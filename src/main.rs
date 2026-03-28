@@ -7,14 +7,19 @@
 //! # Usage
 //!
 //! ```text
+//! # Full pipeline (register trace + DWARF):
+//! codetracer-solana-recorder record --regs trace.regs --elf program.so \
+//!     -o <output-dir> [-f <format>]
+//!
+//! # Legacy placeholder mode (positional ELF only):
 //! codetracer-solana-recorder record <ELF_FILE> \
-//!     -o <output-dir> \
-//!     [-f <format>]
+//!     -o <output-dir> [-f <format>]
 //! ```
 
 use std::path::PathBuf;
 
 use clap::{Parser, Subcommand, ValueEnum};
+use codetracer_trace_writer::TraceEventsFileFormat;
 use eyre::{Context, Result};
 
 // ---------------------------------------------------------------------------
@@ -55,7 +60,19 @@ enum OutputFormat {
 #[derive(Debug, clap::Args)]
 struct RecordArgs {
     /// Path to the compiled Solana program ELF file (.so).
+    /// Used as legacy positional argument; also used as the ELF for DWARF
+    /// if --elf is not provided.
     elf_file: PathBuf,
+
+    /// Path to the pre-generated register trace file (.regs binary).
+    /// When provided together with --elf, uses the full recording pipeline.
+    #[arg(long = "regs")]
+    regs_file: Option<PathBuf>,
+
+    /// Path to the unstripped ELF file for DWARF source mapping.
+    /// Defaults to the positional ELF_FILE if not provided.
+    #[arg(long = "elf")]
+    elf_override: Option<PathBuf>,
 
     /// Directory where the trace files will be written.
     ///
@@ -92,7 +109,7 @@ fn main() -> Result<()> {
 
 /// Execute the `record` subcommand.
 fn record(args: RecordArgs) -> Result<()> {
-    // 1. Validate the ELF file exists.
+    // 1. Validate the positional ELF file exists.
     let elf_path = args
         .elf_file
         .canonicalize()
@@ -100,15 +117,54 @@ fn record(args: RecordArgs) -> Result<()> {
 
     eprintln!("ELF file: {}", elf_path.display());
 
-    // 2. Recording not yet implemented.
+    // Determine trace format.
+    let format = match args.format {
+        OutputFormat::Binary => TraceEventsFileFormat::Binary,
+        OutputFormat::Json => TraceEventsFileFormat::Json,
+    };
+
+    // 2. If --regs is provided, use the full pipeline.
+    if let Some(regs_path) = &args.regs_file {
+        let regs_path = regs_path
+            .canonicalize()
+            .with_context(|| format!("regs file not found: {}", regs_path.display()))?;
+
+        let elf_for_dwarf = match &args.elf_override {
+            Some(p) => p
+                .canonicalize()
+                .with_context(|| format!("ELF override not found: {}", p.display()))?,
+            None => elf_path.clone(),
+        };
+
+        eprintln!("Register trace: {}", regs_path.display());
+        eprintln!("ELF for DWARF: {}", elf_for_dwarf.display());
+
+        let regs_data = std::fs::read(&regs_path)
+            .with_context(|| format!("failed to read regs file: {}", regs_path.display()))?;
+        let elf_data = std::fs::read(&elf_for_dwarf)
+            .with_context(|| format!("failed to read ELF file: {}", elf_for_dwarf.display()))?;
+
+        codetracer_solana_recorder::recorder::record_from_traces(
+            &regs_data,
+            &elf_data,
+            &elf_path,
+            &args.out_dir,
+            format,
+        )?;
+
+        eprintln!("Trace written to {}", args.out_dir.display());
+        return Ok(());
+    }
+
+    // 3. Legacy placeholder mode: no --regs provided.
     eprintln!("Recording not yet implemented");
 
-    // 3. Create output directory.
+    // Create output directory.
     let out_dir = &args.out_dir;
     std::fs::create_dir_all(out_dir)
         .with_context(|| format!("cannot create output dir: {}", out_dir.display()))?;
 
-    // 4. Write placeholder trace_metadata.json.
+    // Write placeholder trace_metadata.json.
     let metadata = serde_json::json!({
         "recorder": "codetracer-solana-recorder",
         "version": env!("CARGO_PKG_VERSION"),
@@ -121,7 +177,7 @@ fn record(args: RecordArgs) -> Result<()> {
     )
     .context("failed to write trace_metadata.json")?;
 
-    // 5. Write placeholder trace_paths.json.
+    // Write placeholder trace_paths.json.
     let paths = serde_json::json!({
         "elf_file": elf_path.to_string_lossy(),
         "trace_dir": out_dir.to_string_lossy()
