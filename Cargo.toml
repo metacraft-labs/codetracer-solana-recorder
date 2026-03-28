@@ -1,0 +1,30 @@
+[package]
+name = "codetracer-solana-recorder"
+version = "0.1.0"
+edition = "2024"
+authors = ["Metacraft Labs Ltd"]
+description = "CodeTracer recorder for Solana programs (Rust/SBF)"
+license = "Apache-2.0"
+
+[dependencies]
+# CodeTracer trace format
+codetracer_trace_types = "0.16"
+codetracer_trace_writer = "0.17"
+
+# DWARF parsing for source mapping
+addr2line = "0.24"
+gimli = "0.31"
+object = "0.36"
+
+# Serialization
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+
+# Error handling
+eyre = "0.6"
+
+# CLI argument parsing
+clap = { version = "4", features = ["derive"] }
+
+[dev-dependencies]
+tempfile = "3"
