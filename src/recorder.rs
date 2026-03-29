@@ -11,7 +11,9 @@ use codetracer_trace_writer::trace_writer::TraceWriter;
 use codetracer_trace_writer::{TraceEventsFileFormat, create_trace_writer};
 use eyre::{Context, Result, eyre};
 
+use crate::cpi::{CpiDetector, CpiEvent};
 use crate::dwarf::DwarfParser;
+use crate::multi_program::ProgramRegistry;
 use crate::register_trace::{RegisterSnapshot, parse_regs_file};
 
 /// Record a Solana program execution from pre-generated register trace
@@ -170,6 +172,170 @@ pub fn record_from_snapshots(
         }
 
         prev_pc = Some(pc);
+    }
+
+    // Emit return for the main function.
+    TraceWriter::register_return(&mut *writer, NONE_VALUE);
+
+    // Finish writing.
+    TraceWriter::finish_writing_trace_events(&mut *writer).map_err(|e| eyre!("{e}"))?;
+    TraceWriter::finish_writing_trace_metadata(&mut *writer).map_err(|e| eyre!("{e}"))?;
+    TraceWriter::finish_writing_trace_paths(&mut *writer).map_err(|e| eyre!("{e}"))?;
+
+    Ok(())
+}
+
+/// Record a Solana program execution with CPI (Cross-Program Invocation)
+/// awareness, producing CodeTracer trace output with nested Call/Return
+/// events at CPI boundaries.
+///
+/// # Arguments
+///
+/// * `snapshots`         - Parsed register snapshots (may span multiple programs)
+/// * `registry`          - Program registry mapping PCs to programs and source info
+/// * `cpi_detector`      - CPI detector initialised with the primary program's range
+/// * `source_path`       - Path to display in the trace for the primary program
+/// * `out_dir`           - Directory where trace files will be written
+/// * `format`            - Output format (Binary or Json)
+pub fn record_with_cpi(
+    snapshots: &[RegisterSnapshot],
+    registry: &ProgramRegistry,
+    cpi_detector: &mut CpiDetector,
+    source_path: &Path,
+    out_dir: &Path,
+    format: TraceEventsFileFormat,
+) -> Result<()> {
+    // Create output directory.
+    std::fs::create_dir_all(out_dir)
+        .with_context(|| format!("cannot create output dir: {}", out_dir.display()))?;
+
+    // Create the trace writer.
+    let program_name = source_path.to_string_lossy();
+    let mut writer = create_trace_writer(&program_name, &[], format);
+
+    // Set up output files.
+    let events_path = out_dir.join("trace.bin");
+    let metadata_path = out_dir.join("trace_metadata.json");
+    let paths_path = out_dir.join("trace_paths.json");
+
+    TraceWriter::begin_writing_trace_events(&mut *writer, &events_path)
+        .map_err(|e| eyre!("{e}"))?;
+    TraceWriter::begin_writing_trace_metadata(&mut *writer, &metadata_path)
+        .map_err(|e| eyre!("{e}"))?;
+    TraceWriter::begin_writing_trace_paths(&mut *writer, &paths_path)
+        .map_err(|e| eyre!("{e}"))?;
+
+    // Start the trace.
+    TraceWriter::start(&mut *writer, source_path, Line(1));
+
+    // Register the u64 type.
+    let u64_type_id = TraceWriter::ensure_type_id(&mut *writer, TypeKind::Int, "u64");
+
+    // Register a function for the main program.
+    let main_fn_id = TraceWriter::ensure_function_id(
+        &mut *writer,
+        "main",
+        source_path,
+        Line(1),
+    );
+
+    // Emit initial call.
+    TraceWriter::register_call(&mut *writer, main_fn_id, vec![]);
+
+    // Walk snapshots with CPI detection.
+    let mut prev_line: Option<u32> = None;
+    let mut prev_pc: Option<u64> = None;
+
+    for snap in snapshots {
+        let pc = snap.pc();
+
+        // Check for CPI boundaries.
+        let cpi_event = cpi_detector.process_snapshot(snap);
+        match cpi_event {
+            CpiEvent::CpiCall { target_pc } => {
+                let program_name_str = registry
+                    .program_name(target_pc)
+                    .unwrap_or("unknown_program");
+                let (file_str, line) = registry
+                    .find_location(target_pc)
+                    .unwrap_or_else(|| (format!("{program_name_str}.sbf"), 0));
+                let cpi_fn_id = TraceWriter::ensure_function_id(
+                    &mut *writer,
+                    program_name_str,
+                    &Path::new(&file_str),
+                    Line(line as i64),
+                );
+                TraceWriter::register_call(&mut *writer, cpi_fn_id, vec![]);
+                // Reset line tracking for the new program context.
+                prev_line = None;
+            }
+            CpiEvent::CpiReturn { return_pc: _ } => {
+                TraceWriter::register_return(&mut *writer, NONE_VALUE);
+                // Reset line tracking for the returned-to context.
+                prev_line = None;
+            }
+            CpiEvent::SameProgram => {
+                // Within the same program, use the existing call/return heuristic.
+                if let Some(prev) = prev_pc {
+                    let diff = if pc > prev { pc - prev } else { prev - pc };
+                    if diff > 2 {
+                        let current_program = cpi_detector.current_program();
+                        let (file_str, line) = registry
+                            .find_location(pc)
+                            .unwrap_or_else(|| (format!("{current_program}.sbf"), 0));
+                        if pc > prev {
+                            let callee_fn_id = TraceWriter::ensure_function_id(
+                                &mut *writer,
+                                &format!("fn_at_pc_{pc}"),
+                                &Path::new(&file_str),
+                                Line(line as i64),
+                            );
+                            TraceWriter::register_call(&mut *writer, callee_fn_id, vec![]);
+                        } else {
+                            TraceWriter::register_return(&mut *writer, NONE_VALUE);
+                        }
+                    }
+                }
+            }
+        }
+
+        // Look up source location for this PC.
+        let (file_str, line) = match registry.find_location(pc) {
+            Some((f, l)) => (f, l),
+            None => {
+                // No source mapping; emit opcode-based line number.
+                let program_name_str = cpi_detector.current_program();
+                (format!("{program_name_str}.sbf"), pc as u32)
+            }
+        };
+
+        // Emit step when line changes.
+        if prev_line != Some(line) {
+            TraceWriter::register_step(
+                &mut *writer,
+                &Path::new(&file_str),
+                Line(line as i64),
+            );
+            prev_line = Some(line);
+        }
+
+        // Emit register values as variables (r0 through r10).
+        for r in 0..=10 {
+            let name = format!("r{r}");
+            let value = ValueRecord::Int {
+                i: snap.reg(r) as i64,
+                type_id: u64_type_id,
+            };
+            TraceWriter::register_variable_with_full_value(&mut *writer, &name, value);
+        }
+
+        prev_pc = Some(pc);
+    }
+
+    // Emit returns for any remaining CPI contexts (handles traces that
+    // end while still inside nested CPIs).
+    for _ in 0..cpi_detector.call_depth() {
+        TraceWriter::register_return(&mut *writer, NONE_VALUE);
     }
 
     // Emit return for the main function.
