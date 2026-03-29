@@ -1,9 +1,21 @@
 {
-  description = "CodeTracer Solana Recorder development environment";
+  description = "CodeTracer Solana Recorder";
+
+  nixConfig = {
+    extra-substituters = [
+      "https://mcl-blockchain-packages.cachix.org"
+      "https://nix-blockchain-development.cachix.org"
+    ];
+    extra-trusted-public-keys = [
+      "mcl-blockchain-packages.cachix.org-1:qoEiUyBgNXmgJTThjbjO//XA9/6tCmx/OohHHt9hWVY="
+      "nix-blockchain-development.cachix.org-1:Ekei3RuW3Se+P/UIo6Q/oAgor/fVhFuuuX5jR8K/cdg="
+    ];
+  };
 
   inputs = {
-    nixpkgs.url = "github:NixOS/nixpkgs/nixpkgs-unstable";
-    flake-utils.url = "github:numtide/flake-utils";
+    mcl-blockchain.url = "github:metacraft-labs/nix-blockchain-development";
+    nixpkgs.follows = "mcl-blockchain/nixpkgs";
+    flake-utils.follows = "mcl-blockchain/flake-utils";
   };
 
   outputs =
@@ -11,27 +23,13 @@
       self,
       nixpkgs,
       flake-utils,
+      mcl-blockchain,
+      ...
     }:
     flake-utils.lib.eachDefaultSystem (
       system:
-      let
-        pkgs = import nixpkgs { inherit system; };
-      in
       {
-        devShells.default = pkgs.mkShell {
-          packages = with pkgs; [
-            # Rust build dependencies
-            rustc
-            cargo
-            capnproto
-            pkg-config
-            openssl
-          ];
-
-          shellHook = ''
-            echo "CodeTracer Solana Recorder dev shell"
-          '';
-        };
+        devShells.default = mcl-blockchain.devShells.${system}.solana;
       }
     );
 }
