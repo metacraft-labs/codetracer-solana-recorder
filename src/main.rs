@@ -4,6 +4,10 @@
 //! ELF file (.so), runs it through the SBF VM with register tracing enabled,
 //! and writes the CodeTracer trace output files.
 //!
+//! Also supports the `replay` subcommand which fetches a confirmed on-chain
+//! transaction via Solana JSON-RPC and replays it through the recording
+//! pipeline.
+//!
 //! # Usage
 //!
 //! ```text
@@ -14,6 +18,10 @@
 //! # Legacy placeholder mode (positional ELF only):
 //! codetracer-solana-recorder record <ELF_FILE> \
 //!     -o <output-dir> [-f <format>]
+//!
+//! # Replay a confirmed on-chain transaction:
+//! codetracer-solana-recorder replay --signature <SIG> \
+//!     [--rpc-url <URL>] [--program-dir <PATH>] [-o <out-dir>] [-f <format>]
 //! ```
 
 use std::path::PathBuf;
@@ -46,6 +54,15 @@ enum Commands {
     /// runs it through the SBF VM with register tracing, and writes
     /// CodeTracer trace files to the output directory.
     Record(RecordArgs),
+
+    /// Replay a confirmed on-chain transaction.
+    ///
+    /// Fetches the transaction via Solana JSON-RPC, reconstructs its
+    /// execution context, and records a CodeTracer trace.
+    ///
+    /// NOTE: Uses *current* account state, not historical state at the
+    /// transaction's slot.
+    Replay(ReplayArgs),
 
     /// Print version information.
     Version,
@@ -85,6 +102,32 @@ struct RecordArgs {
     format: OutputFormat,
 }
 
+#[derive(Debug, clap::Args)]
+struct ReplayArgs {
+    /// Transaction signature to replay (base-58).
+    #[arg(long = "signature")]
+    signature: String,
+
+    /// Solana JSON-RPC endpoint URL.
+    #[arg(long = "rpc-url", default_value = "http://localhost:8899")]
+    rpc_url: String,
+
+    /// Directory containing compiled `.so` files with DWARF debug info.
+    ///
+    /// The recorder will search this directory for program binaries.
+    /// Defaults to `target/deploy/`.
+    #[arg(long = "program-dir")]
+    program_dir: Option<PathBuf>,
+
+    /// Directory where the trace files will be written.
+    #[arg(short = 'o', long = "out-dir", default_value = "./ct-traces/")]
+    out_dir: PathBuf,
+
+    /// Output format for the trace data.
+    #[arg(short = 'f', long = "format", default_value = "binary")]
+    format: OutputFormat,
+}
+
 // ---------------------------------------------------------------------------
 // Entry point
 // ---------------------------------------------------------------------------
@@ -93,6 +136,7 @@ fn main() -> Result<()> {
     let cli = Cli::parse();
     match cli.command {
         Commands::Record(args) => record(args),
+        Commands::Replay(args) => replay(args),
         Commands::Version => {
             println!(
                 "codetracer-solana-recorder {}",
@@ -193,4 +237,24 @@ fn record(args: RecordArgs) -> Result<()> {
     eprintln!("  trace_paths.json");
 
     Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// `replay` implementation
+// ---------------------------------------------------------------------------
+
+/// Execute the `replay` subcommand.
+fn replay(args: ReplayArgs) -> Result<()> {
+    let format = match args.format {
+        OutputFormat::Binary => TraceEventsFileFormat::Binary,
+        OutputFormat::Json => TraceEventsFileFormat::Json,
+    };
+
+    codetracer_solana_recorder::replay::replay_transaction(
+        &args.rpc_url,
+        &args.signature,
+        &args.out_dir,
+        format,
+        args.program_dir.as_deref(),
+    )
 }
