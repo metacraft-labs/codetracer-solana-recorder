@@ -97,6 +97,10 @@ struct RecordArgs {
     #[arg(short = 'o', long = "out-dir", default_value = "./ct-traces/")]
     out_dir: PathBuf,
 
+    /// Path to an Anchor IDL JSON file for account data decoding.
+    #[arg(long = "idl")]
+    idl: Option<PathBuf>,
+
     /// Output format for the trace data.
     #[arg(short = 'f', long = "format", default_value = "binary")]
     format: OutputFormat,
