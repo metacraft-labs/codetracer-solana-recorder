@@ -17,7 +17,10 @@ use codetracer_solana_recorder::register_trace::{RegisterSnapshot, parse_regs_fi
 use codetracer_solana_recorder::tracer_trait::{
     CodeTracerTracer, NoOpTracer, SbpfTracer, replay_snapshots,
 };
-use codetracer_trace_types::{Line, ValueRecord};
+use codetracer_trace_types::{
+    CallRecord, FullValueRecord, FunctionRecord, Line, ReturnRecord, StepRecord,
+    TraceLowLevelEvent, ValueRecord,
+};
 use codetracer_trace_writer::trace_writer::TraceWriter;
 use codetracer_trace_writer::{TraceEventsFileFormat, create_trace_writer};
 
@@ -117,6 +120,146 @@ fn record_cpi_and_read_events(
     std::fs::read_to_string(tmp.path().join("trace.bin")).unwrap()
 }
 
+// ---------------------------------------------------------------------------
+// Structured trace parsing helpers
+// ---------------------------------------------------------------------------
+
+/// Parse JSON trace content into a Vec of TraceLowLevelEvent.
+fn parse_events(content: &str) -> Vec<TraceLowLevelEvent> {
+    serde_json::from_str(content).expect("trace output should be valid JSON array of events")
+}
+
+/// Collect all Step events from parsed trace events.
+fn step_events(events: &[TraceLowLevelEvent]) -> Vec<&StepRecord> {
+    events
+        .iter()
+        .filter_map(|e| match e {
+            TraceLowLevelEvent::Step(s) => Some(s),
+            _ => None,
+        })
+        .collect()
+}
+
+/// Collect all Call events from parsed trace events.
+fn call_events(events: &[TraceLowLevelEvent]) -> Vec<&CallRecord> {
+    events
+        .iter()
+        .filter_map(|e| match e {
+            TraceLowLevelEvent::Call(c) => Some(c),
+            _ => None,
+        })
+        .collect()
+}
+
+/// Collect all Return events from parsed trace events.
+fn return_events(events: &[TraceLowLevelEvent]) -> Vec<&ReturnRecord> {
+    events
+        .iter()
+        .filter_map(|e| match e {
+            TraceLowLevelEvent::Return(r) => Some(r),
+            _ => None,
+        })
+        .collect()
+}
+
+/// Collect all Function registration events.
+fn function_events(events: &[TraceLowLevelEvent]) -> Vec<&FunctionRecord> {
+    events
+        .iter()
+        .filter_map(|e| match e {
+            TraceLowLevelEvent::Function(f) => Some(f),
+            _ => None,
+        })
+        .collect()
+}
+
+/// Collect all Path events (as strings).
+fn path_events(events: &[TraceLowLevelEvent]) -> Vec<&Path> {
+    events
+        .iter()
+        .filter_map(|e| match e {
+            TraceLowLevelEvent::Path(p) => Some(p.as_path()),
+            _ => None,
+        })
+        .collect()
+}
+
+/// Collect all VariableName interning events.
+fn variable_name_events(events: &[TraceLowLevelEvent]) -> Vec<&str> {
+    events
+        .iter()
+        .filter_map(|e| match e {
+            TraceLowLevelEvent::VariableName(n) => Some(n.as_str()),
+            _ => None,
+        })
+        .collect()
+}
+
+/// Collect all Value events.
+fn value_events(events: &[TraceLowLevelEvent]) -> Vec<&FullValueRecord> {
+    events
+        .iter()
+        .filter_map(|e| match e {
+            TraceLowLevelEvent::Value(v) => Some(v),
+            _ => None,
+        })
+        .collect()
+}
+
+/// Extract all integer values from Value events.
+fn int_values(events: &[TraceLowLevelEvent]) -> Vec<i64> {
+    value_events(events)
+        .iter()
+        .filter_map(|fv| match &fv.value {
+            ValueRecord::Int { i, .. } => Some(*i),
+            _ => None,
+        })
+        .collect()
+}
+
+/// Check that at least one Value event has the given integer value.
+fn has_int_value(events: &[TraceLowLevelEvent], expected: i64) -> bool {
+    int_values(events).contains(&expected)
+}
+
+/// Check that at least one Path event ends with the given suffix.
+fn has_path_containing(events: &[TraceLowLevelEvent], suffix: &str) -> bool {
+    path_events(events)
+        .iter()
+        .any(|p| p.to_string_lossy().contains(suffix))
+}
+
+/// Check that at least one Function event has the given name.
+fn has_function_named(events: &[TraceLowLevelEvent], name: &str) -> bool {
+    function_events(events).iter().any(|f| f.name == name)
+}
+
+/// Check that at least one VariableName event matches exactly.
+fn has_variable_name(events: &[TraceLowLevelEvent], name: &str) -> bool {
+    variable_name_events(events).contains(&name)
+}
+
+/// Record, parse, and return structured events (convenience wrapper).
+fn record_and_parse_events(
+    snapshots: &[RegisterSnapshot],
+    source_locs: &[(u64, &str, u32)],
+    source_path: &str,
+) -> Vec<TraceLowLevelEvent> {
+    let content = record_and_read_events(snapshots, source_locs, source_path);
+    parse_events(&content)
+}
+
+/// Record with CPI, parse, and return structured events (convenience wrapper).
+fn record_cpi_and_parse_events(
+    snapshots: &[RegisterSnapshot],
+    registry: &ProgramRegistry,
+    detector: &mut CpiDetector,
+    source_path: &str,
+) -> Vec<TraceLowLevelEvent> {
+    let content = record_cpi_and_read_events(snapshots, registry, detector, source_path);
+    parse_events(&content)
+}
+
 // ===========================================================================
 // 1. Register trace patterns for different instruction types
 // ===========================================================================
@@ -149,20 +292,21 @@ fn test_arithmetic_register_patterns() {
         (5, "arith.rs", 15),
     ];
 
-    let content = record_and_read_events(&snapshots, &source_locs, "arith.rs");
+    let events = record_and_parse_events(&snapshots, &source_locs, "arith.rs");
 
-    // Verify arithmetic results show up in the trace.
-    assert!(content.contains("130"), "ADD result 130 should appear in trace");
-    assert!(content.contains("100"), "SUB result 100 should appear in trace");
-    assert!(content.contains("300"), "MUL result 300 should appear in trace");
-    assert!(content.contains("30"), "DIV result 30 should appear in trace");
+    // Verify arithmetic results show up as integer values in Value events.
+    assert!(has_int_value(&events, 130), "ADD result 130 should appear in trace");
+    assert!(has_int_value(&events, 100), "SUB result 100 should appear in trace");
+    assert!(has_int_value(&events, 300), "MUL result 300 should appear in trace");
+    assert!(has_int_value(&events, 30), "DIV result 30 should appear in trace");
 
     // Each unique line triggers a Step event. TraceWriter::start also emits
     // an initial Step, so the total is source lines + 1.
-    let step_count = content.matches("\"Step\"").count();
+    let steps = step_events(&events);
     assert!(
-        step_count >= 6,
-        "expected at least 6 Step events for 6 unique lines, got {step_count}"
+        steps.len() >= 6,
+        "expected at least 6 Step events for 6 unique lines, got {}",
+        steps.len()
     );
 }
 
@@ -196,23 +340,23 @@ fn test_memory_access_register_patterns() {
         (3, "mem.rs", 4),
     ];
 
-    let content = record_and_read_events(&snapshots, &source_locs, "mem.rs");
+    let events = record_and_parse_events(&snapshots, &source_locs, "mem.rs");
 
-    // Frame pointer (r10) should appear.
-    assert!(content.contains("r10"), "frame pointer r10 should be in trace");
+    // Frame pointer (r10) should appear as a variable name.
+    assert!(has_variable_name(&events, "r10"), "frame pointer r10 should be in trace");
 
-    // Stack address value should appear.
-    let stack_str = format!("{}", stack_addr as i64);
+    // Stack address value should appear as an integer value.
     assert!(
-        content.contains(&stack_str),
+        has_int_value(&events, stack_addr as i64),
         "stack address should appear in trace"
     );
 
     // Step events for each line, plus the initial start step.
-    let step_count = content.matches("\"Step\"").count();
+    let steps = step_events(&events);
     assert!(
-        step_count >= 4,
-        "expected at least 4 Step events, got {step_count}"
+        steps.len() >= 4,
+        "expected at least 4 Step events, got {}",
+        steps.len()
     );
 }
 
@@ -276,17 +420,18 @@ fn test_syscall_register_patterns() {
         (3, "syscall.rs", 31),
     ];
 
-    let content = record_and_read_events(&snapshots, &source_locs, "syscall.rs");
+    let events = record_and_parse_events(&snapshots, &source_locs, "syscall.rs");
 
-    // Verify syscall-related register values appear.
-    assert!(content.contains("r1"), "r1 (msg_ptr/seeds_ptr) should be in trace");
-    assert!(content.contains("r2"), "r2 (msg_len/seeds_len) should be in trace");
-    assert!(content.contains("r0"), "r0 (return value) should be in trace");
+    // Verify syscall-related register names appear.
+    assert!(has_variable_name(&events, "r1"), "r1 (msg_ptr/seeds_ptr) should be in trace");
+    assert!(has_variable_name(&events, "r2"), "r2 (msg_len/seeds_len) should be in trace");
+    assert!(has_variable_name(&events, "r0"), "r0 (return value) should be in trace");
 
-    let step_count = content.matches("\"Step\"").count();
+    let steps = step_events(&events);
     assert!(
-        step_count >= 4,
-        "expected at least 4 Step events, got {step_count}"
+        steps.len() >= 4,
+        "expected at least 4 Step events, got {}",
+        steps.len()
     );
 }
 
@@ -315,31 +460,33 @@ fn test_function_call_return_pc_jumps() {
         (3, "caller.rs", 4),
     ];
 
-    let content = record_and_read_events(&snapshots, &source_locs, "caller.rs");
+    let events = record_and_parse_events(&snapshots, &source_locs, "caller.rs");
 
     // Should have multiple Call events: main + fn_at_pc_100.
-    let call_count = content.matches("\"Call\"").count();
+    let calls = call_events(&events);
     assert!(
-        call_count >= 2,
-        "expected at least 2 Call events (main + callee), got {call_count}"
+        calls.len() >= 2,
+        "expected at least 2 Call events (main + callee), got {}",
+        calls.len()
     );
 
     // Should have Return events: one for callee return, one for main.
-    let return_count = content.matches("\"Return\"").count();
+    let returns = return_events(&events);
     assert!(
-        return_count >= 2,
-        "expected at least 2 Return events, got {return_count}"
+        returns.len() >= 2,
+        "expected at least 2 Return events, got {}",
+        returns.len()
     );
 
-    // The callee function name should contain the PC.
+    // The callee function name should be registered.
     assert!(
-        content.contains("fn_at_pc_100"),
+        has_function_named(&events, "fn_at_pc_100"),
         "callee function name should reference PC 100"
     );
 
-    // Source files from both caller and callee should appear.
-    assert!(content.contains("caller.rs"), "caller.rs should be in trace");
-    assert!(content.contains("callee.rs"), "callee.rs should be in trace");
+    // Source files from both caller and callee should appear as Path events.
+    assert!(has_path_containing(&events, "caller.rs"), "caller.rs should be in trace");
+    assert!(has_path_containing(&events, "callee.rs"), "callee.rs should be in trace");
 }
 
 // ===========================================================================
@@ -367,19 +514,20 @@ fn test_multiple_source_files() {
         (5, "src/lib.rs", 13),
     ];
 
-    let content = record_and_read_events(&snapshots, &source_locs, "src/lib.rs");
+    let events = record_and_parse_events(&snapshots, &source_locs, "src/lib.rs");
 
-    assert!(content.contains("src/lib.rs"), "lib.rs should appear in trace");
+    assert!(has_path_containing(&events, "src/lib.rs"), "lib.rs should appear in trace");
     assert!(
-        content.contains("src/helpers.rs"),
+        has_path_containing(&events, "src/helpers.rs"),
         "helpers.rs should appear in trace"
     );
 
     // All 6 unique lines produce Step events, plus the initial start step.
-    let step_count = content.matches("\"Step\"").count();
+    let steps = step_events(&events);
     assert!(
-        step_count >= 6,
-        "expected at least 6 Step events, got {step_count}"
+        steps.len() >= 6,
+        "expected at least 6 Step events, got {}",
+        steps.len()
     );
 }
 
@@ -403,14 +551,14 @@ fn test_inline_function_same_line() {
         (3, "lib.rs", 11),
     ];
 
-    let content = record_and_read_events(&snapshots, &source_locs, "lib.rs");
+    let events = record_and_parse_events(&snapshots, &source_locs, "lib.rs");
 
     // The recorder deduplicates consecutive identical source lines, so only
     // lines 10 and 11 produce Step events. TraceWriter::start adds an initial
     // Step at the source_path's line 1, giving 3 total.
-    let step_count = content.matches("\"Step\"").count();
+    let steps = step_events(&events);
     assert_eq!(
-        step_count, 3,
+        steps.len(), 3,
         "inline expansion should produce 3 Step events (start + line 10 + line 11)"
     );
 }
@@ -438,19 +586,20 @@ fn test_macro_expansion_multiple_instructions() {
         (4, "lib.rs", 17),
     ];
 
-    let content = record_and_read_events(&snapshots, &source_locs, "lib.rs");
+    let events = record_and_parse_events(&snapshots, &source_locs, "lib.rs");
 
-    assert!(content.contains("lib.rs"), "user source should appear");
+    assert!(has_path_containing(&events, "lib.rs"), "user source should appear");
     assert!(
-        content.contains("solana_program/log.rs"),
+        has_path_containing(&events, "solana_program/log.rs"),
         "macro expansion source should appear"
     );
 
     // All 5 PCs map to different lines, plus the initial start step.
-    let step_count = content.matches("\"Step\"").count();
+    let steps = step_events(&events);
     assert!(
-        step_count >= 5,
-        "expected at least 5 Step events, got {step_count}"
+        steps.len() >= 5,
+        "expected at least 5 Step events, got {}",
+        steps.len()
     );
 }
 
@@ -482,18 +631,19 @@ fn test_nested_function_calls() {
         (3, "caller.rs", 8),
     ];
 
-    let content = record_and_read_events(&snapshots, &source_locs, "caller.rs");
+    let events = record_and_parse_events(&snapshots, &source_locs, "caller.rs");
 
     // Should contain references to all three source files.
-    assert!(content.contains("caller.rs"));
-    assert!(content.contains("foo.rs"));
-    assert!(content.contains("bar.rs"));
+    assert!(has_path_containing(&events, "caller.rs"));
+    assert!(has_path_containing(&events, "foo.rs"));
+    assert!(has_path_containing(&events, "bar.rs"));
 
     // At least 3 Call events: main, foo, bar.
-    let call_count = content.matches("\"Call\"").count();
+    let calls = call_events(&events);
     assert!(
-        call_count >= 3,
-        "expected at least 3 Call events for nested calls, got {call_count}"
+        calls.len() >= 3,
+        "expected at least 3 Call events for nested calls, got {}",
+        calls.len()
     );
 }
 
@@ -540,22 +690,22 @@ fn test_cpi_single_call_to_system_program() {
     let mut detector = CpiDetector::new(0..100);
     detector.add_program_range("system_program", 5000..5100);
 
-    let content = record_cpi_and_read_events(&snapshots, &registry, &mut detector, "lib.rs");
+    let events = record_cpi_and_parse_events(&snapshots, &registry, &mut detector, "lib.rs");
 
     // Call events: main + CPI to system_program.
-    let call_count = content.matches("\"Call\"").count();
-    assert!(call_count >= 2, "expected >= 2 Call events, got {call_count}");
+    let calls = call_events(&events);
+    assert!(calls.len() >= 2, "expected >= 2 Call events, got {}", calls.len());
 
     // Return events: CPI return + main return.
-    let return_count = content.matches("\"Return\"").count();
-    assert!(return_count >= 2, "expected >= 2 Return events, got {return_count}");
+    let returns = return_events(&events);
+    assert!(returns.len() >= 2, "expected >= 2 Return events, got {}", returns.len());
 
-    // System program name should appear.
-    assert!(content.contains("system_program"));
+    // System program name should appear as a Function event.
+    assert!(has_function_named(&events, "system_program"));
 
-    // Both source files should appear.
-    assert!(content.contains("lib.rs"));
-    assert!(content.contains("system.rs"));
+    // Both source files should appear as Path events.
+    assert!(has_path_containing(&events, "lib.rs"));
+    assert!(has_path_containing(&events, "system.rs"));
 }
 
 /// Nested CPI: A -> B -> C with program ID changes.
@@ -610,28 +760,29 @@ fn test_cpi_nested_three_programs() {
     detector.add_program_range("token_program", 1000..1100);
     detector.add_program_range("associated_token", 2000..2100);
 
-    let content =
-        record_cpi_and_read_events(&snapshots, &registry, &mut detector, "primary.rs");
+    let events =
+        record_cpi_and_parse_events(&snapshots, &registry, &mut detector, "primary.rs");
 
     // 3 Call events: main + 2 CPI calls.
-    let call_count = content.matches("\"Call\"").count();
-    assert!(call_count >= 3, "expected >= 3 Call events, got {call_count}");
+    let calls = call_events(&events);
+    assert!(calls.len() >= 3, "expected >= 3 Call events, got {}", calls.len());
 
     // 3 Return events: 2 CPI returns + main return.
-    let return_count = content.matches("\"Return\"").count();
+    let returns = return_events(&events);
     assert!(
-        return_count >= 3,
-        "expected >= 3 Return events, got {return_count}"
+        returns.len() >= 3,
+        "expected >= 3 Return events, got {}",
+        returns.len()
     );
 
-    // All program names should appear.
-    assert!(content.contains("token_program"));
-    assert!(content.contains("associated_token"));
+    // All program names should appear as Function events.
+    assert!(has_function_named(&events, "token_program"));
+    assert!(has_function_named(&events, "associated_token"));
 
-    // All source files should appear.
-    assert!(content.contains("primary.rs"));
-    assert!(content.contains("token.rs"));
-    assert!(content.contains("ata.rs"));
+    // All source files should appear as Path events.
+    assert!(has_path_containing(&events, "primary.rs"));
+    assert!(has_path_containing(&events, "token.rs"));
+    assert!(has_path_containing(&events, "ata.rs"));
 }
 
 /// CPI with multiple accounts: verify register values carrying account info.
@@ -674,18 +825,17 @@ fn test_cpi_with_multiple_accounts() {
     let mut detector = CpiDetector::new(0..100);
     detector.add_program_range("target", 5000..5100);
 
-    let content =
-        record_cpi_and_read_events(&snapshots, &registry, &mut detector, "lib.rs");
+    let events =
+        record_cpi_and_parse_events(&snapshots, &registry, &mut detector, "lib.rs");
 
-    // Account pointers should appear as register values.
-    let acct1_str = format!("{}", acct1_ptr as i64);
+    // Account pointers should appear as integer values in Value events.
     assert!(
-        content.contains(&acct1_str),
+        has_int_value(&events, acct1_ptr as i64),
         "account 1 pointer should be in trace"
     );
 
-    // CPI target name should appear.
-    assert!(content.contains("target"));
+    // CPI target name should appear as a Function event.
+    assert!(has_function_named(&events, "target"));
 }
 
 /// CPI return value propagation: callee sets r0 before returning.
@@ -723,12 +873,12 @@ fn test_cpi_return_value_propagation() {
     let mut detector = CpiDetector::new(0..100);
     detector.add_program_range("callee", 5000..5100);
 
-    let content =
-        record_cpi_and_read_events(&snapshots, &registry, &mut detector, "primary.rs");
+    let events =
+        record_cpi_and_parse_events(&snapshots, &registry, &mut detector, "primary.rs");
 
-    // r0 = 42 should appear (the CPI return value).
+    // r0 = 42 should appear as an integer value in Value events.
     assert!(
-        content.contains("42"),
+        has_int_value(&events, 42),
         "CPI return value 42 should be in trace"
     );
 }
@@ -1175,14 +1325,14 @@ fn test_variable_tracking_function_params() {
 
     let source_locs: Vec<(u64, &str, u32)> = vec![(0, "params.rs", 1)];
 
-    let content = record_and_read_events(&snapshots, &source_locs, "params.rs");
+    let events = record_and_parse_events(&snapshots, &source_locs, "params.rs");
 
-    // All parameter registers should be present.
-    assert!(content.contains("r1") && content.contains("1000"));
-    assert!(content.contains("r2") && content.contains("2000"));
-    assert!(content.contains("r3") && content.contains("3000"));
-    assert!(content.contains("r4") && content.contains("4000"));
-    assert!(content.contains("r5") && content.contains("5000"));
+    // All parameter registers should be present as variable names with their values.
+    assert!(has_variable_name(&events, "r1") && has_int_value(&events, 1000));
+    assert!(has_variable_name(&events, "r2") && has_int_value(&events, 2000));
+    assert!(has_variable_name(&events, "r3") && has_int_value(&events, 3000));
+    assert!(has_variable_name(&events, "r4") && has_int_value(&events, 4000));
+    assert!(has_variable_name(&events, "r5") && has_int_value(&events, 5000));
 }
 
 /// Local variables in r6-r9 (callee-saved registers).
@@ -1199,21 +1349,21 @@ fn test_variable_tracking_locals() {
         (1, "locals.rs", 11),
     ];
 
-    let content = record_and_read_events(&snapshots, &source_locs, "locals.rs");
+    let events = record_and_parse_events(&snapshots, &source_locs, "locals.rs");
 
-    // r6-r9 should be recorded at both steps.
-    assert!(content.contains("r6"));
-    assert!(content.contains("r7"));
-    assert!(content.contains("r8"));
-    assert!(content.contains("r9"));
-    // Initial values.
-    assert!(content.contains("100"));
-    assert!(content.contains("200"));
-    assert!(content.contains("300"));
-    // Updated values.
-    assert!(content.contains("110"));
-    assert!(content.contains("210"));
-    assert!(content.contains("310"));
+    // r6-r9 should be recorded at both steps as variable names.
+    assert!(has_variable_name(&events, "r6"));
+    assert!(has_variable_name(&events, "r7"));
+    assert!(has_variable_name(&events, "r8"));
+    assert!(has_variable_name(&events, "r9"));
+    // Initial values should appear as integer values.
+    assert!(has_int_value(&events, 100));
+    assert!(has_int_value(&events, 200));
+    assert!(has_int_value(&events, 300));
+    // Updated values should appear as integer values.
+    assert!(has_int_value(&events, 110));
+    assert!(has_int_value(&events, 210));
+    assert!(has_int_value(&events, 310));
 }
 
 /// Return value in r0.
@@ -1231,11 +1381,11 @@ fn test_variable_tracking_return_value() {
         (2, "ret.rs", 3),
     ];
 
-    let content = record_and_read_events(&snapshots, &source_locs, "ret.rs");
+    let events = record_and_parse_events(&snapshots, &source_locs, "ret.rs");
 
     // r0 should transition from 0 to 30.
-    assert!(content.contains("r0"));
-    assert!(content.contains("30"));
+    assert!(has_variable_name(&events, "r0"));
+    assert!(has_int_value(&events, 30));
 }
 
 /// Stack pointer in r10 changes across function calls.
@@ -1257,14 +1407,12 @@ fn test_variable_tracking_stack_pointer() {
         (2, "sp.rs", 3),
     ];
 
-    let content = record_and_read_events(&snapshots, &source_locs, "sp.rs");
+    let events = record_and_parse_events(&snapshots, &source_locs, "sp.rs");
 
-    assert!(content.contains("r10"));
-    // Both stack pointer values should appear.
-    let sp1_str = format!("{}", sp1 as i64);
-    let sp2_str = format!("{}", sp2 as i64);
-    assert!(content.contains(&sp1_str));
-    assert!(content.contains(&sp2_str));
+    assert!(has_variable_name(&events, "r10"));
+    // Both stack pointer values should appear as integer values.
+    assert!(has_int_value(&events, sp1 as i64));
+    assert!(has_int_value(&events, sp2 as i64));
 }
 
 /// PC progression in r11: verify sequential advancement.
@@ -1286,27 +1434,30 @@ fn test_variable_tracking_pc_progression() {
         (4, "pc.rs", 5),
     ];
 
-    let content = record_and_read_events(&snapshots, &source_locs, "pc.rs");
+    let events = record_and_parse_events(&snapshots, &source_locs, "pc.rs");
 
     // No large PC jumps, so no spurious Call/Return events beyond main
     // and the start-level call.
-    let call_count = content.matches("\"Call\"").count();
+    let calls = call_events(&events);
     assert!(
-        call_count <= 2,
-        "expected at most 2 Call events for sequential PCs, got {call_count}"
+        calls.len() <= 2,
+        "expected at most 2 Call events for sequential PCs, got {}",
+        calls.len()
     );
 
-    let return_count = content.matches("\"Return\"").count();
+    let returns = return_events(&events);
     assert!(
-        return_count <= 2,
-        "expected at most 2 Return events for sequential PCs, got {return_count}"
+        returns.len() <= 2,
+        "expected at most 2 Return events for sequential PCs, got {}",
+        returns.len()
     );
 
     // 5 unique lines plus the initial start step.
-    let step_count = content.matches("\"Step\"").count();
+    let steps = step_events(&events);
     assert!(
-        step_count >= 5,
-        "expected at least 5 Step events, got {step_count}"
+        steps.len() >= 5,
+        "expected at least 5 Step events, got {}",
+        steps.len()
     );
 }
 
@@ -1332,12 +1483,12 @@ fn test_error_path_missing_signature() {
         (2, "error.rs", 3),
     ];
 
-    let content = record_and_read_events(&snapshots, &source_locs, "error.rs");
+    let events = record_and_parse_events(&snapshots, &source_locs, "error.rs");
 
-    // The error code should appear as r0's value.
-    assert!(content.contains("r0"));
-    // Value "2" should appear for r0.
-    assert!(content.contains("2"));
+    // The error code should appear as r0's variable name.
+    assert!(has_variable_name(&events, "r0"));
+    // Value 2 should appear as an integer value for r0.
+    assert!(has_int_value(&events, 2), "error code 2 should appear as integer value");
 }
 
 /// Custom error enum with error code: simulate via larger r0 value.
@@ -1357,11 +1508,11 @@ fn test_error_path_custom_error_code() {
         (2, "custom_err.rs", 52),
     ];
 
-    let content = record_and_read_events(&snapshots, &source_locs, "custom_err.rs");
+    let events = record_and_parse_events(&snapshots, &source_locs, "custom_err.rs");
 
-    // Custom error code 6001 should appear.
+    // Custom error code 6001 should appear as an integer value.
     assert!(
-        content.contains("6001"),
+        has_int_value(&events, 6001),
         "custom error code 6001 should appear in trace"
     );
 }
@@ -1384,17 +1535,17 @@ fn test_error_path_panic_abort() {
         (90001, "core/panicking.rs", 101),
     ];
 
-    let content = record_and_read_events(&snapshots, &source_locs, "panic.rs");
+    let events = record_and_parse_events(&snapshots, &source_locs, "panic.rs");
 
     // The panic handler should be recorded as a function call (large forward jump).
     assert!(
-        content.contains("fn_at_pc_90000"),
+        has_function_named(&events, "fn_at_pc_90000"),
         "panic handler should appear as a function call"
     );
 
-    // Both source files should appear.
-    assert!(content.contains("panic.rs"));
-    assert!(content.contains("core/panicking.rs"));
+    // Both source files should appear as Path events.
+    assert!(has_path_containing(&events, "panic.rs"));
+    assert!(has_path_containing(&events, "core/panicking.rs"));
 }
 
 // ===========================================================================
@@ -1434,12 +1585,12 @@ fn test_single_instruction_trace() {
     let snapshots = vec![snap_regs(0, 42, 1, 2, 3)];
     let source_locs: Vec<(u64, &str, u32)> = vec![(0, "single.rs", 1)];
 
-    let content = record_and_read_events(&snapshots, &source_locs, "single.rs");
+    let events = record_and_parse_events(&snapshots, &source_locs, "single.rs");
 
-    assert!(content.contains("\"Step\""));
-    assert!(content.contains("\"Call\""));
-    assert!(content.contains("\"Return\""));
-    assert!(content.contains("42")); // r0 value
+    assert!(!step_events(&events).is_empty(), "should have Step events");
+    assert!(!call_events(&events).is_empty(), "should have Call events");
+    assert!(!return_events(&events).is_empty(), "should have Return events");
+    assert!(has_int_value(&events, 42), "r0 value 42 should appear"); // r0 value
 }
 
 /// Empty trace (no snapshots) still produces valid output files.
@@ -1597,10 +1748,11 @@ fn test_replay_snapshots_produces_trace() {
     tracer.finish().unwrap();
 
     let content = std::fs::read_to_string(tmp.path().join("trace.bin")).unwrap();
-    assert!(content.contains("\"Step\""));
-    assert!(content.contains("r0"));
-    assert!(content.contains("r1"));
-    assert!(content.contains("30")); // return value
+    let events = parse_events(&content);
+    assert!(!step_events(&events).is_empty(), "should have Step events");
+    assert!(has_variable_name(&events, "r0"));
+    assert!(has_variable_name(&events, "r1"));
+    assert!(has_int_value(&events, 30), "return value 30 should appear"); // return value
 }
 
 /// NoOpTracer + replay_snapshots with large trace does not panic.
@@ -1820,23 +1972,26 @@ fn test_cpi_large_multi_program_trace() {
         snapshots.push(snap_pc(pc));
     }
 
-    let content =
-        record_cpi_and_read_events(&snapshots, &registry, &mut detector, "primary.rs");
+    let events =
+        record_cpi_and_parse_events(&snapshots, &registry, &mut detector, "primary.rs");
 
-    // All 4 programs should appear.
-    assert!(content.contains("primary.rs") || content.contains("primary"));
-    assert!(content.contains("program_a"));
-    assert!(content.contains("program_b"));
-    assert!(content.contains("program_c"));
+    // All 4 programs should appear as Path or Function events.
+    assert!(
+        has_path_containing(&events, "primary.rs") || has_function_named(&events, "primary"),
+    );
+    assert!(has_function_named(&events, "program_a"));
+    assert!(has_function_named(&events, "program_b"));
+    assert!(has_function_named(&events, "program_c"));
 
     // Multiple Call/Return events.
-    let call_count = content.matches("\"Call\"").count();
-    assert!(call_count >= 4, "expected >= 4 Call events, got {call_count}");
+    let calls = call_events(&events);
+    assert!(calls.len() >= 4, "expected >= 4 Call events, got {}", calls.len());
 
-    let return_count = content.matches("\"Return\"").count();
+    let returns = return_events(&events);
     assert!(
-        return_count >= 3,
-        "expected >= 3 Return events, got {return_count}"
+        returns.len() >= 3,
+        "expected >= 3 Return events, got {}",
+        returns.len()
     );
 }
 
@@ -1927,12 +2082,13 @@ fn test_unmapped_pcs_are_skipped() {
         // PC 50 and 51 intentionally not mapped.
     ];
 
-    let content = record_and_read_events(&snapshots, &source_locs, "mapped.rs");
+    let events = record_and_parse_events(&snapshots, &source_locs, "mapped.rs");
 
     // 2 Step events for the mapped PCs, plus the initial start step.
-    let step_count = content.matches("\"Step\"").count();
+    let steps = step_events(&events);
     assert!(
-        step_count >= 2 && step_count <= 4,
-        "expected 2-4 Step events for mapped PCs + start, got {step_count}"
+        steps.len() >= 2 && steps.len() <= 4,
+        "expected 2-4 Step events for mapped PCs + start, got {}",
+        steps.len()
     );
 }
