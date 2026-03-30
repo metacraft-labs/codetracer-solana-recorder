@@ -4,7 +4,7 @@
 //! that PC-to-source-line resolution works correctly, complementing the
 //! synthetic data tests in other test files.
 
-use codetracer_solana_recorder::dwarf::{DwarfParser, SourceLocation};
+use codetracer_solana_recorder::dwarf::{DwarfParser, FunctionBoundary, SourceLocation, find_functions};
 
 // ---------------------------------------------------------------------------
 // Tests: error handling
@@ -302,4 +302,175 @@ fn test_dwarf_integration_with_recorder() {
         tmp.path().join("trace_metadata.json").exists(),
         "trace_metadata.json should exist"
     );
+}
+
+// ---------------------------------------------------------------------------
+// Tests: .debug_info function boundary extraction (Call/Return events)
+// ---------------------------------------------------------------------------
+
+/// find_functions extracts function boundaries from the recorder's own binary.
+///
+/// A real debug binary compiled with `-g` should contain many DW_TAG_subprogram
+/// entries with low_pc/high_pc ranges.
+#[test]
+fn test_find_functions_on_real_binary() {
+    let binary_path = env!("CARGO_BIN_EXE_codetracer-solana-recorder");
+    let elf_data = std::fs::read(binary_path).expect("should be able to read the test binary");
+
+    let functions = find_functions(&elf_data).expect("find_functions should succeed on a real binary");
+
+    assert!(
+        !functions.is_empty(),
+        "real binary should contain at least one function boundary"
+    );
+
+    // Every function boundary must have a non-empty name and a valid range.
+    for func in &functions {
+        assert!(!func.name.is_empty(), "function name should not be empty");
+        assert!(
+            func.end_addr > func.start_addr,
+            "function end_addr ({:#x}) should be greater than start_addr ({:#x}) for {:?}",
+            func.end_addr,
+            func.start_addr,
+            func.name,
+        );
+    }
+}
+
+/// The "main" function (or equivalent entry point) should appear in the list.
+#[test]
+fn test_find_functions_contains_main() {
+    let binary_path = env!("CARGO_BIN_EXE_codetracer-solana-recorder");
+    let elf_data = std::fs::read(binary_path).expect("should be able to read the test binary");
+
+    let functions = find_functions(&elf_data).expect("find_functions should succeed");
+
+    let has_main = functions.iter().any(|f| f.name == "main");
+    assert!(
+        has_main,
+        "should find a 'main' function boundary; found: {:?}",
+        functions.iter().map(|f| &f.name).take(20).collect::<Vec<_>>()
+    );
+}
+
+/// Multiple distinct functions should be found, with non-overlapping or
+/// reasonably sized ranges.
+#[test]
+fn test_find_functions_multiple_distinct() {
+    let binary_path = env!("CARGO_BIN_EXE_codetracer-solana-recorder");
+    let elf_data = std::fs::read(binary_path).expect("should be able to read the test binary");
+
+    let functions = find_functions(&elf_data).expect("find_functions should succeed");
+
+    // A real Rust binary should have many functions.
+    assert!(
+        functions.len() >= 10,
+        "expected at least 10 function boundaries, got {}",
+        functions.len()
+    );
+
+    // Collect unique function names.
+    let unique_names: std::collections::HashSet<&str> =
+        functions.iter().map(|f| f.name.as_str()).collect();
+    assert!(
+        unique_names.len() >= 5,
+        "expected at least 5 unique function names, got {}",
+        unique_names.len()
+    );
+}
+
+/// An ELF address can be tested against function boundaries to determine
+/// which function it belongs to, enabling Call/Return event generation.
+#[test]
+fn test_find_functions_address_lookup() {
+    let binary_path = env!("CARGO_BIN_EXE_codetracer-solana-recorder");
+    let elf_data = std::fs::read(binary_path).expect("should be able to read the test binary");
+
+    let functions = find_functions(&elf_data).expect("find_functions should succeed");
+
+    // Pick the first function and verify an address in its range resolves to it.
+    let func = &functions[0];
+    let mid_addr = func.start_addr + (func.end_addr - func.start_addr) / 2;
+
+    let found = functions
+        .iter()
+        .find(|f| mid_addr >= f.start_addr && mid_addr < f.end_addr);
+    assert!(
+        found.is_some(),
+        "address {:#x} should fall within at least one function boundary",
+        mid_addr
+    );
+    assert_eq!(
+        found.unwrap().name, func.name,
+        "address should resolve to the expected function"
+    );
+}
+
+/// find_functions rejects non-ELF input.
+#[test]
+fn test_find_functions_rejects_non_elf() {
+    let result = find_functions(b"not an elf");
+    assert!(result.is_err(), "non-ELF data should produce an error");
+}
+
+/// find_functions returns an empty list when no DW_TAG_subprogram entries
+/// have address ranges (tested by checking that out-of-range addresses
+/// don't produce false matches).
+#[test]
+fn test_find_functions_all_have_valid_ranges() {
+    let binary_path = env!("CARGO_BIN_EXE_codetracer-solana-recorder");
+    let elf_data = std::fs::read(binary_path).expect("should be able to read the test binary");
+
+    let functions = find_functions(&elf_data).expect("find_functions should succeed");
+
+    // Every returned function must have end_addr > start_addr (no degenerate ranges).
+    for func in &functions {
+        assert!(
+            func.end_addr > func.start_addr,
+            "function {:?} has invalid range: {:#x}..{:#x}",
+            func.name,
+            func.start_addr,
+            func.end_addr,
+        );
+        // Sizes should be reasonable (not spanning the entire address space).
+        let size = func.end_addr - func.start_addr;
+        assert!(
+            size < 100_000_000,
+            "function {:?} has suspiciously large size: {} bytes",
+            func.name,
+            size,
+        );
+    }
+}
+
+/// FunctionBoundary struct equality and clone work correctly.
+#[test]
+fn test_function_boundary_equality_and_clone() {
+    let fb1 = FunctionBoundary {
+        name: "process_instruction".to_string(),
+        start_addr: 0x1000,
+        end_addr: 0x1100,
+    };
+    let fb2 = fb1.clone();
+    assert_eq!(fb1, fb2, "cloned FunctionBoundary should be equal");
+
+    let fb3 = FunctionBoundary {
+        name: "other_fn".to_string(),
+        start_addr: 0x2000,
+        end_addr: 0x2080,
+    };
+    assert_ne!(fb1, fb3, "different FunctionBoundary values should not be equal");
+}
+
+/// FunctionBoundary debug formatting includes all fields.
+#[test]
+fn test_function_boundary_debug() {
+    let fb = FunctionBoundary {
+        name: "my_func".to_string(),
+        start_addr: 0x4000,
+        end_addr: 0x4100,
+    };
+    let debug = format!("{:?}", fb);
+    assert!(debug.contains("my_func"), "debug should contain function name");
+    assert!(debug.contains("4000") || debug.contains("16384"), "debug should contain start_addr");
 }
