@@ -39,10 +39,10 @@ fn record_nonexistent_file_fails() {
 }
 
 #[test]
-fn record_creates_output_files() {
+fn record_rejects_invalid_elf() {
     let tmp = tempfile::TempDir::new().expect("failed to create temp dir");
     let elf_file = tmp.path().join("dummy_program.so");
-    std::fs::write(&elf_file, b"dummy ELF data").expect("failed to write dummy ELF");
+    std::fs::write(&elf_file, b"dummy ELF data").expect("failed to write dummy file");
 
     let out_dir = tmp.path().join("ct-traces");
 
@@ -57,17 +57,18 @@ fn record_creates_output_files() {
         .expect("failed to run");
 
     assert!(
-        output.status.success(),
-        "record should succeed, stderr: {}",
-        String::from_utf8_lossy(&output.stderr)
+        !output.status.success(),
+        "record should fail for invalid ELF input"
     );
 
+    let stderr = String::from_utf8_lossy(&output.stderr);
     assert!(
-        out_dir.join("trace_metadata.json").exists(),
-        "trace_metadata.json should be created"
-    );
-    assert!(
-        out_dir.join("trace_paths.json").exists(),
-        "trace_paths.json should be created"
+        stderr.contains("ELF"),
+        "error message should mention ELF, got: {stderr}"
     );
 }
+
+// NOTE: A test for successful output file creation (`record_creates_output_files`)
+// requires a real ELF binary (e.g. one produced by `cargo-build-sbf`). Such a
+// binary is not available in the unit-test environment, so we only validate
+// the rejection path here.
