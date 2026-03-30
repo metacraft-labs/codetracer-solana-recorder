@@ -163,6 +163,18 @@ fn record(args: RecordArgs) -> Result<()> {
         .canonicalize()
         .with_context(|| format!("ELF file not found: {}", args.elf_file.display()))?;
 
+    // 2. Validate the file has a valid ELF magic number.
+    {
+        let header = std::fs::read(&elf_path)
+            .with_context(|| format!("failed to read ELF file: {}", elf_path.display()))?;
+        if header.len() < 4 || &header[..4] != b"\x7fELF" {
+            eyre::bail!(
+                "invalid ELF file: {} — file does not start with the ELF magic number (\\x7fELF)",
+                elf_path.display()
+            );
+        }
+    }
+
     eprintln!("ELF file: {}", elf_path.display());
 
     // Determine trace format.
