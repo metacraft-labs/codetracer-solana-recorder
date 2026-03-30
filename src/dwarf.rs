@@ -91,7 +91,9 @@ impl DwarfParser {
     ///
     /// Uses the formula: `elf_addr = text_vaddr + (sbf_pc * 8)`.
     pub fn find_location(&self, sbf_pc: u64) -> Option<SourceLocation> {
-        let elf_addr = self.text_vaddr + sbf_pc * 8;
+        let elf_addr = self
+            .text_vaddr
+            .checked_add(sbf_pc.checked_mul(8)?)?;
         let loc = self.context.find_location(elf_addr).ok()??;
         Some(SourceLocation {
             file: loc.file?.to_string(),
