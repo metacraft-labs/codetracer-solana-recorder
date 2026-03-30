@@ -7,6 +7,7 @@ use std::path::Path;
 
 use codetracer_solana_recorder::recorder::record_from_snapshots;
 use codetracer_solana_recorder::register_trace::{RegisterSnapshot, parse_regs_file, ROW_SIZE};
+use codetracer_trace_types::{FullValueRecord, TraceLowLevelEvent, ValueRecord};
 use codetracer_trace_writer::TraceEventsFileFormat;
 
 // ---------------------------------------------------------------------------
@@ -169,24 +170,62 @@ fn test_sbpf_variable_extraction() {
     )
     .unwrap();
 
-    // Read the trace events file and check for register variable values.
+    // Read and parse the trace events as structured data.
     let events_path = tmp.path().join("trace.bin");
     assert!(events_path.exists(), "trace.bin should exist");
     let content = std::fs::read_to_string(&events_path).unwrap();
+    let events: Vec<TraceLowLevelEvent> =
+        serde_json::from_str(&content).expect("trace output should be valid JSON");
 
-    // JSON format: check that register names and expected values appear.
-    // r1 should be 10 at some point.
-    assert!(content.contains("r1"), "trace should contain r1 variable");
-    assert!(content.contains("r2"), "trace should contain r2 variable");
+    // Collect all variable names that were interned.
+    let var_names: Vec<&str> = events
+        .iter()
+        .filter_map(|e| match e {
+            TraceLowLevelEvent::VariableName(n) => Some(n.as_str()),
+            _ => None,
+        })
+        .collect();
 
-    // Check that the integer value 10 appears (r1 = 10).
-    assert!(content.contains("10"), "trace should contain value 10 for r1");
-    // Check that the integer value 32 appears (r2 = 32).
-    assert!(content.contains("32"), "trace should contain value 32 for r2");
-    // Check that the integer value 42 appears (r3 = 42).
-    assert!(content.contains("42"), "trace should contain value 42 for r3");
-    // Check r0 = 94 (return value).
-    assert!(content.contains("94"), "trace should contain value 94 for r0");
+    // Register variable names r0-r10 should be interned.
+    for reg in &["r0", "r1", "r2", "r3", "r4", "r5"] {
+        assert!(
+            var_names.contains(reg),
+            "trace should intern variable name '{reg}', found: {var_names:?}"
+        );
+    }
+
+    // Collect all integer values from Value events.
+    let int_values: Vec<i64> = events
+        .iter()
+        .filter_map(|e| match e {
+            TraceLowLevelEvent::Value(FullValueRecord { value: ValueRecord::Int { i, .. }, .. }) => {
+                Some(*i)
+            }
+            _ => None,
+        })
+        .collect();
+
+    // Expected register values at various steps.
+    assert!(
+        int_values.contains(&10),
+        "trace should contain value 10 (r1), found: {int_values:?}"
+    );
+    assert!(
+        int_values.contains(&32),
+        "trace should contain value 32 (r2), found: {int_values:?}"
+    );
+    assert!(
+        int_values.contains(&42),
+        "trace should contain value 42 (r3 = sum), found: {int_values:?}"
+    );
+    assert!(
+        int_values.contains(&84),
+        "trace should contain value 84 (r4 = doubled), found: {int_values:?}"
+    );
+    assert!(
+        int_values.contains(&94),
+        "trace should contain value 94 (r0 = return value), found: {int_values:?}"
+    );
 }
 
 /// Test 4: Verify 3-file output (trace.bin, trace_metadata.json, trace_paths.json).
@@ -236,16 +275,32 @@ fn test_solana_trace_3file_output() {
         paths.is_array() || paths.is_object(),
         "paths should be a JSON array or object, got: {paths}"
     );
+
+    // trace.bin should be parseable as a JSON array of TraceLowLevelEvent.
+    let events_content =
+        std::fs::read_to_string(tmp.path().join("trace.bin")).unwrap();
+    let events: Vec<TraceLowLevelEvent> = serde_json::from_str(&events_content)
+        .expect("trace.bin should be valid JSON array of events");
+    assert!(
+        !events.is_empty(),
+        "trace events should not be empty"
+    );
+
+    // Metadata should contain recorder info.
+    assert!(
+        meta.get("lang").is_some() || meta.get("program").is_some() || meta.get("command").is_some(),
+        "metadata should have at least one recognized key, got: {meta}"
+    );
 }
 
-/// Test 5: Verify step count and Call/Return events.
+/// Test 5: Verify step count and Call/Return events using parsed trace data.
 #[test]
 fn test_sbpf_step_events() {
     let snapshots = synthetic_snapshots();
     let source_locs = create_synthetic_source_locations();
     let tmp = tempfile::TempDir::new().unwrap();
 
-    // Use JSON format so we can inspect.
+    // Use JSON format so we can parse.
     record_from_snapshots(
         &snapshots,
         &source_locs,
@@ -257,28 +312,67 @@ fn test_sbpf_step_events() {
 
     let events_path = tmp.path().join("trace.bin");
     let content = std::fs::read_to_string(&events_path).unwrap();
+    let events: Vec<TraceLowLevelEvent> =
+        serde_json::from_str(&content).expect("trace output should be valid JSON");
 
-    // We have 7 snapshots, each with a unique line, so 7 Step events.
-    // Count occurrences of "Step" in the JSON.
-    let step_count = content.matches("\"Step\"").count();
-    // There should be at least 7 steps (the 7 source lines) plus the initial
-    // call-step that TraceWriter emits automatically with register_call.
+    // Count structured event types.
+    let step_count = events
+        .iter()
+        .filter(|e| matches!(e, TraceLowLevelEvent::Step(_)))
+        .count();
+    let call_count = events
+        .iter()
+        .filter(|e| matches!(e, TraceLowLevelEvent::Call(_)))
+        .count();
+    let return_count = events
+        .iter()
+        .filter(|e| matches!(e, TraceLowLevelEvent::Return(_)))
+        .count();
+
+    // We have 7 snapshots, each with a unique line, so at least 7 Step events.
     assert!(
         step_count >= 7,
         "expected at least 7 Step events, got {step_count}"
     );
 
     // There should be at least one Call event (the main function call).
-    let call_count = content.matches("\"Call\"").count();
     assert!(
         call_count >= 1,
         "expected at least 1 Call event, got {call_count}"
     );
 
     // There should be at least one Return event.
-    let return_count = content.matches("\"Return\"").count();
     assert!(
         return_count >= 1,
         "expected at least 1 Return event, got {return_count}"
     );
+
+    // Verify that step events reference the correct source file.
+    let step_events: Vec<_> = events
+        .iter()
+        .filter_map(|e| match e {
+            TraceLowLevelEvent::Step(s) => Some(s),
+            _ => None,
+        })
+        .collect();
+
+    // All steps should reference "test.rs" path (by path_id).
+    // Verify we have path events that include "test.rs".
+    let has_test_rs_path = events.iter().any(|e| match e {
+        TraceLowLevelEvent::Path(p) => p.to_string_lossy().contains("test.rs"),
+        _ => false,
+    });
+    assert!(
+        has_test_rs_path,
+        "trace should contain a Path event for 'test.rs'"
+    );
+
+    // Steps should have sequential line numbers (5 through 11).
+    let step_lines: Vec<i64> = step_events.iter().map(|s| s.line.0).collect();
+    for expected_line in 5..=11i64 {
+        assert!(
+            step_lines.contains(&expected_line),
+            "step events should include line {expected_line}, found: {step_lines:?}"
+        );
+    }
 }
