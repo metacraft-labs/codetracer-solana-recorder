@@ -142,6 +142,13 @@ jobs:
             cp media/ct_vscode.js out/ct_vscode.js
           fi
 
+      - name: Update recorder flake inputs
+        run: |
+          # The recorder's flake.lock may pin an old mcl-blockchain that
+          # predates the addition of this language's dev shell. Updating
+          # ensures nix develop can resolve the devShell attribute.
+          nix flake update mcl-blockchain --flake "$GITHUB_WORKSPACE"
+
       - name: Record Solana trace fixture
         run: |
           cd "$GITHUB_WORKSPACE/../codetracer-vscode-extension"
