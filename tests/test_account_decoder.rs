@@ -178,7 +178,7 @@ fn test_decoded_to_value_record() {
 
     // We need to call start before registering types.
     let tmp = tempfile::tempdir().unwrap();
-    let events_path = tmp.path().join("trace.bin");
+    let events_path = tmp.path().join("trace.json");
     let meta_path = tmp.path().join("trace_metadata.json");
     let paths_path = tmp.path().join("trace_paths.json");
 

@@ -354,7 +354,7 @@ fn test_record_with_cpi_using_real_boundaries() {
     );
 
     // Parse the trace output.
-    let content = std::fs::read_to_string(tmp.path().join("trace.bin")).unwrap();
+    let content = std::fs::read_to_string(tmp.path().join("trace.json")).unwrap();
     let events: Vec<TraceLowLevelEvent> =
         serde_json::from_str(&content).expect("valid JSON");
 
@@ -442,7 +442,7 @@ fn test_record_with_cpi_using_real_boundaries() {
     );
 
     // --- All 3 output files should exist ---
-    assert!(tmp.path().join("trace.bin").exists());
+    assert!(tmp.path().join("trace.json").exists());
     assert!(tmp.path().join("trace_metadata.json").exists());
     assert!(tmp.path().join("trace_paths.json").exists());
 }
@@ -558,7 +558,7 @@ fn test_cpi_trace_event_ordering() {
     )
     .unwrap();
 
-    let content = std::fs::read_to_string(tmp.path().join("trace.bin")).unwrap();
+    let content = std::fs::read_to_string(tmp.path().join("trace.json")).unwrap();
     let events: Vec<TraceLowLevelEvent> =
         serde_json::from_str(&content).expect("valid JSON");
 

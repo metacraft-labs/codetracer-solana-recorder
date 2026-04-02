@@ -251,8 +251,8 @@ fn test_cpi_trace_output() {
     .unwrap();
 
     // Read the trace output and verify CPI events.
-    let events_path = tmp.path().join("trace.bin");
-    assert!(events_path.exists(), "trace.bin should exist");
+    let events_path = tmp.path().join("trace.json");
+    assert!(events_path.exists(), "trace.json should exist");
     let content = std::fs::read_to_string(&events_path).unwrap();
 
     // Should have Call events: one for main, one for the CPI call.

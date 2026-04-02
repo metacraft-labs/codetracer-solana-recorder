@@ -297,7 +297,7 @@ fn test_dwarf_integration_with_recorder() {
     );
 
     // Output files should exist.
-    assert!(tmp.path().join("trace.bin").exists(), "trace.bin should exist");
+    assert!(tmp.path().join("trace.json").exists(), "trace.json should exist");
     assert!(
         tmp.path().join("trace_metadata.json").exists(),
         "trace_metadata.json should exist"

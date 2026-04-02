@@ -117,7 +117,11 @@ impl CodeTracerTracer {
         let program_name = source_path.to_string_lossy();
         let mut writer = create_trace_writer(&program_name, &[], format);
 
-        let events_path = out_dir.join("trace.bin");
+        let events_filename = match format {
+            TraceEventsFileFormat::Json => "trace.json",
+            TraceEventsFileFormat::Binary | TraceEventsFileFormat::BinaryV0 => "trace.bin",
+        };
+        let events_path = out_dir.join(events_filename);
         let metadata_path = out_dir.join("trace_metadata.json");
         let paths_path = out_dir.join("trace_paths.json");
 
