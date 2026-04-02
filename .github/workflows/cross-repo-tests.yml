@@ -133,14 +133,12 @@ jobs:
           EXT_BRANCH="${{ steps.resolve-refs.outputs.vscode_extension_branch }}"
           DEST="$GITHUB_WORKSPACE/../codetracer-vscode-extension"
           rm -rf "$DEST"
-          mkdir -p "$DEST"
-          git -C "$DEST" init
-          git -C "$DEST" remote add origin \
-            "https://x-access-token:${GH_TOKEN}@github.com/metacraft-labs/codetracer-vscode-extension.git"
-          git -C "$DEST" fetch origin "$EXT_BRANCH"
-          git -C "$DEST" checkout -b "$EXT_BRANCH" FETCH_HEAD
-          if [ "$EXT_REF" != "$EXT_BRANCH" ] && [ "$EXT_REF" != "main" ]; then
-            git -C "$DEST" checkout "$EXT_REF"
+          git clone --depth 1 \
+            "https://x-access-token:${GH_TOKEN}@github.com/metacraft-labs/codetracer-vscode-extension.git" \
+            "$DEST"
+          if [ "$EXT_BRANCH" != "main" ]; then
+            git -C "$DEST" fetch origin "$EXT_BRANCH"
+            git -C "$DEST" checkout FETCH_HEAD
           fi
 
       - name: Clone nix-blockchain-development
