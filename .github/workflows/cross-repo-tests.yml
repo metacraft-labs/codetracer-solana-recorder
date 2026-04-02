@@ -1,0 +1,165 @@
+# Cross-Repo Integration Tests
+#
+# Validates that changes to this recorder do not break the CodeTracer VS Code
+# extension's Solana DAP and GUI tests.
+#
+# Workspace layout (sibling repos cloned alongside this checkout):
+#   $GITHUB_WORKSPACE/../
+#     codetracer-solana-recorder/                      <-- this repo (checked out)
+#     codetracer/                    <-- cloned (for ct binary)
+#     codetracer-vscode-extension/   <-- cloned (test harness + fixtures)
+
+name: Cross-Repo Integration Tests
+
+on:
+  pull_request:
+    branches: [main]
+  push:
+    branches: [main]
+
+  workflow_dispatch:
+    inputs:
+      codetracer_ref:
+        description: 'Git ref for codetracer repo'
+        required: false
+        default: ''
+      vscode_extension_ref:
+        description: 'Git ref for codetracer-vscode-extension repo'
+        required: false
+        default: ''
+
+  repository_dispatch:
+    types: [cross-repo-test]
+
+jobs:
+  wdio-integration:
+    runs-on: [self-hosted, nixos]
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install Nix
+        uses: metacraft-labs/metacraft-github-actions/setup-nix@main
+        with:
+          cachix-auth-token: ${{ secrets.CACHIX_AUTH_TOKEN }}
+          cachix-cache: ${{ vars.CACHIX_CACHE }}
+          trusted-public-keys: ${{ vars.TRUSTED_PUBLIC_KEYS }}
+          substituters: ${{ vars.SUBSTITUTERS }}
+          gh-token: ${{ secrets.GH_READ_METACRAFT_PRIVATE_REPOS }}
+
+      - name: Install just
+        uses: extractions/setup-just@v2
+
+      # Resolve sibling refs using priority cascade:
+      #   1. workflow_dispatch input (manual override)
+      #   2. repository_dispatch payload (bidirectional trigger)
+      #   3. .github/sibling-pins (pinned SHAs)
+      #   4. Fallback to main
+      - name: Resolve sibling refs
+        id: resolve-refs
+        run: |
+          resolve_ref() {
+            local name="$1" dispatch_input="$2" payload_field="$3"
+
+            # 1. workflow_dispatch input
+            if [ -n "$dispatch_input" ]; then
+              echo "$dispatch_input"
+              return
+            fi
+
+            # 2. repository_dispatch payload
+            if [ -n "$payload_field" ]; then
+              echo "$payload_field"
+              return
+            fi
+
+            # 3. sibling-pins
+            if [ -f .github/sibling-pins ]; then
+              local ref
+              ref="$(grep "^${name} " .github/sibling-pins | cut -d' ' -f2)" || true
+              if [ -n "$ref" ]; then
+                echo "$ref"
+                return
+              fi
+            fi
+
+            # 4. Fallback
+            echo "main"
+          }
+
+          CT_REF=$(resolve_ref codetracer \
+            "${{ github.event.inputs.codetracer_ref }}" \
+            "${{ github.event.client_payload.codetracer_ref }}")
+          EXT_REF=$(resolve_ref codetracer-vscode-extension \
+            "${{ github.event.inputs.vscode_extension_ref }}" \
+            "${{ github.event.client_payload.vscode_extension_ref }}")
+
+          echo "codetracer_ref=$CT_REF" >> "$GITHUB_OUTPUT"
+          echo "vscode_extension_ref=$EXT_REF" >> "$GITHUB_OUTPUT"
+          echo "Resolved refs: codetracer=$CT_REF, vscode-extension=$EXT_REF"
+
+      - name: Clone codetracer
+        uses: metacraft-labs/metacraft-github-actions/clone-repo@main
+        with:
+          repo: metacraft-labs/codetracer
+          ref: ${{ steps.resolve-refs.outputs.codetracer_ref }}
+          path: ${{ github.workspace }}/../codetracer
+          gh-token: ${{ secrets.GH_READ_METACRAFT_PRIVATE_REPOS }}
+          submodules: 'true'
+
+      - name: Clone codetracer-vscode-extension
+        uses: metacraft-labs/metacraft-github-actions/clone-repo@main
+        with:
+          repo: metacraft-labs/codetracer-vscode-extension
+          ref: ${{ steps.resolve-refs.outputs.vscode_extension_ref }}
+          path: ${{ github.workspace }}/../codetracer-vscode-extension
+          gh-token: ${{ secrets.GH_READ_METACRAFT_PRIVATE_REPOS }}
+
+      - name: Build codetracer
+        run: |
+          cd "$GITHUB_WORKSPACE/../codetracer"
+          nix build -L '.?submodules=1#codetracer' \
+            --override-input codetracer-trace-format path:./libs/codetracer-trace-format
+
+      - name: Install extension dependencies
+        run: |
+          cd "$GITHUB_WORKSPACE/../codetracer-vscode-extension"
+          nix develop -c just install
+
+      - name: Compile extension TypeScript
+        run: |
+          cd "$GITHUB_WORKSPACE/../codetracer-vscode-extension"
+          nix develop -c just compile-ts
+
+      - name: Restore Nim-compiled ct_vscode.js
+        run: |
+          cd "$GITHUB_WORKSPACE/../codetracer-vscode-extension"
+          if [ -f media/ct_vscode.js ]; then
+            cp media/ct_vscode.js out/ct_vscode.js
+          fi
+
+      - name: Record Solana trace fixture
+        run: |
+          cd "$GITHUB_WORKSPACE/../codetracer-vscode-extension"
+          FORCE=1 bash scripts/prepare-solana-fixture.sh
+
+      - name: Run Solana smoke tests
+        run: |
+          cd "$GITHUB_WORKSPACE/../codetracer-vscode-extension"
+          nix develop -c just _xvfb-run \
+            "npx wdio run wdio.conf.ts --spec test/wdio/specs/smoke/solana.e2e.ts"
+
+      - name: Run Solana deep tests
+        run: |
+          cd "$GITHUB_WORKSPACE/../codetracer-vscode-extension"
+          nix develop -c just _xvfb-run \
+            "npx wdio run wdio.conf.ts --spec test/wdio/specs/deep/solana-deep.e2e.ts"
+
+      - name: Upload diagnostics on failure
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: wdio-solana-diagnostics
+          path: ${{ github.workspace }}/../codetracer-vscode-extension/test/wdio/diagnostics/
+          retention-days: 7
