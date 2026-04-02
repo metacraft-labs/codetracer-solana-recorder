@@ -171,8 +171,8 @@ fn test_sbpf_variable_extraction() {
     .unwrap();
 
     // Read and parse the trace events as structured data.
-    let events_path = tmp.path().join("trace.bin");
-    assert!(events_path.exists(), "trace.bin should exist");
+    let events_path = tmp.path().join("trace.json");
+    assert!(events_path.exists(), "trace.json should exist");
     let content = std::fs::read_to_string(&events_path).unwrap();
     let events: Vec<TraceLowLevelEvent> =
         serde_json::from_str(&content).expect("trace output should be valid JSON");
@@ -228,7 +228,7 @@ fn test_sbpf_variable_extraction() {
     );
 }
 
-/// Test 4: Verify 3-file output (trace.bin, trace_metadata.json, trace_paths.json).
+/// Test 4: Verify 3-file output (trace.json, trace_metadata.json, trace_paths.json).
 #[test]
 fn test_solana_trace_3file_output() {
     let snapshots = synthetic_snapshots();
@@ -246,8 +246,8 @@ fn test_solana_trace_3file_output() {
 
     // All three trace files must exist.
     assert!(
-        tmp.path().join("trace.bin").exists(),
-        "trace.bin should be created"
+        tmp.path().join("trace.json").exists(),
+        "trace.json should be created"
     );
     assert!(
         tmp.path().join("trace_metadata.json").exists(),
@@ -276,11 +276,11 @@ fn test_solana_trace_3file_output() {
         "paths should be a JSON array or object, got: {paths}"
     );
 
-    // trace.bin should be parseable as a JSON array of TraceLowLevelEvent.
+    // trace.json should be parseable as a JSON array of TraceLowLevelEvent.
     let events_content =
-        std::fs::read_to_string(tmp.path().join("trace.bin")).unwrap();
+        std::fs::read_to_string(tmp.path().join("trace.json")).unwrap();
     let events: Vec<TraceLowLevelEvent> = serde_json::from_str(&events_content)
-        .expect("trace.bin should be valid JSON array of events");
+        .expect("trace.json should be valid JSON array of events");
     assert!(
         !events.is_empty(),
         "trace events should not be empty"
@@ -310,7 +310,7 @@ fn test_sbpf_step_events() {
     )
     .unwrap();
 
-    let events_path = tmp.path().join("trace.bin");
+    let events_path = tmp.path().join("trace.json");
     let content = std::fs::read_to_string(&events_path).unwrap();
     let events: Vec<TraceLowLevelEvent> =
         serde_json::from_str(&content).expect("trace output should be valid JSON");

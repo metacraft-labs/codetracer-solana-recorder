@@ -147,8 +147,8 @@ fn test_real_elf_dwarf_source_mapping_pipeline() {
     );
 
     // Parse the trace output.
-    let events_path = tmp.path().join("trace.bin");
-    assert!(events_path.exists(), "trace.bin should exist");
+    let events_path = tmp.path().join("trace.json");
+    assert!(events_path.exists(), "trace.json should exist");
     let content = std::fs::read_to_string(&events_path).unwrap();
     let events: Vec<TraceLowLevelEvent> =
         serde_json::from_str(&content).expect("trace output should be valid JSON");
@@ -308,7 +308,7 @@ fn test_real_elf_function_boundaries_in_trace() {
     );
 
     // Parse trace output.
-    let content = std::fs::read_to_string(tmp.path().join("trace.bin")).unwrap();
+    let content = std::fs::read_to_string(tmp.path().join("trace.json")).unwrap();
     let events: Vec<TraceLowLevelEvent> =
         serde_json::from_str(&content).expect("valid JSON");
 
@@ -381,7 +381,7 @@ fn test_dwarf_line_fidelity_per_location() {
         );
         assert!(result.is_ok(), "recording should succeed for PC {pc}");
 
-        let content = std::fs::read_to_string(tmp.path().join("trace.bin")).unwrap();
+        let content = std::fs::read_to_string(tmp.path().join("trace.json")).unwrap();
         let events: Vec<TraceLowLevelEvent> =
             serde_json::from_str(&content).expect("valid JSON");
 
@@ -478,7 +478,7 @@ fn test_register_trace_roundtrip_with_dwarf() {
     )
     .unwrap();
 
-    let content = std::fs::read_to_string(tmp.path().join("trace.bin")).unwrap();
+    let content = std::fs::read_to_string(tmp.path().join("trace.json")).unwrap();
     let events: Vec<TraceLowLevelEvent> =
         serde_json::from_str(&content).expect("valid JSON");
 

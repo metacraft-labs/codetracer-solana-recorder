@@ -99,12 +99,12 @@ fn test_codetracer_tracer_records_steps() {
     tracer.finish().unwrap();
 
     // Verify trace files exist.
-    assert!(tmp.path().join("trace.bin").exists());
+    assert!(tmp.path().join("trace.json").exists());
     assert!(tmp.path().join("trace_metadata.json").exists());
     assert!(tmp.path().join("trace_paths.json").exists());
 
     // Verify content has Step events.
-    let content = std::fs::read_to_string(tmp.path().join("trace.bin")).unwrap();
+    let content = std::fs::read_to_string(tmp.path().join("trace.json")).unwrap();
     let step_count = content.matches("\"Step\"").count();
     assert!(
         step_count >= 3,

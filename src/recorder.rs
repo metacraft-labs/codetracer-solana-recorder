@@ -92,7 +92,11 @@ pub fn record_from_snapshots(
     let mut writer = create_trace_writer(&program_name, &[], format);
 
     // Set up output files.
-    let events_path = out_dir.join("trace.bin");
+    let events_filename = match format {
+        TraceEventsFileFormat::Json => "trace.json",
+        TraceEventsFileFormat::Binary | TraceEventsFileFormat::BinaryV0 => "trace.bin",
+    };
+    let events_path = out_dir.join(events_filename);
     let metadata_path = out_dir.join("trace_metadata.json");
     let paths_path = out_dir.join("trace_paths.json");
 
@@ -214,7 +218,11 @@ pub fn record_with_cpi(
     let mut writer = create_trace_writer(&program_name, &[], format);
 
     // Set up output files.
-    let events_path = out_dir.join("trace.bin");
+    let events_filename = match format {
+        TraceEventsFileFormat::Json => "trace.json",
+        TraceEventsFileFormat::Binary | TraceEventsFileFormat::BinaryV0 => "trace.bin",
+    };
+    let events_path = out_dir.join(events_filename);
     let metadata_path = out_dir.join("trace_metadata.json");
     let paths_path = out_dir.join("trace_paths.json");
 

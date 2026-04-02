@@ -97,7 +97,7 @@ fn record_and_read_events(
         TraceEventsFileFormat::Json,
     )
     .unwrap();
-    std::fs::read_to_string(tmp.path().join("trace.bin")).unwrap()
+    std::fs::read_to_string(tmp.path().join("trace.json")).unwrap()
 }
 
 /// Run `record_with_cpi` with JSON output and return the trace events content.
@@ -117,7 +117,7 @@ fn record_cpi_and_read_events(
         TraceEventsFileFormat::Json,
     )
     .unwrap();
-    std::fs::read_to_string(tmp.path().join("trace.bin")).unwrap()
+    std::fs::read_to_string(tmp.path().join("trace.json")).unwrap()
 }
 
 // ---------------------------------------------------------------------------
@@ -1236,7 +1236,7 @@ fn test_decoded_fields_to_struct_record() {
     let mut writer = create_trace_writer("test", &[], TraceEventsFileFormat::Json);
     let tmp = tempfile::TempDir::new().unwrap();
 
-    TraceWriter::begin_writing_trace_events(&mut *writer, &tmp.path().join("trace.bin"))
+    TraceWriter::begin_writing_trace_events(&mut *writer, &tmp.path().join("trace.json"))
         .unwrap();
     TraceWriter::begin_writing_trace_metadata(
         &mut *writer,
@@ -1609,7 +1609,7 @@ fn test_empty_trace() {
     )
     .unwrap();
 
-    assert!(tmp.path().join("trace.bin").exists());
+    assert!(tmp.path().join("trace.json").exists());
     assert!(tmp.path().join("trace_metadata.json").exists());
     assert!(tmp.path().join("trace_paths.json").exists());
 }
@@ -1747,7 +1747,7 @@ fn test_replay_snapshots_produces_trace() {
     replay_snapshots(&mut tracer, &snapshots);
     tracer.finish().unwrap();
 
-    let content = std::fs::read_to_string(tmp.path().join("trace.bin")).unwrap();
+    let content = std::fs::read_to_string(tmp.path().join("trace.json")).unwrap();
     let events = parse_events(&content);
     assert!(!step_events(&events).is_empty(), "should have Step events");
     assert!(has_variable_name(&events, "r0"));
