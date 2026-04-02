@@ -145,6 +145,10 @@ jobs:
       - name: Record Solana trace fixture
         run: |
           cd "$GITHUB_WORKSPACE/../codetracer-vscode-extension"
+          # Strip direnv from PATH so recorder_exec uses 'nix develop' directly.
+          # The direnv-nix-flake-overrides plugin overrides NIX_CONFIG, which
+          # drops the access-tokens needed for private flake inputs.
+          export PATH=$(echo "$PATH" | tr ':' '\n' | grep -v direnv | tr '\n' ':' | sed 's/:$//')
           FORCE=1 bash scripts/prepare-solana-fixture.sh
 
       - name: Run Solana smoke tests
