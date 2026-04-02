@@ -92,9 +92,23 @@ jobs:
             "${{ github.event.inputs.vscode_extension_ref }}" \
             "${{ github.event.client_payload.vscode_extension_ref }}")
 
+          resolve_branch() {
+            local name="$1"
+            if [ -f .github/sibling-pins ]; then
+              local branch
+              branch="$(grep "^${name} " .github/sibling-pins | cut -d' ' -f3)" || true
+              if [ -n "$branch" ]; then
+                echo "$branch"; return
+              fi
+            fi
+            echo "main"
+          }
+
           echo "codetracer_ref=$CT_REF" >> "$GITHUB_OUTPUT"
           echo "vscode_extension_ref=$EXT_REF" >> "$GITHUB_OUTPUT"
-          echo "Resolved refs: codetracer=$CT_REF, vscode-extension=$EXT_REF"
+          EXT_BRANCH=$(resolve_branch codetracer-vscode-extension)
+          echo "vscode_extension_branch=$EXT_BRANCH" >> "$GITHUB_OUTPUT"
+          echo "Resolved refs: codetracer=$CT_REF, vscode-extension=$EXT_REF (branch=$EXT_BRANCH)"
 
       - name: Clone codetracer
         env:
@@ -112,12 +126,20 @@ jobs:
           fi
 
       - name: Clone codetracer-vscode-extension
-        uses: metacraft-labs/metacraft-github-actions/clone-repo@main
-        with:
-          repo: metacraft-labs/codetracer-vscode-extension
-          ref: ${{ steps.resolve-refs.outputs.vscode_extension_ref }}
-          path: ${{ github.workspace }}/../codetracer-vscode-extension
-          gh-token: ${{ secrets.GH_READ_METACRAFT_PRIVATE_REPOS }}
+        env:
+          GH_TOKEN: ${{ secrets.GH_READ_METACRAFT_PRIVATE_REPOS }}
+        run: |
+          EXT_REF="${{ steps.resolve-refs.outputs.vscode_extension_ref }}"
+          EXT_BRANCH="${{ steps.resolve-refs.outputs.vscode_extension_branch }}"
+          DEST="$GITHUB_WORKSPACE/../codetracer-vscode-extension"
+          rm -rf "$DEST"
+          git clone --depth 1 --branch "$EXT_BRANCH" --single-branch \
+            "https://x-access-token:${GH_TOKEN}@github.com/metacraft-labs/codetracer-vscode-extension.git" \
+            "$DEST"
+          if [ "$EXT_REF" != "main" ] && [ "$EXT_REF" != "$EXT_BRANCH" ]; then
+            git -C "$DEST" fetch origin "$EXT_REF"
+            git -C "$DEST" checkout "$EXT_REF"
+          fi
 
       - name: Clone nix-blockchain-development
         env:
