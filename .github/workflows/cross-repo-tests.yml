@@ -129,13 +129,6 @@ jobs:
             "https://x-access-token:${GH_TOKEN}@github.com/metacraft-labs/nix-blockchain-development.git" \
             "$DEST"
 
-      - name: Configure flake input overrides
-        run: |
-          # Point mcl-blockchain to the local clone so nix develop doesn't
-          # need GitHub API auth (which the NixOS daemon can't use).
-          echo "NIX_FLAKE_OVERRIDE_INPUTS='mcl-blockchain=path:../nix-blockchain-development'" > "$GITHUB_WORKSPACE/.env"
-          direnv allow "$GITHUB_WORKSPACE"
-
       - name: Build codetracer
         run: |
           cd "$GITHUB_WORKSPACE/../codetracer"
@@ -158,6 +151,28 @@ jobs:
           if [ -f media/ct_vscode.js ]; then
             cp media/ct_vscode.js out/ct_vscode.js
           fi
+
+      - name: Patch recorder_exec for local flake override
+        run: |
+          cd "$GITHUB_WORKSPACE/../codetracer-vscode-extension"
+          MCL_PATH="$GITHUB_WORKSPACE/../nix-blockchain-development"
+          # Replace recorder_exec to bypass direnv (which can't propagate
+          # GitHub auth to the NixOS Nix daemon) and use --override-input
+          # to resolve mcl-blockchain from the local clone.
+          cat > scripts/recorder-shell-exec.sh << HEREDOC
+          #!/usr/bin/env bash
+          recorder_exec() {
+            local repo_dir="\$1"
+            shift
+            if [ -f "\$repo_dir/flake.nix" ] && command -v nix >/dev/null 2>&1; then
+              nix develop "\$repo_dir" --accept-flake-config \\
+                --override-input mcl-blockchain "path:$MCL_PATH" \\
+                -c "\$@"
+            else
+              "\$@"
+            fi
+          }
+          HEREDOC
 
       - name: Record Solana trace fixture
         run: |
