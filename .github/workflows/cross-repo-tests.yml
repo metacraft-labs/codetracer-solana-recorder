@@ -197,6 +197,13 @@ jobs:
           }
           HEREDOC
 
+      - name: Patch runnablePath for CI
+        run: |
+          CT_BIN="$GITHUB_WORKSPACE/../codetracer/result/bin/ct"
+          SETTINGS="$GITHUB_WORKSPACE/../codetracer-vscode-extension/test/wdio/projects/stylus-test/.vscode/settings.json"
+          echo "{\"codetracer.runnablePath\": \"$CT_BIN\"}" > "$SETTINGS"
+          echo "Patched runnablePath to: $CT_BIN"
+
       - name: Record Solana trace fixture
         run: |
           cd "$GITHUB_WORKSPACE/../codetracer-vscode-extension"
