@@ -154,9 +154,15 @@ jobs:
       - name: Build codetracer
         run: |
           cd "$GITHUB_WORKSPACE/../codetracer"
-          nix build -L '.?submodules=1#codetracer' \
-            --override-input codetracer-trace-format path:./libs/codetracer-trace-format
-          echo "$PWD/result/bin" >> "$GITHUB_PATH"
+          OVERRIDE="--override-input codetracer-trace-format path:./libs/codetracer-trace-format"
+          nix build -L ".?submodules=1#codetracer" $OVERRIDE -o result-ct
+          nix build -L ".?submodules=1#db-backend" $OVERRIDE -o result-db
+          # Merge both outputs into a single bin directory so the extension
+          # can find both ct and db-backend via a single runnablePath.
+          mkdir -p combined-bin
+          ln -sf "$PWD"/result-ct/bin/* combined-bin/
+          ln -sf "$PWD"/result-db/bin/* combined-bin/
+          echo "$PWD/combined-bin" >> "$GITHUB_PATH"
 
       - name: Install extension dependencies
         run: |
@@ -199,7 +205,7 @@ jobs:
 
       - name: Patch runnablePath for CI
         run: |
-          CT_BIN="$GITHUB_WORKSPACE/../codetracer/result/bin/ct"
+          CT_BIN="$GITHUB_WORKSPACE/../codetracer/combined-bin/ct"
           SETTINGS="$GITHUB_WORKSPACE/../codetracer-vscode-extension/test/wdio/projects/stylus-test/.vscode/settings.json"
           mkdir -p "$(dirname "$SETTINGS")"
           echo "{\"codetracer.runnablePath\": \"$CT_BIN\"}" > "$SETTINGS"
