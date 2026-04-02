@@ -99,14 +99,23 @@ jobs:
           echo "vscode_extension_ref=$EXT_REF" >> "$GITHUB_OUTPUT"
           echo "Resolved refs: codetracer=$CT_REF, vscode-extension=$EXT_REF"
 
+      # Clone codetracer with submodules. Uses git clone directly (rather than
+      # clone-repo action) because --recurse-submodules propagates credentials
+      # to all submodules including private ones like tree-sitter-nim.
       - name: Clone codetracer
-        uses: metacraft-labs/metacraft-github-actions/clone-repo@main
-        with:
-          repo: metacraft-labs/codetracer
-          ref: ${{ steps.resolve-refs.outputs.codetracer_ref }}
-          path: ${{ github.workspace }}/../codetracer
-          gh-token: ${{ secrets.GH_READ_METACRAFT_PRIVATE_REPOS }}
-          submodules: 'true'
+        env:
+          GH_TOKEN: ${{ secrets.GH_READ_METACRAFT_PRIVATE_REPOS }}
+        run: |
+          CT_REF="${{ steps.resolve-refs.outputs.codetracer_ref }}"
+          DEST="$GITHUB_WORKSPACE/../codetracer"
+          rm -rf "$DEST"
+          git clone --depth 1 --recurse-submodules --shallow-submodules \
+            "https://x-access-token:${GH_TOKEN}@github.com/metacraft-labs/codetracer.git" \
+            "$DEST"
+          if [ "$CT_REF" != "main" ]; then
+            git -C "$DEST" fetch origin "$CT_REF"
+            git -C "$DEST" checkout "$CT_REF"
+          fi
 
       - name: Clone codetracer-vscode-extension
         uses: metacraft-labs/metacraft-github-actions/clone-repo@main
@@ -156,10 +165,20 @@ jobs:
           nix develop -c just _xvfb-run \
             "npx wdio run wdio.conf.ts --spec test/wdio/specs/deep/solana-deep.e2e.ts"
 
+      - name: Collect diagnostics on failure
+        if: failure()
+        run: |
+          EXT_DIAG="$GITHUB_WORKSPACE/../codetracer-vscode-extension/test/wdio/diagnostics"
+          if [ -d "$EXT_DIAG" ]; then
+            mkdir -p "$GITHUB_WORKSPACE/wdio-diagnostics"
+            cp -r "$EXT_DIAG"/* "$GITHUB_WORKSPACE/wdio-diagnostics/"
+          fi
+
       - name: Upload diagnostics on failure
         if: failure()
         uses: actions/upload-artifact@v4
         with:
           name: wdio-solana-diagnostics
-          path: ${{ github.workspace }}/../codetracer-vscode-extension/test/wdio/diagnostics/
+          path: wdio-diagnostics/
           retention-days: 7
+          if-no-files-found: ignore
