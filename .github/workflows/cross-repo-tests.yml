@@ -133,13 +133,10 @@ jobs:
           EXT_BRANCH="${{ steps.resolve-refs.outputs.vscode_extension_branch }}"
           DEST="$GITHUB_WORKSPACE/../codetracer-vscode-extension"
           rm -rf "$DEST"
-          git clone --depth 1 --branch "$EXT_BRANCH" --single-branch \
+          git clone --branch "$EXT_BRANCH" \
             "https://x-access-token:${GH_TOKEN}@github.com/metacraft-labs/codetracer-vscode-extension.git" \
             "$DEST"
-          # If the desired ref is not already checked out, deepen and checkout
-          CLONED_SHA="$(git -C "$DEST" rev-parse HEAD)"
-          if [ "$CLONED_SHA" != "$EXT_REF" ] && [ "$EXT_REF" != "main" ] && [ "$EXT_REF" != "$EXT_BRANCH" ]; then
-            git -C "$DEST" fetch --unshallow origin "$EXT_BRANCH"
+          if [ "$EXT_REF" != "$EXT_BRANCH" ] && [ "$EXT_REF" != "main" ]; then
             git -C "$DEST" checkout "$EXT_REF"
           fi
 
