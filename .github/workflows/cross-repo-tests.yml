@@ -119,6 +119,23 @@ jobs:
           path: ${{ github.workspace }}/../codetracer-vscode-extension
           gh-token: ${{ secrets.GH_READ_METACRAFT_PRIVATE_REPOS }}
 
+      - name: Clone nix-blockchain-development
+        env:
+          GH_TOKEN: ${{ secrets.GH_READ_METACRAFT_PRIVATE_REPOS }}
+        run: |
+          DEST="$GITHUB_WORKSPACE/../nix-blockchain-development"
+          rm -rf "$DEST"
+          git clone --depth 1 \
+            "https://x-access-token:${GH_TOKEN}@github.com/metacraft-labs/nix-blockchain-development.git" \
+            "$DEST"
+
+      - name: Configure flake input overrides
+        run: |
+          # Point mcl-blockchain to the local clone so nix develop doesn't
+          # need GitHub API auth (which the NixOS daemon can't use).
+          echo "NIX_FLAKE_OVERRIDE_INPUTS='mcl-blockchain=path:../nix-blockchain-development'" > "$GITHUB_WORKSPACE/.env"
+          direnv allow "$GITHUB_WORKSPACE"
+
       - name: Build codetracer
         run: |
           cd "$GITHUB_WORKSPACE/../codetracer"
@@ -142,20 +159,9 @@ jobs:
             cp media/ct_vscode.js out/ct_vscode.js
           fi
 
-      - name: Update recorder flake inputs
-        run: |
-          # The recorder's flake.lock may pin an old mcl-blockchain that
-          # predates the addition of this language's dev shell. Updating
-          # ensures nix develop can resolve the devShell attribute.
-          nix flake update mcl-blockchain --flake "$GITHUB_WORKSPACE"
-
       - name: Record Solana trace fixture
         run: |
           cd "$GITHUB_WORKSPACE/../codetracer-vscode-extension"
-          # Strip direnv from PATH so recorder_exec uses 'nix develop' directly.
-          # The direnv-nix-flake-overrides plugin overrides NIX_CONFIG, which
-          # drops the access-tokens needed for private flake inputs.
-          export PATH=$(echo "$PATH" | tr ':' '\n' | grep -v direnv | tr '\n' ':' | sed 's/:$//')
           FORCE=1 bash scripts/prepare-solana-fixture.sh
 
       - name: Run Solana smoke tests
