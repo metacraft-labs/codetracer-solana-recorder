@@ -31,6 +31,13 @@ on:
   repository_dispatch:
     types: [cross-repo-test]
 
+# Nix needs access-tokens to fetch private flake inputs (e.g. mcl-blockchain).
+# NIX_CONFIG is set globally so both direnv and direct nix develop pick it up.
+env:
+  NIX_CONFIG: |
+    access-tokens = github.com=${{ secrets.GH_READ_METACRAFT_PRIVATE_REPOS }}
+    accept-flake-config = true
+
 jobs:
   wdio-integration:
     runs-on: [self-hosted, nixos]
@@ -43,9 +50,9 @@ jobs:
         uses: metacraft-labs/metacraft-github-actions/setup-nix@main
         with:
           cachix-auth-token: ${{ secrets.CACHIX_AUTH_TOKEN }}
-          cachix-cache: ${{ vars.CACHIX_CACHE }}
-          trusted-public-keys: ${{ vars.TRUSTED_PUBLIC_KEYS }}
-          substituters: ${{ vars.SUBSTITUTERS }}
+          cachix-cache: ''
+          trusted-public-keys: ''
+          substituters: ''
           gh-token: ${{ secrets.GH_READ_METACRAFT_PRIVATE_REPOS }}
 
       - name: Install just
@@ -62,29 +69,19 @@ jobs:
           resolve_ref() {
             local name="$1" dispatch_input="$2" payload_field="$3"
 
-            # 1. workflow_dispatch input
             if [ -n "$dispatch_input" ]; then
-              echo "$dispatch_input"
-              return
+              echo "$dispatch_input"; return
             fi
-
-            # 2. repository_dispatch payload
             if [ -n "$payload_field" ]; then
-              echo "$payload_field"
-              return
+              echo "$payload_field"; return
             fi
-
-            # 3. sibling-pins
             if [ -f .github/sibling-pins ]; then
               local ref
               ref="$(grep "^${name} " .github/sibling-pins | cut -d' ' -f2)" || true
               if [ -n "$ref" ]; then
-                echo "$ref"
-                return
+                echo "$ref"; return
               fi
             fi
-
-            # 4. Fallback
             echo "main"
           }
 
@@ -99,9 +96,6 @@ jobs:
           echo "vscode_extension_ref=$EXT_REF" >> "$GITHUB_OUTPUT"
           echo "Resolved refs: codetracer=$CT_REF, vscode-extension=$EXT_REF"
 
-      # Clone codetracer with submodules. Uses git clone directly (rather than
-      # clone-repo action) because --recurse-submodules propagates credentials
-      # to all submodules including private ones like tree-sitter-nim.
       - name: Clone codetracer
         env:
           GH_TOKEN: ${{ secrets.GH_READ_METACRAFT_PRIVATE_REPOS }}
