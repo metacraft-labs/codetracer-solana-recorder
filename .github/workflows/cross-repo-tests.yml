@@ -156,6 +156,7 @@ jobs:
           cd "$GITHUB_WORKSPACE/../codetracer"
           nix build -L '.?submodules=1#codetracer' \
             --override-input codetracer-trace-format path:./libs/codetracer-trace-format
+          echo "$PWD/result/bin" >> "$GITHUB_PATH"
 
       - name: Install extension dependencies
         run: |
