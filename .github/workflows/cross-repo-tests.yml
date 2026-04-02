@@ -201,6 +201,7 @@ jobs:
         run: |
           CT_BIN="$GITHUB_WORKSPACE/../codetracer/result/bin/ct"
           SETTINGS="$GITHUB_WORKSPACE/../codetracer-vscode-extension/test/wdio/projects/stylus-test/.vscode/settings.json"
+          mkdir -p "$(dirname "$SETTINGS")"
           echo "{\"codetracer.runnablePath\": \"$CT_BIN\"}" > "$SETTINGS"
           echo "Patched runnablePath to: $CT_BIN"
 
