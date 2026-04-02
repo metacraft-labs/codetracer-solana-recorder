@@ -1,2 +1,2 @@
-codetracer 50b737db93f2bf75fceb41141563ef7a7e4a1fa8 main
-codetracer-vscode-extension 8637e04589b5c4a826b3cbbe2ab1ec9e8f929949 fix/guard-npm-compile
+codetracer fe888461c4a2e86725e3215da8d453e1757b4e75 fix/harmonize-out-dir-flags
+codetracer-vscode-extension fda7ae55e61d2d83fba0a38e20eedd1b59d5e8e2 fix/guard-npm-compile
