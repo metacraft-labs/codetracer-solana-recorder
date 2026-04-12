@@ -216,41 +216,34 @@ fn record(args: RecordArgs) -> Result<()> {
         return Ok(());
     }
 
-    // 3. Legacy placeholder mode: no --regs provided.
-    eprintln!("Recording not yet implemented");
+    // 3. Execute the ELF through the SBF VM with register tracing.
+    //    This is the primary recording mode for standalone programs.
+    eprintln!("Executing ELF with register tracing...");
 
-    // Create output directory.
-    let out_dir = &args.out_dir;
-    std::fs::create_dir_all(out_dir)
-        .with_context(|| format!("cannot create output dir: {}", out_dir.display()))?;
+    let elf_data = std::fs::read(&elf_path)
+        .with_context(|| format!("failed to read ELF file: {}", elf_path.display()))?;
 
-    // Write placeholder trace_metadata.json.
-    let metadata = serde_json::json!({
-        "recorder": "codetracer-solana-recorder",
-        "version": env!("CARGO_PKG_VERSION"),
-        "format": format!("{:?}", args.format).to_lowercase(),
-        "status": "placeholder"
-    });
-    std::fs::write(
-        out_dir.join("trace_metadata.json"),
-        serde_json::to_string_pretty(&metadata)?,
+    let regs_data = codetracer_solana_recorder::executor::execute_with_tracing(
+        &elf_data,
+        1_000_000, // 1M compute units
     )
-    .context("failed to write trace_metadata.json")?;
+    .with_context(|| "SBF VM execution failed")?;
 
-    // Write placeholder trace_paths.json.
-    let paths = serde_json::json!({
-        "elf_file": elf_path.to_string_lossy(),
-        "trace_dir": out_dir.to_string_lossy()
-    });
-    std::fs::write(
-        out_dir.join("trace_paths.json"),
-        serde_json::to_string_pretty(&paths)?,
-    )
-    .context("failed to write trace_paths.json")?;
+    eprintln!(
+        "Execution complete: {} register snapshots",
+        regs_data.len() / 96
+    );
 
-    eprintln!("Placeholder trace written to {}", out_dir.display());
-    eprintln!("  trace_metadata.json");
-    eprintln!("  trace_paths.json");
+    // Use the existing record_from_traces pipeline.
+    codetracer_solana_recorder::recorder::record_from_traces(
+        &regs_data,
+        &elf_data,
+        &elf_path,
+        &args.out_dir,
+        format,
+    )?;
+
+    eprintln!("Trace written to {}", args.out_dir.display());
 
     Ok(())
 }
