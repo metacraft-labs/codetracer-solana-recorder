@@ -33,7 +33,7 @@ reqwest = { version = "0.12", features = ["blocking", "json"] }
 base64 = "0.22"
 
 # SBF virtual machine for program execution with register tracing
-solana-sbpf = { path = "../sbpf" }
+solana-sbpf = "0.19"
 
 [dev-dependencies]
 tempfile = "3"
