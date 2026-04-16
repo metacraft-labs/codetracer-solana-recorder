@@ -117,32 +117,33 @@ jobs:
           CT_REF="${{ steps.resolve-refs.outputs.codetracer_ref }}"
           DEST="$GITHUB_WORKSPACE/../codetracer"
           rm -rf "$DEST"
-          # Clone with --recurse-submodules but without --shallow-submodules.
-          # Shallow submodule fetches fail when pinned submodule SHAs are not
-          # reachable from the latest commit (e.g. after force-push or rebase).
-          if ! git clone --depth 1 --recurse-submodules \
+          # Clone without submodules first, then init them individually.
+          # --recurse-submodules fails when submodule SHAs are unreachable
+          # (force-pushed or rebased upstream). Individual init+update is
+          # more resilient: we can skip submodules that fail.
+          git clone --depth 1 \
             "https://x-access-token:${GH_TOKEN}@github.com/metacraft-labs/codetracer.git" \
-            "$DEST" 2>&1; then
-            # Fallback: clone without submodules, then init them separately
-            rm -rf "$DEST"
-            git clone --depth 1 \
-              "https://x-access-token:${GH_TOKEN}@github.com/metacraft-labs/codetracer.git" \
-              "$DEST"
-            cd "$DEST"
-            git submodule init
-            # Rewrite submodule URLs with auth token
-            for url in $(git config --get-regexp '^submodule\..*\.url$' \
-                         | grep -E 'git@github\.com:|https://github\.com/' \
-                         | cut -d' ' -f1); do
-              old_url=$(git config --get "$url")
-              new_url=$(echo "$old_url" \
-                | sed "s|git@github.com:|https://x-access-token:${GH_TOKEN}@github.com/|" \
-                | sed "s|https://github.com/|https://x-access-token:${GH_TOKEN}@github.com/|")
-              git config "$url" "$new_url"
-            done
-            git submodule update --recursive
-            cd -
-          fi
+            "$DEST"
+          cd "$DEST"
+          git submodule init
+          # Rewrite submodule URLs with auth token for private repos
+          for url in $(git config --get-regexp '^submodule\..*\.url$' \
+                       | grep -E 'git@github\.com:|https://github\.com/' \
+                       | cut -d' ' -f1); do
+            old_url=$(git config --get "$url")
+            new_url=$(echo "$old_url" \
+              | sed "s|git@github.com:|https://x-access-token:${GH_TOKEN}@github.com/|" \
+              | sed "s|https://github.com/|https://x-access-token:${GH_TOKEN}@github.com/|")
+            git config "$url" "$new_url"
+          done
+          # Update submodules one by one, skipping failures (some pinned
+          # SHAs may be unreachable). The critical submodule for WDIO tests
+          # is tree-sitter-nim; others are optional.
+          for mod in $(git config --get-regexp '^submodule\..*\.url$' | cut -d. -f2); do
+            git submodule update --depth 1 "$mod" 2>&1 || \
+              echo "::warning::submodule $mod failed to update (non-fatal)"
+          done
+          cd -
           if [ "$CT_REF" != "main" ]; then
             git -C "$DEST" fetch origin "$CT_REF"
             git -C "$DEST" checkout "$CT_REF"
