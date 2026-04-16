@@ -117,9 +117,32 @@ jobs:
           CT_REF="${{ steps.resolve-refs.outputs.codetracer_ref }}"
           DEST="$GITHUB_WORKSPACE/../codetracer"
           rm -rf "$DEST"
-          git clone --depth 1 --recurse-submodules --shallow-submodules \
+          # Clone with --recurse-submodules but without --shallow-submodules.
+          # Shallow submodule fetches fail when pinned submodule SHAs are not
+          # reachable from the latest commit (e.g. after force-push or rebase).
+          if ! git clone --depth 1 --recurse-submodules \
             "https://x-access-token:${GH_TOKEN}@github.com/metacraft-labs/codetracer.git" \
-            "$DEST"
+            "$DEST" 2>&1; then
+            # Fallback: clone without submodules, then init them separately
+            rm -rf "$DEST"
+            git clone --depth 1 \
+              "https://x-access-token:${GH_TOKEN}@github.com/metacraft-labs/codetracer.git" \
+              "$DEST"
+            cd "$DEST"
+            git submodule init
+            # Rewrite submodule URLs with auth token
+            for url in $(git config --get-regexp '^submodule\..*\.url$' \
+                         | grep -E 'git@github\.com:|https://github\.com/' \
+                         | cut -d' ' -f1); do
+              old_url=$(git config --get "$url")
+              new_url=$(echo "$old_url" \
+                | sed "s|git@github.com:|https://x-access-token:${GH_TOKEN}@github.com/|" \
+                | sed "s|https://github.com/|https://x-access-token:${GH_TOKEN}@github.com/|")
+              git config "$url" "$new_url"
+            done
+            git submodule update --recursive
+            cd -
+          fi
           if [ "$CT_REF" != "main" ]; then
             git -C "$DEST" fetch origin "$CT_REF"
             git -C "$DEST" checkout "$CT_REF"
