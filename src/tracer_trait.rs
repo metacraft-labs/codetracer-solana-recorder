@@ -171,6 +171,7 @@ impl CodeTracerTracer {
             .map_err(|e| eyre!("{e}"))?;
         TraceWriter::finish_writing_trace_paths(&mut *self.writer)
             .map_err(|e| eyre!("{e}"))?;
+        self.writer.close().map_err(|e| eyre!("{e}"))?;
         Ok(())
     }
 

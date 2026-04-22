@@ -77,12 +77,6 @@ pub fn record_from_snapshots(
     out_dir: &Path,
     format: TraceEventsFileFormat,
 ) -> Result<()> {
-    // Build a PC -> (file, line) lookup.
-    let pc_to_loc: std::collections::HashMap<u64, (&str, u32)> = source_locations
-        .iter()
-        .map(|(pc, file, line)| (*pc, (*file, *line)))
-        .collect();
-
     // Create output directory.
     std::fs::create_dir_all(out_dir)
         .with_context(|| format!("cannot create output dir: {}", out_dir.display()))?;
@@ -107,22 +101,47 @@ pub fn record_from_snapshots(
     TraceWriter::begin_writing_trace_paths(&mut *writer, &paths_path)
         .map_err(|e| eyre!("{e}"))?;
 
+    record_from_snapshots_into_writer(snapshots, source_locations, source_path, &mut *writer)?;
+
+    // Finish writing.
+    TraceWriter::finish_writing_trace_events(&mut *writer).map_err(|e| eyre!("{e}"))?;
+    TraceWriter::finish_writing_trace_metadata(&mut *writer).map_err(|e| eyre!("{e}"))?;
+    TraceWriter::finish_writing_trace_paths(&mut *writer).map_err(|e| eyre!("{e}"))?;
+    writer.close().map_err(|e| eyre!("{e}"))?;
+
+    Ok(())
+}
+
+/// Core recording logic that writes into any TraceWriter.
+/// Useful for tests with NonStreamingTraceWriter.
+pub fn record_from_snapshots_into_writer(
+    snapshots: &[RegisterSnapshot],
+    source_locations: &[(u64, &str, u32)],
+    source_path: &Path,
+    writer: &mut dyn TraceWriter,
+) -> Result<()> {
+    // Build a PC -> (file, line) lookup.
+    let pc_to_loc: std::collections::HashMap<u64, (&str, u32)> = source_locations
+        .iter()
+        .map(|(pc, file, line)| (*pc, (*file, *line)))
+        .collect();
+
     // Start the trace.
-    TraceWriter::start(&mut *writer, source_path, Line(1));
+    TraceWriter::start(writer, source_path, Line(1));
 
     // Register the u64 type (after start so "None" gets TypeId(0)).
-    let u64_type_id = TraceWriter::ensure_type_id(&mut *writer, TypeKind::Int, "u64");
+    let u64_type_id = TraceWriter::ensure_type_id(writer, TypeKind::Int, "u64");
 
     // Register a function for the main program.
     let main_fn_id = TraceWriter::ensure_function_id(
-        &mut *writer,
+        writer,
         "main",
         source_path,
         Line(1),
     );
 
     // Emit initial call.
-    TraceWriter::register_call(&mut *writer, main_fn_id, vec![]);
+    TraceWriter::register_call(writer, main_fn_id, vec![]);
 
     // Walk snapshots.
     let mut prev_line: Option<u32> = None;
@@ -140,25 +159,23 @@ pub fn record_from_snapshots(
         // Detect function call/return from large PC jumps.
         if let Some(prev) = prev_pc {
             let diff = if pc > prev { pc - prev } else { prev - pc };
-            // A forward jump of more than 2 instructions suggests a call;
-            // a backward jump suggests a return. This is a heuristic.
             if diff > 2 && pc > prev {
                 let callee_fn_id = TraceWriter::ensure_function_id(
-                    &mut *writer,
+                    writer,
                     &format!("fn_at_pc_{pc}"),
                     &Path::new(file_str),
                     Line(line as i64),
                 );
-                TraceWriter::register_call(&mut *writer, callee_fn_id, vec![]);
+                TraceWriter::register_call(writer, callee_fn_id, vec![]);
             } else if diff > 2 && pc < prev {
-                TraceWriter::register_return(&mut *writer, NONE_VALUE);
+                TraceWriter::register_return(writer, NONE_VALUE);
             }
         }
 
         // Emit step when line changes.
         if prev_line != Some(line) {
             TraceWriter::register_step(
-                &mut *writer,
+                writer,
                 &Path::new(file_str),
                 Line(line as i64),
             );
@@ -172,19 +189,14 @@ pub fn record_from_snapshots(
                 i: snap.reg(r) as i64,
                 type_id: u64_type_id,
             };
-            TraceWriter::register_variable_with_full_value(&mut *writer, &name, value);
+            TraceWriter::register_variable_with_full_value(writer, &name, value);
         }
 
         prev_pc = Some(pc);
     }
 
     // Emit return for the main function.
-    TraceWriter::register_return(&mut *writer, NONE_VALUE);
-
-    // Finish writing.
-    TraceWriter::finish_writing_trace_events(&mut *writer).map_err(|e| eyre!("{e}"))?;
-    TraceWriter::finish_writing_trace_metadata(&mut *writer).map_err(|e| eyre!("{e}"))?;
-    TraceWriter::finish_writing_trace_paths(&mut *writer).map_err(|e| eyre!("{e}"))?;
+    TraceWriter::register_return(writer, NONE_VALUE);
 
     Ok(())
 }
@@ -353,6 +365,7 @@ pub fn record_with_cpi(
     TraceWriter::finish_writing_trace_events(&mut *writer).map_err(|e| eyre!("{e}"))?;
     TraceWriter::finish_writing_trace_metadata(&mut *writer).map_err(|e| eyre!("{e}"))?;
     TraceWriter::finish_writing_trace_paths(&mut *writer).map_err(|e| eyre!("{e}"))?;
+    writer.close().map_err(|e| eyre!("{e}"))?;
 
     Ok(())
 }

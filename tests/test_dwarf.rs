@@ -296,12 +296,14 @@ fn test_dwarf_integration_with_recorder() {
         result.err()
     );
 
-    // Output files should exist.
-    assert!(tmp.path().join("trace.json").exists(), "trace.json should exist");
-    assert!(
-        tmp.path().join("trace_metadata.json").exists(),
-        "trace_metadata.json should exist"
-    );
+    // Verify .ct output exists.
+    let ct_files: Vec<_> = std::fs::read_dir(tmp.path())
+        .unwrap()
+        .filter_map(|e| e.ok())
+        .map(|e| e.path())
+        .filter(|p| p.extension().map_or(false, |ext| ext == "ct"))
+        .collect();
+    assert!(!ct_files.is_empty(), "expected .ct file");
 }
 
 // ---------------------------------------------------------------------------
