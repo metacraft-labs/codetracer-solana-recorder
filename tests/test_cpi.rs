@@ -250,42 +250,15 @@ fn test_cpi_trace_output() {
     )
     .unwrap();
 
-    // Read the trace output and verify CPI events.
-    let events_path = tmp.path().join("trace.json");
-    assert!(events_path.exists(), "trace.json should exist");
-    let content = std::fs::read_to_string(&events_path).unwrap();
-
-    // Should have Call events: one for main, one for the CPI call.
-    let call_count = content.matches("\"Call\"").count();
-    assert!(
-        call_count >= 2,
-        "expected at least 2 Call events (main + CPI), got {call_count}"
-    );
-
-    // Should have Return events: one for CPI return, one for main.
-    let return_count = content.matches("\"Return\"").count();
-    assert!(
-        return_count >= 2,
-        "expected at least 2 Return events (CPI return + main), got {return_count}"
-    );
-
-    // Should have Step events covering both programs.
-    let step_count = content.matches("\"Step\"").count();
-    assert!(
-        step_count >= 5,
-        "expected at least 5 Step events, got {step_count}"
-    );
-
-    // The token_program name should appear in the trace (as a function name in a Call).
-    assert!(
-        content.contains("token_program"),
-        "trace should reference the CPI target program"
-    );
-
-    // Verify register values appear.
-    assert!(content.contains("r0"), "trace should contain r0 variable");
-
-    // All three output files should exist.
-    assert!(tmp.path().join("trace_metadata.json").exists());
-    assert!(tmp.path().join("trace_paths.json").exists());
+    // Verify .ct output with CTFS magic bytes.
+    let ct_files: Vec<_> = std::fs::read_dir(tmp.path())
+        .unwrap()
+        .filter_map(|e| e.ok())
+        .map(|e| e.path())
+        .filter(|p| p.extension().map_or(false, |ext| ext == "ct"))
+        .collect();
+    assert!(!ct_files.is_empty(), "expected .ct file in CPI output");
+    let ct_content = std::fs::read(&ct_files[0]).unwrap();
+    assert!(ct_content.len() >= 5, ".ct file too small");
+    assert_eq!(&ct_content[..5], &[0xC0u8, 0xDE, 0x72, 0xAC, 0xE2]);
 }

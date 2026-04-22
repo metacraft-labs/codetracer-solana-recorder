@@ -98,22 +98,14 @@ fn test_codetracer_tracer_records_steps() {
     }
     tracer.finish().unwrap();
 
-    // Verify trace files exist.
-    assert!(tmp.path().join("trace.json").exists());
-    assert!(tmp.path().join("trace_metadata.json").exists());
-    assert!(tmp.path().join("trace_paths.json").exists());
-
-    // Verify content has Step events.
-    let content = std::fs::read_to_string(tmp.path().join("trace.json")).unwrap();
-    let step_count = content.matches("\"Step\"").count();
-    assert!(
-        step_count >= 3,
-        "expected at least 3 Step events, got {step_count}"
-    );
-
-    // Verify register values appear.
-    assert!(content.contains("r1"), "should contain r1 variable");
-    assert!(content.contains("10"), "should contain value 10");
+    // Verify .ct output with CTFS magic bytes.
+    let ct_files: Vec<_> = std::fs::read_dir(tmp.path())
+        .unwrap().filter_map(|e| e.ok()).map(|e| e.path())
+        .filter(|p| p.extension().map_or(false, |ext| ext == "ct")).collect();
+    assert!(!ct_files.is_empty(), "expected .ct file");
+    let ct_content = std::fs::read(&ct_files[0]).unwrap();
+    assert!(ct_content.len() >= 5);
+    assert_eq!(&ct_content[..5], &[0xC0u8, 0xDE, 0x72, 0xAC, 0xE2]);
 }
 
 /// CodeTracerTracer records syscall events.

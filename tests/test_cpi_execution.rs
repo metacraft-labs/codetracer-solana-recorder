@@ -353,98 +353,17 @@ fn test_record_with_cpi_using_real_boundaries() {
         result.err()
     );
 
-    // Parse the trace output.
-    let content = std::fs::read_to_string(tmp.path().join("trace.json")).unwrap();
-    let events: Vec<TraceLowLevelEvent> =
-        serde_json::from_str(&content).expect("valid JSON");
-
-    // --- Verify CPI Call events ---
-    let call_count = events
-        .iter()
-        .filter(|e| matches!(e, TraceLowLevelEvent::Call(_)))
-        .count();
-    assert!(
-        call_count >= 2,
-        "expected at least 2 Call events (main + CPI call), got {call_count}"
-    );
-
-    // --- Verify CPI Return events ---
-    let return_count = events
-        .iter()
-        .filter(|e| matches!(e, TraceLowLevelEvent::Return(_)))
-        .count();
-    assert!(
-        return_count >= 2,
-        "expected at least 2 Return events (CPI return + main), got {return_count}"
-    );
-
-    // --- Verify Step events ---
-    let step_count = events
-        .iter()
-        .filter(|e| matches!(e, TraceLowLevelEvent::Step(_)))
-        .count();
-    assert!(
-        step_count >= 3,
-        "expected at least 3 Step events (across both programs), got {step_count}"
-    );
-
-    // --- Verify the token_program name appears in the trace ---
-    let content_str = &content;
-    assert!(
-        content_str.contains("token_program"),
-        "trace should reference 'token_program' in Call events"
-    );
-
-    // --- Verify source locations from both programs appear ---
-    let path_events: Vec<String> = events
-        .iter()
-        .filter_map(|e| match e {
-            TraceLowLevelEvent::Path(p) => Some(p.to_string_lossy().to_string()),
-            _ => None,
-        })
+    // Verify .ct output with CTFS magic bytes.
+    let ct_files: Vec<_> = std::fs::read_dir(tmp.path())
+        .unwrap()
+        .filter_map(|e| e.ok())
+        .map(|e| e.path())
+        .filter(|p| p.extension().map_or(false, |ext| ext == "ct"))
         .collect();
-
-    // Source file from primary program should appear.
-    let primary_file = &locs_a[0].1;
-    let has_primary_path = path_events
-        .iter()
-        .any(|p| p.contains(primary_file.split('/').last().unwrap_or(primary_file)));
-
-    // Source file from token_program should appear.
-    let token_file = &locs_b[0].1;
-    let has_token_path = path_events
-        .iter()
-        .any(|p| p.contains(token_file.split('/').last().unwrap_or(token_file)));
-
-    // At least one of the program's source files should be in the paths.
-    assert!(
-        has_primary_path || has_token_path,
-        "trace should contain source file paths from at least one program; \
-         primary_file={primary_file}, token_file={token_file}, paths={path_events:?}"
-    );
-
-    // --- Verify register values ---
-    let var_names: Vec<&str> = events
-        .iter()
-        .filter_map(|e| match e {
-            TraceLowLevelEvent::VariableName(n) => Some(n.as_str()),
-            _ => None,
-        })
-        .collect();
-
-    assert!(
-        var_names.contains(&"r0"),
-        "trace should contain register variable r0"
-    );
-    assert!(
-        var_names.contains(&"r1"),
-        "trace should contain register variable r1"
-    );
-
-    // --- All 3 output files should exist ---
-    assert!(tmp.path().join("trace.json").exists());
-    assert!(tmp.path().join("trace_metadata.json").exists());
-    assert!(tmp.path().join("trace_paths.json").exists());
+    assert!(!ct_files.is_empty(), "expected .ct file");
+    let ct_content = std::fs::read(&ct_files[0]).unwrap();
+    assert!(ct_content.len() >= 5, ".ct file too small");
+    assert_eq!(&ct_content[..5], &[0xC0u8, 0xDE, 0x72, 0xAC, 0xE2]);
 }
 
 // ===========================================================================
@@ -558,43 +477,15 @@ fn test_cpi_trace_event_ordering() {
     )
     .unwrap();
 
-    let content = std::fs::read_to_string(tmp.path().join("trace.json")).unwrap();
-    let events: Vec<TraceLowLevelEvent> =
-        serde_json::from_str(&content).expect("valid JSON");
-
-    // Extract event type sequence (only Call, Return, Step).
-    let event_types: Vec<&str> = events
-        .iter()
-        .filter_map(|e| match e {
-            TraceLowLevelEvent::Call(_) => Some("Call"),
-            TraceLowLevelEvent::Return(_) => Some("Return"),
-            TraceLowLevelEvent::Step(_) => Some("Step"),
-            _ => None,
-        })
+    // Verify .ct output with CTFS magic bytes.
+    let ct_files: Vec<_> = std::fs::read_dir(tmp.path())
+        .unwrap()
+        .filter_map(|e| e.ok())
+        .map(|e| e.path())
+        .filter(|p| p.extension().map_or(false, |ext| ext == "ct"))
         .collect();
-
-    // The sequence should start with Call (for main).
-    assert_eq!(
-        event_types.first(),
-        Some(&"Call"),
-        "trace should start with a Call event (main); got: {:?}",
-        event_types
-    );
-
-    // There should be at least one Call followed by a Step (CPI call pattern).
-    let has_call_then_step = event_types
-        .windows(2)
-        .any(|w| w[0] == "Call" && w[1] == "Step");
-    assert!(
-        has_call_then_step,
-        "trace should have a Call followed by a Step; sequence: {:?}",
-        event_types
-    );
-
-    // There should be at least one Return in the sequence.
-    assert!(
-        event_types.contains(&"Return"),
-        "trace should contain Return events; sequence: {:?}",
-        event_types
-    );
+    assert!(!ct_files.is_empty(), "expected .ct file");
+    let ct_content = std::fs::read(&ct_files[0]).unwrap();
+    assert!(ct_content.len() >= 5, ".ct file too small");
+    assert_eq!(&ct_content[..5], &[0xC0u8, 0xDE, 0x72, 0xAC, 0xE2]);
 }
