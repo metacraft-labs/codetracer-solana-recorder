@@ -8,7 +8,7 @@ use std::path::Path;
 use codetracer_solana_recorder::recorder::record_from_snapshots;
 use codetracer_solana_recorder::register_trace::{RegisterSnapshot, parse_regs_file, ROW_SIZE};
 use codetracer_trace_types::{FullValueRecord, TraceLowLevelEvent, ValueRecord};
-use codetracer_trace_writer::TraceEventsFileFormat;
+use codetracer_trace_writer_nim::TraceEventsFileFormat;
 
 // ---------------------------------------------------------------------------
 // Synthetic test data helpers

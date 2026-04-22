@@ -8,8 +8,8 @@ license = "Apache-2.0"
 
 [dependencies]
 # CodeTracer trace format
-codetracer_trace_types = "0.16"
-codetracer_trace_writer = "0.17"
+codetracer_trace_types = { path = "../codetracer-trace-format/codetracer_trace_types" }
+codetracer_trace_writer_nim = { path = "../codetracer-trace-format/codetracer_trace_writer_nim" }
 
 # DWARF parsing for source mapping
 addr2line = "0.24"

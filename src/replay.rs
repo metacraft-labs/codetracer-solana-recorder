@@ -23,7 +23,7 @@
 
 use std::path::{Path, PathBuf};
 
-use codetracer_trace_writer::TraceEventsFileFormat;
+use codetracer_trace_writer_nim::TraceEventsFileFormat;
 use eyre::{Context, Result, bail, eyre};
 
 use crate::recorder::record_from_snapshots;

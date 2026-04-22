@@ -7,8 +7,8 @@
 use std::path::Path;
 
 use codetracer_trace_types::{Line, TypeKind, ValueRecord, NONE_VALUE};
-use codetracer_trace_writer::trace_writer::TraceWriter;
-use codetracer_trace_writer::{TraceEventsFileFormat, create_trace_writer};
+use codetracer_trace_writer_nim::trace_writer::TraceWriter;
+use codetracer_trace_writer_nim::{TraceEventsFileFormat, create_trace_writer};
 use eyre::{Context, Result, eyre};
 
 use crate::cpi::{CpiDetector, CpiEvent};
@@ -94,7 +94,7 @@ pub fn record_from_snapshots(
     // Set up output files.
     let events_filename = match format {
         TraceEventsFileFormat::Json => "trace.json",
-        TraceEventsFileFormat::Binary | TraceEventsFileFormat::BinaryV0 => "trace.bin",
+        TraceEventsFileFormat::Binary | TraceEventsFileFormat::BinaryV0 | TraceEventsFileFormat::Ctfs => "trace.bin",
     };
     let events_path = out_dir.join(events_filename);
     let metadata_path = out_dir.join("trace_metadata.json");
@@ -220,7 +220,7 @@ pub fn record_with_cpi(
     // Set up output files.
     let events_filename = match format {
         TraceEventsFileFormat::Json => "trace.json",
-        TraceEventsFileFormat::Binary | TraceEventsFileFormat::BinaryV0 => "trace.bin",
+        TraceEventsFileFormat::Binary | TraceEventsFileFormat::BinaryV0 | TraceEventsFileFormat::Ctfs => "trace.bin",
     };
     let events_path = out_dir.join(events_filename);
     let metadata_path = out_dir.join("trace_metadata.json");

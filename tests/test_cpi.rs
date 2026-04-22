@@ -6,7 +6,7 @@ use codetracer_solana_recorder::cpi::{CpiDetector, CpiEvent};
 use codetracer_solana_recorder::multi_program::ProgramRegistry;
 use codetracer_solana_recorder::recorder::record_with_cpi;
 use codetracer_solana_recorder::register_trace::RegisterSnapshot;
-use codetracer_trace_writer::TraceEventsFileFormat;
+use codetracer_trace_writer_nim::TraceEventsFileFormat;
 
 // ---------------------------------------------------------------------------
 // Helpers

@@ -19,7 +19,7 @@
 use codetracer_trace_types::{
     FieldTypeRecord, TypeId, TypeKind, TypeRecord, TypeSpecificInfo, ValueRecord,
 };
-use codetracer_trace_writer::trace_writer::TraceWriter;
+use codetracer_trace_writer_nim::trace_writer::TraceWriter;
 use eyre::{Result, bail, ensure};
 use serde::Deserialize;
 

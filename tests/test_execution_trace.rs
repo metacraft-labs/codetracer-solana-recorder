@@ -20,7 +20,7 @@ use codetracer_solana_recorder::dwarf::{DwarfParser, find_functions};
 use codetracer_solana_recorder::recorder::record_from_traces;
 use codetracer_solana_recorder::register_trace::ROW_SIZE;
 use codetracer_trace_types::TraceLowLevelEvent;
-use codetracer_trace_writer::TraceEventsFileFormat;
+use codetracer_trace_writer_nim::TraceEventsFileFormat;
 
 // ---------------------------------------------------------------------------
 // Helpers

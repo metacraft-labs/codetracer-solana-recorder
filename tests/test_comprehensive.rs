@@ -21,8 +21,8 @@ use codetracer_trace_types::{
     CallRecord, FullValueRecord, FunctionRecord, Line, ReturnRecord, StepRecord,
     TraceLowLevelEvent, ValueRecord,
 };
-use codetracer_trace_writer::trace_writer::TraceWriter;
-use codetracer_trace_writer::{TraceEventsFileFormat, create_trace_writer};
+use codetracer_trace_writer_nim::trace_writer::TraceWriter;
+use codetracer_trace_writer_nim::{TraceEventsFileFormat, create_trace_writer};
 
 // ===========================================================================
 // Helpers
