@@ -259,7 +259,7 @@ fn test_source_location_debug() {
 fn test_dwarf_integration_with_recorder() {
     use codetracer_solana_recorder::recorder::record_from_traces;
     use codetracer_solana_recorder::register_trace::ROW_SIZE;
-    use codetracer_trace_writer::TraceEventsFileFormat;
+    use codetracer_trace_writer_nim::TraceEventsFileFormat;
 
     let binary_path = env!("CARGO_BIN_EXE_codetracer-solana-recorder");
     let elf_data = std::fs::read(binary_path).expect("should be able to read the test binary");

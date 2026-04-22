@@ -4,8 +4,8 @@ use codetracer_solana_recorder::account_decoder::{
     AnchorIdl, BorshDecoder, DecodedField, DecodedValue, TypeIds, decoded_to_value_record,
 };
 use codetracer_trace_types::ValueRecord;
-use codetracer_trace_writer::{TraceEventsFileFormat, create_trace_writer};
-use codetracer_trace_writer::trace_writer::TraceWriter;
+use codetracer_trace_writer_nim::{TraceEventsFileFormat, create_trace_writer};
+use codetracer_trace_writer_nim::trace_writer::TraceWriter;
 
 // ---------------------------------------------------------------------------
 // Borsh decoding tests

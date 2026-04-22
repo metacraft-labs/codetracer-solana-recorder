@@ -6,7 +6,7 @@ use codetracer_solana_recorder::register_trace::{RegisterSnapshot, parse_regs_fi
 use codetracer_solana_recorder::tracer_trait::{
     CodeTracerTracer, NoOpTracer, RegisterTraceTracer, SbpfTracer, replay_snapshots,
 };
-use codetracer_trace_writer::TraceEventsFileFormat;
+use codetracer_trace_writer_nim::TraceEventsFileFormat;
 
 // ---------------------------------------------------------------------------
 // Helpers
