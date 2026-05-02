@@ -25,7 +25,9 @@ use crate::register_trace::{RegisterSnapshot, parse_regs_file};
 /// * `elf_data`  - Raw ELF file content (unstripped, with DWARF)
 /// * `source_path` - Path to display in the trace for source locations
 /// * `out_dir`   - Directory where trace files will be written
-/// * `format`    - Output format (Binary or Json)
+/// * `format`    - Output format.  Use `TraceEventsFileFormat::Ctfs` for the
+///   canonical multi-stream container; the other variants are legacy and
+///   are not consumed by the modern `NimTraceReaderHandle` FFI.
 pub fn record_from_traces(
     regs_data: &[u8],
     elf_data: &[u8],
@@ -212,7 +214,7 @@ pub fn record_from_snapshots_into_writer(
 /// * `cpi_detector`      - CPI detector initialised with the primary program's range
 /// * `source_path`       - Path to display in the trace for the primary program
 /// * `out_dir`           - Directory where trace files will be written
-/// * `format`            - Output format (Binary or Json)
+/// * `format`            - Output format.  Prefer `TraceEventsFileFormat::Ctfs`.
 pub fn record_with_cpi(
     snapshots: &[RegisterSnapshot],
     registry: &ProgramRegistry,
@@ -284,6 +286,31 @@ pub fn record_with_cpi(
                     program_name_str,
                     &Path::new(&file_str),
                     Line(line as i64),
+                );
+                // Stage CPI-target metadata as call args so the calltrace
+                // pane displays which program was invoked and at what PC.
+                // Mirrors the `register_call_arg` / `arg` pattern from the
+                // Ruby (1.22) and JS (1.38) recorders — see section 5.6 of
+                // /tmp/isonim-migration.txt.
+                let pc_type_id =
+                    TraceWriter::ensure_type_id(&mut *writer, TypeKind::Int, "u64");
+                let str_type_id =
+                    TraceWriter::ensure_type_id(&mut *writer, TypeKind::String, "string");
+                let _ = TraceWriter::arg(
+                    &mut *writer,
+                    "target_program",
+                    ValueRecord::String {
+                        text: program_name_str.to_string(),
+                        type_id: str_type_id,
+                    },
+                );
+                let _ = TraceWriter::arg(
+                    &mut *writer,
+                    "target_pc",
+                    ValueRecord::Int {
+                        i: target_pc as i64,
+                        type_id: pc_type_id,
+                    },
                 );
                 TraceWriter::register_call(&mut *writer, cpi_fn_id, vec![]);
                 // Reset line tracking for the new program context.

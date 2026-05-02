@@ -12,7 +12,7 @@
 use std::io::Write;
 use std::path::Path;
 
-use codetracer_trace_types::{Line, TypeKind, ValueRecord, NONE_VALUE};
+use codetracer_trace_types::{EventLogKind, Line, TypeKind, ValueRecord, NONE_VALUE};
 use codetracer_trace_writer_nim::trace_writer::TraceWriter;
 use codetracer_trace_writer_nim::{TraceEventsFileFormat, create_trace_writer};
 use eyre::{Result, eyre};
@@ -239,6 +239,29 @@ impl SbpfTracer for CodeTracerTracer {
 
     fn on_syscall(&mut self, name: &str, _registers: &[u64; 12]) {
         self.recorded_syscalls.push(name.to_string());
+
+        // Emit the syscall to the canonical IO event stream so the
+        // CodeTracer "event log" pane shows program log output.
+        // Solana program logs are emitted through `sol_log` and the
+        // `sol_log_*` family of syscalls — these are the SBF
+        // equivalent of stdout writes, so they map to `EventLogKind::Write`
+        // (the same bucket used by the Ruby/Python recorders for
+        // stdout — see handoff entries 1.21 / 1.27 in
+        // /tmp/isonim-migration.txt).
+        //
+        // Other syscalls (sol_invoke_signed et al.) are non-IO control
+        // events; we use `EventLogKind::TraceLogEvent` for them so they
+        // appear in the trace as structured diagnostic events without
+        // polluting the program-log pane.
+        if !self.started {
+            return;
+        }
+        let kind = if name.starts_with("sol_log") {
+            EventLogKind::Write
+        } else {
+            EventLogKind::TraceLogEvent
+        };
+        TraceWriter::register_special_event(&mut *self.writer, kind, name, "");
     }
 
     fn on_cpi_call(&mut self, _program_id: &[u8; 32], _instruction_data: &[u8]) {

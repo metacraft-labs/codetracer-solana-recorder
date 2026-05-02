@@ -68,9 +68,23 @@ enum Commands {
     Version,
 }
 
+/// Trace output format selectable from the CLI.
+///
+/// `Ctfs` is the canonical multi-stream format consumed by the
+/// `NimTraceReaderHandle` FFI and the db-backend's `CTFSTraceReader`.
+/// `Binary` (legacy CBOR+Zstd) and `Json` remain available for
+/// debugging / interop with older tooling, but should not be used
+/// for new traces — the canonical Nim reader cannot decode them
+/// without a postprocess pass.
 #[derive(Debug, Clone, ValueEnum)]
 enum OutputFormat {
+    /// Canonical CTFS multi-stream container (steps.dat + calls.dat
+    /// + events.dat + funcs.dat + …).  Default and recommended.
+    Ctfs,
+    /// Legacy CBOR+Zstd binary container.  Kept for migration only.
     Binary,
+    /// Legacy JSON `events.log` + `meta.json` + `paths.json`.
+    /// Kept for migration / human inspection only.
     Json,
 }
 
@@ -102,7 +116,7 @@ struct RecordArgs {
     idl: Option<PathBuf>,
 
     /// Output format for the trace data.
-    #[arg(short = 'f', long = "format", default_value = "binary")]
+    #[arg(short = 'f', long = "format", default_value = "ctfs")]
     format: OutputFormat,
 }
 
@@ -128,7 +142,7 @@ struct ReplayArgs {
     out_dir: PathBuf,
 
     /// Output format for the trace data.
-    #[arg(short = 'f', long = "format", default_value = "binary")]
+    #[arg(short = 'f', long = "format", default_value = "ctfs")]
     format: OutputFormat,
 }
 
@@ -179,6 +193,7 @@ fn record(args: RecordArgs) -> Result<()> {
 
     // Determine trace format.
     let format = match args.format {
+        OutputFormat::Ctfs => TraceEventsFileFormat::Ctfs,
         OutputFormat::Binary => TraceEventsFileFormat::Binary,
         OutputFormat::Json => TraceEventsFileFormat::Json,
     };
@@ -255,6 +270,7 @@ fn record(args: RecordArgs) -> Result<()> {
 /// Execute the `replay` subcommand.
 fn replay(args: ReplayArgs) -> Result<()> {
     let format = match args.format {
+        OutputFormat::Ctfs => TraceEventsFileFormat::Ctfs,
         OutputFormat::Binary => TraceEventsFileFormat::Binary,
         OutputFormat::Json => TraceEventsFileFormat::Json,
     };
