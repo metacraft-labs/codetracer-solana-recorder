@@ -252,21 +252,47 @@ fn record_rejects_missing_regs_file() {
 // ===========================================================================
 
 /// Record a synthetic 7-instruction program through `record_from_snapshots`,
-/// then convert the produced `.ct` container to JSON via `ct-print --json`
-/// and assert on the textual representation.
+/// then convert the produced `.ct` container to JSON via `ct-print` and
+/// assert on:
+///
+/// 1. **Structural anchors** (legacy layer): `ct-print --json` output
+///    contains the source filename and at least one of the SBF
+///    register names somewhere in the textual rendering.
+/// 2. **Exact decoded values** (the layer enabled by `ct-print --full`):
+///    the synthetic fixture mirrors the canonical `(10 + 32) * 2 + 10
+///    = 94` flow used by every other recorder's content test
+///    (cairo / cardano / circom / flow / fuel / leo / miden / move /
+///    polkavm).  Intermediate let-bindings `a=10`, `b=32`,
+///    `sum_val=42`, `doubled=84`, `final_result=94` are not recovered
+///    by the Solana recorder yet (no DWARF-aware let-binding pass —
+///    same limitation as polkavm), so the canonical values surface
+///    through the SBF register stream the synthetic snapshots seed:
+///    `r1=10` (a), `r2=32` (b), `r3=42` (sum_val), `r4=84` (doubled),
+///    `r5=94` (final_result), and `r0=94` for the return value.
+///    Each value must surface in the trace as a step variable with a
+///    decoded `Int` ValueRecord whose `i` field matches the canonical
+///    literal.
 ///
 /// Pre-2026-05-08 the recorder shipped a `--format json` mode and a
 /// `trace.json` file was written directly.  The convention now mandates
 /// CTFS-only output; `ct print` is the canonical conversion tool.  See
-/// `Recorder-CLI-Conventions.md` §4.
+/// `Recorder-CLI-Conventions.md` §4.  `ct-print --full` (added 2026-05
+/// in `codetracer-trace-format-nim`) is what enables the exact-value
+/// layer — its output is a deterministic JSON document with every CBOR
+/// `ValueRecord` decoded to a structured form like
+/// `{"kind":"Int","i":42,"type_id":N}`.
 ///
-/// The Solana recorder's variable payload (register values encoded as
-/// `ValueRecord::Int { i, type_id }`) does not round-trip through
-/// `ct print --json` today (same pre-existing limitation as cardano /
-/// circom / flow / fuel / leo / miden / move / polkavm), so this test
-/// asserts on **structural anchors** — the fixture's source path file
-/// name and at least one of the SBF register names — rather than on
-/// integer values.
+/// The note in earlier revisions of this test about register integer
+/// payloads not round-tripping through `ct-print --json` is empirically
+/// obsolete for `--full`: the recorder's
+/// `register_variable_with_full_value` path decodes back to
+/// `{"kind":"Int","i":<n>,"type_id":N}` with values intact.  The
+/// strict `value.kind == "Int"` invariant means: if a future Solana
+/// recorder upgrade emits a different `ValueRecord` variant for SBF
+/// register values (e.g. a `Raw` 8-byte register snapshot once the
+/// recorder learns to surface 64-bit unsigned values that overflow
+/// i64), this test fails loudly and the next maintainer extends the
+/// assertion to the new variant rather than silently accepting it.
 #[test]
 fn test_recorded_trace_via_ct_print_json() {
     let ct_print = ct_print_path();
@@ -308,7 +334,11 @@ fn test_recorded_trace_via_ct_print_json() {
     );
     let ct_path = &ct_files[0];
 
-    // ct-print --json <file.ct>
+    // -----------------------------------------------------------------
+    // Layer 1 (legacy): ct-print --json — substring presence checks.
+    // Kept as a safety net so a regression in the textual rendering
+    // is caught even if --full's JSON shape evolves.
+    // -----------------------------------------------------------------
     let output = Command::new(&ct_print)
         .args(["--json"])
         .arg(ct_path)
@@ -317,19 +347,22 @@ fn test_recorded_trace_via_ct_print_json() {
 
     assert!(
         output.status.success(),
-        "ct-print should succeed; stderr: {}",
+        "ct-print --json should succeed; stderr: {}",
         String::from_utf8_lossy(&output.stderr)
     );
 
-    let stdout = String::from_utf8_lossy(&output.stdout);
-    assert!(!stdout.is_empty(), "ct-print --json produced empty output");
+    let stdout_json = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        !stdout_json.is_empty(),
+        "ct-print --json produced empty output"
+    );
 
     // Structural anchor 1: the fixture source path name appears in the
     // path stream rendered by ct-print.
     assert!(
-        stdout.contains("solana_fixture.rs"),
+        stdout_json.contains("solana_fixture.rs"),
         "ct-print --json output should mention the fixture source path \
-         (solana_fixture.rs); got:\n{stdout}"
+         (solana_fixture.rs); got:\n{stdout_json}"
     );
 
     // Structural anchor 2: at least one of the SBF register names
@@ -338,12 +371,194 @@ fn test_recorded_trace_via_ct_print_json() {
     // `record_from_snapshots_into_writer` in `src/recorder.rs`.
     let register_anchor = ["r0", "r1", "r2", "r3", "r4", "r5"]
         .iter()
-        .any(|v| stdout.contains(v));
+        .any(|v| stdout_json.contains(v));
     assert!(
         register_anchor,
         "ct-print --json output should mention at least one of the \
-         SBF register names (r0..r5); got:\n{stdout}"
+         SBF register names (r0..r5); got:\n{stdout_json}"
     );
+
+    // -----------------------------------------------------------------
+    // Layer 2 (the upgrade): ct-print --full — exact decoded values.
+    // -----------------------------------------------------------------
+    let full_output = Command::new(&ct_print)
+        .args(["--full", "--strip-paths"])
+        .arg(ct_path)
+        .output()
+        .expect("failed to run ct-print --full");
+
+    assert!(
+        full_output.status.success(),
+        "ct-print --full should succeed; stderr: {}",
+        String::from_utf8_lossy(&full_output.stderr)
+    );
+
+    let doc: serde_json::Value = serde_json::from_slice(&full_output.stdout)
+        .expect("ct-print --full should emit valid JSON");
+
+    // ----- Path table: the canonical fixture path must appear ---------
+    let paths: Vec<&str> = doc["paths"]
+        .as_array()
+        .expect("paths array")
+        .iter()
+        .filter_map(|v| v.as_str())
+        .collect();
+    assert!(
+        paths.iter().any(|p| p.ends_with("solana_fixture.rs")),
+        "expected solana_fixture.rs in paths table; got {:?}",
+        paths
+    );
+
+    // ----- Function table: exactly `main` ----------------------------
+    // The Solana recorder synthesises a single top-level `main`
+    // function for every recording (see
+    // `record_from_snapshots_into_writer` in `src/recorder.rs`) and
+    // emits no nested call frames for the synthetic fixture (the PC
+    // jumps stay within the +/- 2 step delta that the recorder's call
+    // heuristic tolerates without synthesising an `fn_at_pc_*`
+    // frame).  Pin both invariants down explicitly so a future change
+    // (DWARF-aware function-name resolution, or a different call
+    // heuristic) trips this assertion and the next maintainer extends
+    // the call-sequence checks below to cover the new behaviour.
+    let functions: Vec<&str> = doc["functions"]
+        .as_array()
+        .expect("functions array")
+        .iter()
+        .filter_map(|v| v.as_str())
+        .collect();
+    assert_eq!(
+        functions.len(),
+        1,
+        "expected exactly 1 entry in the functions table; got {:?} — \
+         if multi-frame call synthesis or DWARF function-name \
+         resolution has landed, extend this test to assert on the \
+         resolved names via `ends_with` matching",
+        functions
+    );
+    assert!(
+        functions[0].ends_with("main"),
+        "expected the sole function-table entry to be `main`; got {:?}",
+        functions
+    );
+
+    // ----- Step / call counts ----------------------------------------
+    // The recorder emits one initial step at the trace start (line 1),
+    // then a delta step per source-line transition for each of the 7
+    // synthetic snapshots (lines 5..=11), for 8 step events total.  A
+    // single call_entry frame for `main` wraps the whole trace.  These
+    // are stable properties of the synthetic fixture under the current
+    // Solana recorder — if they change, that's a real regression to
+    // investigate, not a flake.
+    let counts = &doc["counts"];
+    assert_eq!(
+        counts["steps"].as_u64(),
+        Some(8),
+        "expected 8 step events for the synthetic Solana fixture; \
+         counts={counts}",
+    );
+    assert_eq!(
+        counts["calls"].as_u64(),
+        Some(1),
+        "expected exactly 1 call event (the synthesised `main` frame); \
+         counts={counts}",
+    );
+    assert_eq!(
+        counts["paths"].as_u64(),
+        Some(1),
+        "expected exactly 1 path (solana_fixture.rs); counts={counts}",
+    );
+
+    let events = doc["events"].as_array().expect("events array");
+
+    // ----- Call sequence: exactly `main` -----------------------------
+    let call_sequence: Vec<&str> = events
+        .iter()
+        .filter(|e| e["kind"] == "call_entry")
+        .filter_map(|e| e["function"].as_str())
+        .collect();
+    assert_eq!(
+        call_sequence.len(),
+        1,
+        "expected exactly 1 call_entry event; got {:?}",
+        call_sequence
+    );
+    assert!(
+        call_sequence[0].ends_with("main"),
+        "expected the sole call_entry to be `main`; got {:?}",
+        call_sequence
+    );
+
+    // ----- Strict ValueRecord variant + exact decoded values ---------
+    // Collect every (varname, i64) pair surfaced by step events.  The
+    // Solana recorder writes register values as `ValueRecord::Int`
+    // CBOR blobs (see `register_variable_with_full_value` in
+    // `src/recorder.rs`); ct-print --full decodes them back to
+    // `{"kind":"Int","i":<n>,...}`.  If a different variant surfaces
+    // (e.g. a `Raw` 8-byte register snapshot once the recorder learns
+    // to surface 64-bit unsigned values that overflow i64), fail
+    // loudly so the test author can decide whether to extend the
+    // assertions or accept the new variant.
+    let observed_vars: Vec<(String, i64)> = events
+        .iter()
+        .filter(|e| e["kind"] == "step")
+        .flat_map(|e| {
+            e["vars"]
+                .as_array()
+                .cloned()
+                .unwrap_or_default()
+                .into_iter()
+        })
+        .map(|v| {
+            let name = v["varname"]
+                .as_str()
+                .expect("step var should have a varname")
+                .to_string();
+            let value = &v["value"];
+            assert_eq!(
+                value["kind"].as_str(),
+                Some("Int"),
+                "register `{}` should decode as Int, got {}; \
+                 if a new ValueRecord variant has landed for Solana \
+                 SBF register values, extend this test to assert on \
+                 it explicitly rather than weakening the check",
+                name,
+                value
+            );
+            let i = value["i"]
+                .as_i64()
+                .unwrap_or_else(|| panic!("Int.i must be i64 for `{name}`; got {value}"));
+            (name, i)
+        })
+        .collect();
+
+    // The canonical (10+32)*2+10 = 94 flow seeded by
+    // `build_synthetic_regs` above:
+    //   r1 = 10 (a)
+    //   r2 = 32 (b)
+    //   r3 = 42 (sum_val = a + b)
+    //   r4 = 84 (doubled = sum_val * 2)
+    //   r5 = 94 (final_result = doubled + a)
+    //   r0 = 94 (return value)
+    // Each (register, value) pair must surface at least once across
+    // the step stream.  Same canonical values as cairo / polkavm /
+    // etc. — if these six don't surface, that's the bug to chase.
+    let expected: &[(&str, i64)] = &[
+        ("r1", 10),
+        ("r2", 32),
+        ("r3", 42),
+        ("r4", 84),
+        ("r5", 94),
+        ("r0", 94),
+    ];
+    for (name, value) in expected {
+        assert!(
+            observed_vars
+                .iter()
+                .any(|(n, v)| n == name && v == value),
+            "expected step variable `{name}` = {value} in --full output; \
+             observed = {observed_vars:?}"
+        );
+    }
 }
 
 // ===========================================================================
