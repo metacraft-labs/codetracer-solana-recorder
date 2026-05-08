@@ -8,7 +8,6 @@ use std::path::Path;
 use codetracer_solana_recorder::recorder::record_from_snapshots;
 use codetracer_solana_recorder::register_trace::{RegisterSnapshot, parse_regs_file, ROW_SIZE};
 use codetracer_trace_types::{FullValueRecord, TraceLowLevelEvent, ValueRecord};
-use codetracer_trace_writer_nim::TraceEventsFileFormat;
 
 // ---------------------------------------------------------------------------
 // Synthetic test data helpers
@@ -148,7 +147,6 @@ fn test_sbpf_source_mapping() {
         &source_locs,
         Path::new("test.rs"),
         tmp.path(),
-        TraceEventsFileFormat::Json,
     )
     .unwrap();
 }
@@ -161,13 +159,12 @@ fn test_sbpf_variable_extraction() {
     let source_locs = create_synthetic_source_locations();
     let tmp = tempfile::TempDir::new().unwrap();
 
-    // Use JSON format so we can inspect the output.
+    // CTFS-only output; event-level inspection deferred to ct-print.
     record_from_snapshots(
         &snapshots,
         &source_locs,
         Path::new("test.rs"),
         tmp.path(),
-        TraceEventsFileFormat::Json,
     )
     .unwrap();
 
@@ -243,7 +240,6 @@ fn test_solana_trace_3file_output() {
         &source_locs,
         Path::new("test.rs"),
         tmp.path(),
-        TraceEventsFileFormat::Json,
     )
     .unwrap();
 
@@ -266,13 +262,12 @@ fn test_sbpf_step_events() {
     let source_locs = create_synthetic_source_locations();
     let tmp = tempfile::TempDir::new().unwrap();
 
-    // Use JSON format so we can parse.
+    // CTFS-only output; structural assertions only.
     record_from_snapshots(
         &snapshots,
         &source_locs,
         Path::new("test.rs"),
         tmp.path(),
-        TraceEventsFileFormat::Json,
     )
     .unwrap();
 

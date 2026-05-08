@@ -21,7 +21,6 @@ use codetracer_solana_recorder::multi_program::ProgramRegistry;
 use codetracer_solana_recorder::recorder::record_with_cpi;
 use codetracer_solana_recorder::register_trace::RegisterSnapshot;
 use codetracer_trace_types::TraceLowLevelEvent;
-use codetracer_trace_writer_nim::TraceEventsFileFormat;
 
 // ---------------------------------------------------------------------------
 // Helpers
@@ -345,7 +344,6 @@ fn test_record_with_cpi_using_real_boundaries() {
         &mut detector,
         Path::new("primary.rs"),
         tmp.path(),
-        TraceEventsFileFormat::Json,
     );
     assert!(
         result.is_ok(),
@@ -473,7 +471,6 @@ fn test_cpi_trace_event_ordering() {
         &mut detector,
         Path::new("primary.rs"),
         tmp.path(),
-        TraceEventsFileFormat::Json,
     )
     .unwrap();
 

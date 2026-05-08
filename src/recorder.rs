@@ -3,10 +3,15 @@
 //! This module consumes register trace data from the SBF VM,
 //! correlates it with DWARF source mapping, and produces CodeTracer
 //! trace output.
+//!
+//! The output format is fixed to CTFS — see
+//! `Recorder-CLI-Conventions.md` §4 in `codetracer-specs`.  Use
+//! `ct print` (from `codetracer-trace-format-nim`) for human-readable
+//! conversion of the produced bundle.
 
 use std::path::Path;
 
-use codetracer_trace_types::{Line, TypeKind, ValueRecord, NONE_VALUE};
+use codetracer_trace_types::{Line, NONE_VALUE, TypeKind, ValueRecord};
 use codetracer_trace_writer_nim::trace_writer::TraceWriter;
 use codetracer_trace_writer_nim::{TraceEventsFileFormat, create_trace_writer};
 use eyre::{Context, Result, eyre};
@@ -15,6 +20,13 @@ use crate::cpi::{CpiDetector, CpiEvent};
 use crate::dwarf::DwarfParser;
 use crate::multi_program::ProgramRegistry;
 use crate::register_trace::{RegisterSnapshot, parse_regs_file};
+
+// The recorder is CTFS-only per `Recorder-CLI-Conventions.md` §4 (see
+// `codetracer-specs`).  We pin every `create_trace_writer` call site to
+// this constant so the recorder surface no longer carries a `format`
+// parameter and the writer cannot accidentally drift away from the
+// canonical multi-stream container.
+const CTFS_FORMAT: TraceEventsFileFormat = TraceEventsFileFormat::Ctfs;
 
 /// Record a Solana program execution from pre-generated register trace
 /// and DWARF-annotated ELF, producing CodeTracer trace output.
@@ -25,15 +37,14 @@ use crate::register_trace::{RegisterSnapshot, parse_regs_file};
 /// * `elf_data`  - Raw ELF file content (unstripped, with DWARF)
 /// * `source_path` - Path to display in the trace for source locations
 /// * `out_dir`   - Directory where trace files will be written
-/// * `format`    - Output format.  Use `TraceEventsFileFormat::Ctfs` for the
-///   canonical multi-stream container; the other variants are legacy and
-///   are not consumed by the modern `NimTraceReaderHandle` FFI.
+///
+/// The output format is fixed to the canonical CodeTracer CTFS multi-stream
+/// container.
 pub fn record_from_traces(
     regs_data: &[u8],
     elf_data: &[u8],
     source_path: &Path,
     out_dir: &Path,
-    format: TraceEventsFileFormat,
 ) -> Result<()> {
     // 1. Parse register snapshots.
     let snapshots = parse_regs_file(regs_data)?;
@@ -56,7 +67,7 @@ pub fn record_from_traces(
         .map(|(pc, f, l)| (*pc, f.as_str(), *l))
         .collect();
 
-    record_from_snapshots(&snapshots, &source_locs_ref, source_path, out_dir, format)
+    record_from_snapshots(&snapshots, &source_locs_ref, source_path, out_dir)
 }
 
 /// Record a Solana program execution from pre-parsed register snapshots
@@ -71,28 +82,26 @@ pub fn record_from_traces(
 /// * `source_locations` - Tuples of (pc, file, line) mapping PCs to source
 /// * `source_path`      - Path to display in the trace
 /// * `out_dir`          - Directory where trace files will be written
-/// * `format`           - Output format
+///
+/// The output format is fixed to the canonical CodeTracer CTFS multi-stream
+/// container.
 pub fn record_from_snapshots(
     snapshots: &[RegisterSnapshot],
     source_locations: &[(u64, &str, u32)],
     source_path: &Path,
     out_dir: &Path,
-    format: TraceEventsFileFormat,
 ) -> Result<()> {
     // Create output directory.
     std::fs::create_dir_all(out_dir)
         .with_context(|| format!("cannot create output dir: {}", out_dir.display()))?;
 
-    // Create the trace writer.
+    // Create the trace writer (CTFS only).
     let program_name = source_path.to_string_lossy();
-    let mut writer = create_trace_writer(&program_name, &[], format);
+    let mut writer = create_trace_writer(&program_name, &[], CTFS_FORMAT);
 
-    // Set up output files.
-    let events_filename = match format {
-        TraceEventsFileFormat::Json => "trace.json",
-        TraceEventsFileFormat::Binary | TraceEventsFileFormat::BinaryV0 | TraceEventsFileFormat::Ctfs => "trace.bin",
-    };
-    let events_path = out_dir.join(events_filename);
+    // Set up output files.  CTFS-only writer — events stream lives in
+    // `trace.bin`.
+    let events_path = out_dir.join("trace.bin");
     let metadata_path = out_dir.join("trace_metadata.json");
     let paths_path = out_dir.join("trace_paths.json");
 
@@ -214,29 +223,27 @@ pub fn record_from_snapshots_into_writer(
 /// * `cpi_detector`      - CPI detector initialised with the primary program's range
 /// * `source_path`       - Path to display in the trace for the primary program
 /// * `out_dir`           - Directory where trace files will be written
-/// * `format`            - Output format.  Prefer `TraceEventsFileFormat::Ctfs`.
+///
+/// The output format is fixed to the canonical CodeTracer CTFS multi-stream
+/// container.
 pub fn record_with_cpi(
     snapshots: &[RegisterSnapshot],
     registry: &ProgramRegistry,
     cpi_detector: &mut CpiDetector,
     source_path: &Path,
     out_dir: &Path,
-    format: TraceEventsFileFormat,
 ) -> Result<()> {
     // Create output directory.
     std::fs::create_dir_all(out_dir)
         .with_context(|| format!("cannot create output dir: {}", out_dir.display()))?;
 
-    // Create the trace writer.
+    // Create the trace writer (CTFS only).
     let program_name = source_path.to_string_lossy();
-    let mut writer = create_trace_writer(&program_name, &[], format);
+    let mut writer = create_trace_writer(&program_name, &[], CTFS_FORMAT);
 
-    // Set up output files.
-    let events_filename = match format {
-        TraceEventsFileFormat::Json => "trace.json",
-        TraceEventsFileFormat::Binary | TraceEventsFileFormat::BinaryV0 | TraceEventsFileFormat::Ctfs => "trace.bin",
-    };
-    let events_path = out_dir.join(events_filename);
+    // Set up output files.  CTFS-only writer — events stream lives in
+    // `trace.bin`.
+    let events_path = out_dir.join("trace.bin");
     let metadata_path = out_dir.join("trace_metadata.json");
     let paths_path = out_dir.join("trace_paths.json");
 

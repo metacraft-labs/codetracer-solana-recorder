@@ -23,7 +23,6 @@
 
 use std::path::{Path, PathBuf};
 
-use codetracer_trace_writer_nim::TraceEventsFileFormat;
 use eyre::{Context, Result, bail, eyre};
 
 use crate::recorder::record_from_snapshots;
@@ -41,9 +40,11 @@ use crate::rpc_client::{self, TransactionData};
 /// * `rpc_url`     - Solana JSON-RPC endpoint URL.
 /// * `signature`   - Base-58 transaction signature.
 /// * `out_dir`     - Directory where the trace files will be written.
-/// * `format`      - Output format (Binary or Json).
 /// * `program_dir` - Optional directory to search for debug `.so` files.
 ///                   Defaults to `target/deploy/` relative to CWD.
+///
+/// The output format is fixed to the canonical CodeTracer CTFS multi-stream
+/// container.
 ///
 /// # Errors
 ///
@@ -53,7 +54,6 @@ pub fn replay_transaction(
     rpc_url: &str,
     signature: &str,
     out_dir: &Path,
-    format: TraceEventsFileFormat,
     program_dir: Option<&Path>,
 ) -> Result<()> {
     eprintln!("Fetching transaction {signature} from {rpc_url} ...");
@@ -130,7 +130,6 @@ pub fn replay_transaction(
         &source_locs_ref,
         &program_so,
         out_dir,
-        format,
     )?;
 
     eprintln!("Trace written to {}", out_dir.display());
