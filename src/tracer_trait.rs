@@ -12,12 +12,19 @@
 use std::io::Write;
 use std::path::Path;
 
-use codetracer_trace_types::{EventLogKind, Line, TypeKind, ValueRecord, NONE_VALUE};
+use codetracer_trace_types::{EventLogKind, Line, NONE_VALUE, TypeKind, ValueRecord};
 use codetracer_trace_writer_nim::trace_writer::TraceWriter;
 use codetracer_trace_writer_nim::{TraceEventsFileFormat, create_trace_writer};
 use eyre::{Result, eyre};
 
 use crate::register_trace::{RegisterSnapshot, ROW_SIZE};
+
+// The recorder is CTFS-only per `Recorder-CLI-Conventions.md` §4 (see
+// `codetracer-specs`).  We pin every `create_trace_writer` call site to
+// this constant so the tracer surface no longer carries a `format`
+// parameter and the writer cannot accidentally drift away from the
+// canonical multi-stream container.
+const CTFS_FORMAT: TraceEventsFileFormat = TraceEventsFileFormat::Ctfs;
 
 // ---------------------------------------------------------------------------
 // The trait
@@ -103,25 +110,23 @@ impl CodeTracerTracer {
     ///
     /// * `source_path` — Path displayed in the trace for source locations.
     /// * `out_dir`     — Directory where trace files will be written.
-    /// * `format`      — Output format (Binary or Json).
     /// * `source_locations` — PC-to-source mapping as `(pc, file, line)`.
+    ///
+    /// The output format is fixed to the canonical CodeTracer CTFS
+    /// multi-stream container.
     pub fn new(
         source_path: &Path,
         out_dir: &Path,
-        format: TraceEventsFileFormat,
         source_locations: Vec<(u64, String, u32)>,
     ) -> Result<Self> {
         std::fs::create_dir_all(out_dir)
             .map_err(|e| eyre!("cannot create output dir: {e}"))?;
 
         let program_name = source_path.to_string_lossy();
-        let mut writer = create_trace_writer(&program_name, &[], format);
+        let mut writer = create_trace_writer(&program_name, &[], CTFS_FORMAT);
 
-        let events_filename = match format {
-            TraceEventsFileFormat::Json => "trace.json",
-            TraceEventsFileFormat::Binary | TraceEventsFileFormat::BinaryV0 | TraceEventsFileFormat::Ctfs => "trace.bin",
-        };
-        let events_path = out_dir.join(events_filename);
+        // CTFS-only writer — events stream lives in `trace.bin`.
+        let events_path = out_dir.join("trace.bin");
         let metadata_path = out_dir.join("trace_metadata.json");
         let paths_path = out_dir.join("trace_paths.json");
 

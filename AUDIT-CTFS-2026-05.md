@@ -222,3 +222,131 @@ frontend distinguish Solana control events from terminal stderr.
 This is an infrastructure change in
 `codetracer-trace-format-nim/src/codetracer_trace_writer_ffi.nim` — out
 of scope for any single recorder audit.
+
+---
+
+## Convention compliance follow-up — 2026-05-08
+
+Mirrors the cairo / cardano / circom / flow / fuel / leo / miden / move /
+polkavm follow-ups: the recorder is now CTFS-only at the CLI surface, with
+the canonical `CODETRACER_<NAME>_RECORDER_OUT_DIR` /
+`CODETRACER_<NAME>_RECORDER_DISABLED` env-var contract from
+`Recorder-CLI-Conventions.md` §4 / §5.
+
+### CLI changes
+
+* `--format` / `-f` removed from both subcommands (`record`, `replay`).
+  Clap now rejects the flag at every level — exercised by
+  `tests/test_cli.rs::test_format_flag_rejected_by_clap`.
+* `OutputFormat` enum (and its `OutputFormat → TraceEventsFileFormat`
+  mapping) deleted from `src/main.rs`.
+* `RecordArgs.out_dir` / `ReplayArgs.out_dir` changed from `PathBuf`
+  (with `default_value = "./ct-traces/"`) to `Option<PathBuf>`.  A new
+  `resolve_out_dir` helper resolves `--out-dir` →
+  `CODETRACER_SOLANA_RECORDER_OUT_DIR` → `./ct-traces/` in priority
+  order.
+* New `recording_disabled()` helper reads
+  `CODETRACER_SOLANA_RECORDER_DISABLED` (`1` / `true`); each subcommand
+  short-circuits with a "skipping trace recording" note when it is set.
+* `--help` text now points users at `ct print` from
+  `codetracer-trace-format-nim` for human-readable conversion.
+
+### Library / tracer changes
+
+* `src/recorder.rs::record_from_traces(regs_data, elf_data, source_path,
+  out_dir)` and `record_from_snapshots(snapshots, source_locations,
+  source_path, out_dir)` no longer take a `format` parameter; the writer
+  is pinned to `TraceEventsFileFormat::Ctfs` via the new module-level
+  `CTFS_FORMAT` constant.
+* `src/recorder.rs::record_with_cpi(snapshots, registry, cpi_detector,
+  source_path, out_dir)` no longer takes a `format` parameter; same pin
+  via `CTFS_FORMAT`.  The `events_filename` match-on-`format` collapsed
+  to the unconditional `trace.bin`.
+* `src/replay.rs::replay_transaction(rpc_url, signature, out_dir,
+  program_dir)` no longer takes a `format` parameter; the route through
+  `recorder::record_from_snapshots` is CTFS-only.
+* `src/tracer_trait.rs::CodeTracerTracer::new(source_path, out_dir,
+  source_locations)` no longer takes a `format` parameter; same pin via
+  the module-level `CTFS_FORMAT` constant.
+
+### Tests
+
+* `tests/test_cli.rs` extended with the six standard convention tests:
+  - `test_recorded_trace_via_ct_print_json` — records a synthetic
+    7-instruction register trace through `record_from_snapshots`, pipes
+    the produced `.ct` file through `ct-print --json` from
+    `codetracer-trace-format-nim`, and asserts on **structural anchors**
+    (the fixture path `solana_fixture.rs` and at least one of the SBF
+    register names `r0..r5`).  Integer values are not asserted because
+    the recorder's variable payload (`ValueRecord::Int { i, type_id }`
+    over a `u64` register-type id) doesn't round-trip through
+    `ct print --json` today (same pre-existing limitation as cardano /
+    circom / flow / fuel / leo / miden / move / polkavm).
+  - `test_env_out_dir_used_when_flag_omitted` — sets
+    `CODETRACER_SOLANA_RECORDER_OUT_DIR=<tmp>` without `--out-dir` and
+    asserts the env-supplied dir receives the `.ct` bundle.  Drives the
+    `--regs <path>` branch (synthetic register trace + recorder's own
+    binary as the ELF for DWARF) so the test does not depend on a built
+    SBF program.
+  - `test_env_disabled_skips_recording` — sets
+    `CODETRACER_SOLANA_RECORDER_DISABLED=1` and asserts the recorder
+    exits 0 with no trace artefacts written.
+  - `test_format_flag_rejected_by_clap` — asserts clap rejects
+    `--format json` at both subcommand levels (`record` / `replay`).
+  - `test_no_format_flag_in_help` — asserts `--help` (top-level + each
+    subcommand) does not advertise `--format` or `CODETRACER_FORMAT`.
+  - `test_help_mentions_ct_print` — asserts top-level `--help` mentions
+    `ct print` so users discover the canonical conversion tool.
+* `tests/test_comprehensive.rs::test_trace_output_binary_format`
+  **deleted**.  It asserted on the OLD `--format binary` contract,
+  which is incompatible with the post-2026-05-08 contract (`--format`
+  must not exist; CTFS is the only format).  The structural CTFS
+  magic-byte assertion that test produced is already covered by
+  `test_trace_output_valid_json` (renamed conceptually but kept under
+  its original name) and by every other recording test that asserts on
+  the `.ct` magic.
+* All call-sites in `tests/test_tracer.rs`, `tests/test_cpi.rs`,
+  `tests/test_cpi_execution.rs`, `tests/test_execution_trace.rs`,
+  `tests/test_dwarf.rs`, `tests/test_tracer_trait.rs`,
+  `tests/test_comprehensive.rs`, and `tests/test_account_decoder.rs`
+  updated to call the new `format`-less recorder/tracer signatures.
+  Direct `create_trace_writer(...)` usages in the
+  `decoded_fields_to_struct_record` and `decoded_to_value_record` tests
+  switched from `TraceEventsFileFormat::Json` to
+  `TraceEventsFileFormat::Ctfs` to align with the CTFS-only philosophy.
+
+### New artefacts
+
+* `Justfile` — standard `build` / `test` / `lint` /
+  `verify-cli-convention` / `format` recipes.  `lint` and `test` both
+  run `tests/verify-cli-convention-no-silent-skip.sh`.
+* `tests/verify-cli-convention-no-silent-skip.sh` — shell-side
+  verification that `--format` is absent from `--help` at all three
+  levels (top + record + replay), `--out-dir` / `--version` / `ct print`
+  are present where the convention requires them, and the two env vars
+  are referenced in `src/`.  Wired into `just lint` and `just test`.
+* `README.md` — top-level usage / architecture / env-var documentation
+  matching the rest of the recorder fleet.
+
+### Verification
+
+```
+export LIBRARY_PATH=/nix/store/<…>-zstd-<…>/lib   # local libzstd workaround
+cd /home/zahary/metacraft/codetracer-solana-recorder
+cargo build --locked              # clean
+cargo test --locked               # 142 active passing across 12 test binaries
+                                  # (lib 6 + 17 account_decoder + 12 cli +
+                                  #  47 comprehensive + 6 cpi + 5 cpi_execution +
+                                  #  21 dwarf + 4 execution_trace + 11 replay +
+                                  #  5 tracer + 8 tracer_trait)
+bash tests/verify-cli-convention-no-silent-skip.sh   # 14 ok lines, 0 fails
+```
+
+`tests/test_cli.rs::test_recorded_trace_via_ct_print_json` runs end-to-end
+(does not skip) inside the metacraft workspace where
+`../codetracer-trace-format-nim/ct-print` exists.
+
+### Recorder-CLI-Conventions.md
+
+The Implementation Status table now lists Solana as `✓ Compliant
+(CTFS-only)` with the standard env-var notes.

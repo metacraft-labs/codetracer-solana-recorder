@@ -20,7 +20,6 @@ use codetracer_solana_recorder::dwarf::{DwarfParser, find_functions};
 use codetracer_solana_recorder::recorder::record_from_traces;
 use codetracer_solana_recorder::register_trace::ROW_SIZE;
 use codetracer_trace_types::TraceLowLevelEvent;
-use codetracer_trace_writer_nim::TraceEventsFileFormat;
 
 // ---------------------------------------------------------------------------
 // Helpers
@@ -139,7 +138,6 @@ fn test_real_elf_dwarf_source_mapping_pipeline() {
         &elf_data,
         Path::new("test_program.so"),
         tmp.path(),
-        TraceEventsFileFormat::Json,
     );
     assert!(
         result.is_ok(),
@@ -305,7 +303,6 @@ fn test_real_elf_function_boundaries_in_trace() {
         &elf_data,
         Path::new("test_program.so"),
         tmp.path(),
-        TraceEventsFileFormat::Json,
     );
     assert!(
         result.is_ok(),
@@ -392,7 +389,6 @@ fn test_dwarf_line_fidelity_per_location() {
             &elf_data,
             Path::new("test_program.so"),
             tmp.path(),
-            TraceEventsFileFormat::Json,
         );
         assert!(result.is_ok(), "recording should succeed for PC {pc}");
 
@@ -498,7 +494,6 @@ fn test_register_trace_roundtrip_with_dwarf() {
         &elf_data,
         Path::new("test_program.so"),
         tmp.path(),
-        TraceEventsFileFormat::Json,
     )
     .unwrap();
 

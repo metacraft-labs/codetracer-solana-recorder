@@ -95,7 +95,6 @@ fn record_and_get_events(
         source_locs,
         Path::new(source_path),
         tmp.path(),
-        TraceEventsFileFormat::Json,
     )
     .unwrap();
     let ct_files: Vec<_> = std::fs::read_dir(tmp.path())
@@ -260,7 +259,6 @@ fn record_cpi_and_parse_events(
         detector,
         Path::new(source_path),
         tmp.path(),
-        TraceEventsFileFormat::Json,
     )
     .unwrap();
     // Verify .ct output was produced with CTFS magic bytes.
@@ -1264,7 +1262,7 @@ fn test_account_decode_truncated_data() {
 /// Conversion of decoded fields to ValueRecord with struct type registration.
 #[test]
 fn test_decoded_fields_to_struct_record() {
-    let mut writer = create_trace_writer("test", &[], TraceEventsFileFormat::Json);
+    let mut writer = create_trace_writer("test", &[], TraceEventsFileFormat::Ctfs);
     let tmp = tempfile::TempDir::new().unwrap();
 
     TraceWriter::begin_writing_trace_events(&mut *writer, &tmp.path().join("trace.json"))
@@ -1645,7 +1643,6 @@ fn test_empty_trace() {
         &source_locs,
         Path::new("empty.rs"),
         tmp.path(),
-        TraceEventsFileFormat::Json,
     )
     .unwrap();
 
@@ -1744,7 +1741,6 @@ fn test_tracer_trait_syscall_recording() {
     let mut tracer = CodeTracerTracer::new(
         Path::new("test.rs"),
         tmp.path(),
-        TraceEventsFileFormat::Json,
         source_locs,
     )
     .unwrap();
@@ -1784,7 +1780,6 @@ fn test_replay_snapshots_produces_trace() {
     let mut tracer = CodeTracerTracer::new(
         Path::new("replay.rs"),
         tmp.path(),
-        TraceEventsFileFormat::Json,
         source_locs,
     )
     .unwrap();
@@ -2070,7 +2065,6 @@ fn test_trace_output_valid_json() {
         &source_locs,
         Path::new("valid.rs"),
         tmp.path(),
-        TraceEventsFileFormat::Json,
     )
     .unwrap();
 
@@ -2087,40 +2081,12 @@ fn test_trace_output_valid_json() {
     assert_eq!(&ct_content[..5], &[0xC0u8, 0xDE, 0x72, 0xAC, 0xE2]);
 }
 
-/// Binary trace output produces non-empty files.
-#[test]
-fn test_trace_output_binary_format() {
-    let snapshots = vec![
-        snap_regs(0, 0, 10, 20, 0),
-        snap_regs(1, 30, 0, 0, 0),
-    ];
-    let source_locs: Vec<(u64, &str, u32)> = vec![
-        (0, "bin.rs", 1),
-        (1, "bin.rs", 2),
-    ];
-
-    let tmp = tempfile::TempDir::new().unwrap();
-    record_from_snapshots(
-        &snapshots,
-        &source_locs,
-        Path::new("bin.rs"),
-        tmp.path(),
-        TraceEventsFileFormat::Binary,
-    )
-    .unwrap();
-
-    // Verify .ct output with CTFS magic bytes.
-    let ct_files: Vec<_> = std::fs::read_dir(tmp.path())
-        .unwrap()
-        .filter_map(|e| e.ok())
-        .map(|e| e.path())
-        .filter(|p| p.extension().map_or(false, |ext| ext == "ct"))
-        .collect();
-    assert!(!ct_files.is_empty(), "expected .ct file for binary format");
-    let ct_content = std::fs::read(&ct_files[0]).unwrap();
-    assert!(ct_content.len() >= 5, ".ct file too small");
-    assert_eq!(&ct_content[..5], &[0xC0u8, 0xDE, 0x72, 0xAC, 0xE2]);
-}
+// `test_trace_output_binary_format` was deleted on 2026-05-08 — it asserted
+// on the legacy `--format binary` contract.  Post-2026-05-08 the recorder is
+// CTFS-only; the equivalent magic-byte structural assertion now lives in the
+// `test_trace_output_valid_json` test (renamed conceptually but kept under
+// its original name).  See `AUDIT-CTFS-2026-05.md` ("Convention compliance
+// follow-up — 2026-05-08") for the full record.
 
 /// Snapshots without source mapping are skipped gracefully.
 #[test]

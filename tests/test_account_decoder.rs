@@ -174,7 +174,7 @@ fn test_anchor_account_decode() {
 #[test]
 fn test_decoded_to_value_record() {
     // Create a trace writer to register types.
-    let mut writer = create_trace_writer("test", &[], TraceEventsFileFormat::Json);
+    let mut writer = create_trace_writer("test", &[], TraceEventsFileFormat::Ctfs);
 
     // We need to call start before registering types.
     let tmp = tempfile::tempdir().unwrap();

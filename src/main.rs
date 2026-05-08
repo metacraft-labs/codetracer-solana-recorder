@@ -8,38 +8,81 @@
 //! transaction via Solana JSON-RPC and replays it through the recording
 //! pipeline.
 //!
+//! The recorder always writes traces in the canonical CodeTracer multi-stream
+//! CTFS format (see `Recorder-CLI-Conventions.md` §4 in `codetracer-specs`).
+//! No `--format` flag is exposed: human-readable conversion is handled
+//! out-of-band by `ct print` (shipped with `codetracer-trace-format-nim`).
+//!
 //! # Usage
 //!
 //! ```text
 //! # Full pipeline (register trace + DWARF):
 //! codetracer-solana-recorder record --regs trace.regs --elf program.so \
-//!     -o <output-dir> [-f <format>]
+//!     -o <output-dir>
 //!
 //! # Legacy placeholder mode (positional ELF only):
 //! codetracer-solana-recorder record <ELF_FILE> \
-//!     -o <output-dir> [-f <format>]
+//!     -o <output-dir>
 //!
 //! # Replay a confirmed on-chain transaction:
 //! codetracer-solana-recorder replay --signature <SIG> \
-//!     [--rpc-url <URL>] [--program-dir <PATH>] [-o <out-dir>] [-f <format>]
+//!     [--rpc-url <URL>] [--program-dir <PATH>] [-o <out-dir>]
 //! ```
+//!
+//! # Environment variables
+//!
+//! * `CODETRACER_SOLANA_RECORDER_OUT_DIR` — fallback for `--out-dir` when the
+//!   flag is not given. The CLI flag always wins.
+//! * `CODETRACER_SOLANA_RECORDER_DISABLED` — set to `1` or `true` to skip
+//!   recording entirely. The recorder still validates its inputs (where
+//!   applicable) and propagates a clean exit code.
 
 use std::path::PathBuf;
 
-use clap::{Parser, Subcommand, ValueEnum};
-use codetracer_trace_writer_nim::TraceEventsFileFormat;
+use clap::{Parser, Subcommand};
 use eyre::{Context, Result};
+
+// ---------------------------------------------------------------------------
+// Constants
+// ---------------------------------------------------------------------------
+
+/// Environment variable used as a fallback for `--out-dir` when the CLI
+/// flag is omitted.  Convention: see `Recorder-CLI-Conventions.md` §5.
+const ENV_OUT_DIR: &str = "CODETRACER_SOLANA_RECORDER_OUT_DIR";
+
+/// Environment variable that, when set to `1`/`true`, disables tracing
+/// entirely — the recorder runs as a transparent pass-through.
+const ENV_DISABLED: &str = "CODETRACER_SOLANA_RECORDER_DISABLED";
+
+/// Default output directory used when neither `--out-dir` nor
+/// `CODETRACER_SOLANA_RECORDER_OUT_DIR` is set.
+const DEFAULT_OUT_DIR: &str = "./ct-traces/";
 
 // ---------------------------------------------------------------------------
 // CLI definition
 // ---------------------------------------------------------------------------
 
 /// CodeTracer Solana recorder -- record Solana/SBF program execution traces.
+///
+/// Traces are always written in the canonical CTFS multi-stream format.
+/// To convert a recorded `.ct` bundle to JSON / text for inspection, use
+/// `ct print` from `codetracer-trace-format-nim`.
 #[derive(Debug, Parser)]
 #[command(
     name = "codetracer-solana-recorder",
     version,
-    about = "Record Solana program execution traces for CodeTracer"
+    about = "Record Solana program execution traces for CodeTracer (CTFS-only). \
+             Use `ct print` from codetracer-trace-format-nim for human-readable conversion.",
+    long_about = "Record Solana program execution traces for CodeTracer.\n\
+                  \n\
+                  Output is always written in the canonical CodeTracer CTFS\n\
+                  multi-stream format. Use `ct print` (shipped with the\n\
+                  codetracer-trace-format-nim sibling) to convert a recorded\n\
+                  `.ct` bundle to JSON or other human-readable forms.\n\
+                  \n\
+                  Environment variables:\n\
+                    CODETRACER_SOLANA_RECORDER_OUT_DIR    fallback for --out-dir\n\
+                    CODETRACER_SOLANA_RECORDER_DISABLED   set to 1/true to skip recording"
 )]
 struct Cli {
     #[command(subcommand)]
@@ -68,26 +111,6 @@ enum Commands {
     Version,
 }
 
-/// Trace output format selectable from the CLI.
-///
-/// `Ctfs` is the canonical multi-stream format consumed by the
-/// `NimTraceReaderHandle` FFI and the db-backend's `CTFSTraceReader`.
-/// `Binary` (legacy CBOR+Zstd) and `Json` remain available for
-/// debugging / interop with older tooling, but should not be used
-/// for new traces — the canonical Nim reader cannot decode them
-/// without a postprocess pass.
-#[derive(Debug, Clone, ValueEnum)]
-enum OutputFormat {
-    /// Canonical CTFS multi-stream container (steps.dat + calls.dat
-    /// + events.dat + funcs.dat + …).  Default and recommended.
-    Ctfs,
-    /// Legacy CBOR+Zstd binary container.  Kept for migration only.
-    Binary,
-    /// Legacy JSON `events.log` + `meta.json` + `paths.json`.
-    /// Kept for migration / human inspection only.
-    Json,
-}
-
 #[derive(Debug, clap::Args)]
 struct RecordArgs {
     /// Path to the compiled Solana program ELF file (.so).
@@ -107,17 +130,15 @@ struct RecordArgs {
 
     /// Directory where the trace files will be written.
     ///
-    /// The directory will be created if it does not exist.
-    #[arg(short = 'o', long = "out-dir", default_value = "./ct-traces/")]
-    out_dir: PathBuf,
+    /// The directory will be created if it does not exist.  Falls back to
+    /// the `CODETRACER_SOLANA_RECORDER_OUT_DIR` environment variable when
+    /// the flag is omitted.
+    #[arg(short = 'o', long = "out-dir")]
+    out_dir: Option<PathBuf>,
 
     /// Path to an Anchor IDL JSON file for account data decoding.
     #[arg(long = "idl")]
     idl: Option<PathBuf>,
-
-    /// Output format for the trace data.
-    #[arg(short = 'f', long = "format", default_value = "ctfs")]
-    format: OutputFormat,
 }
 
 #[derive(Debug, clap::Args)]
@@ -138,12 +159,44 @@ struct ReplayArgs {
     program_dir: Option<PathBuf>,
 
     /// Directory where the trace files will be written.
-    #[arg(short = 'o', long = "out-dir", default_value = "./ct-traces/")]
-    out_dir: PathBuf,
+    ///
+    /// Falls back to the `CODETRACER_SOLANA_RECORDER_OUT_DIR` environment
+    /// variable when the flag is omitted.
+    #[arg(short = 'o', long = "out-dir")]
+    out_dir: Option<PathBuf>,
+}
 
-    /// Output format for the trace data.
-    #[arg(short = 'f', long = "format", default_value = "ctfs")]
-    format: OutputFormat,
+// ---------------------------------------------------------------------------
+// Helpers
+// ---------------------------------------------------------------------------
+
+/// Resolve the effective output directory:
+///   1. `--out-dir` if given on the CLI.
+///   2. `CODETRACER_SOLANA_RECORDER_OUT_DIR` env var.
+///   3. `DEFAULT_OUT_DIR` ("./ct-traces/").
+fn resolve_out_dir(cli_out_dir: Option<PathBuf>) -> PathBuf {
+    if let Some(path) = cli_out_dir {
+        return path;
+    }
+    if let Some(value) = std::env::var_os(ENV_OUT_DIR)
+        && !value.is_empty()
+    {
+        return PathBuf::from(value);
+    }
+    PathBuf::from(DEFAULT_OUT_DIR)
+}
+
+/// Whether the recorder is disabled via env var.  When true, the CLI
+/// must execute its target operation in pass-through mode without
+/// emitting any trace artefacts.
+fn recording_disabled() -> bool {
+    match std::env::var(ENV_DISABLED) {
+        Ok(value) => {
+            let v = value.trim();
+            v == "1" || v.eq_ignore_ascii_case("true")
+        }
+        Err(_) => false,
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -191,12 +244,14 @@ fn record(args: RecordArgs) -> Result<()> {
 
     eprintln!("ELF file: {}", elf_path.display());
 
-    // Determine trace format.
-    let format = match args.format {
-        OutputFormat::Ctfs => TraceEventsFileFormat::Ctfs,
-        OutputFormat::Binary => TraceEventsFileFormat::Binary,
-        OutputFormat::Json => TraceEventsFileFormat::Json,
-    };
+    if recording_disabled() {
+        // Pass-through: the Solana recorder runs the SBF VM itself — so
+        // disabling recording simply means "don't emit any trace artefacts".
+        eprintln!("{ENV_DISABLED} is set; skipping trace recording (no output written).");
+        return Ok(());
+    }
+
+    let out_dir = resolve_out_dir(args.out_dir);
 
     // 2. If --regs is provided, use the full pipeline.
     if let Some(regs_path) = &args.regs_file {
@@ -223,11 +278,10 @@ fn record(args: RecordArgs) -> Result<()> {
             &regs_data,
             &elf_data,
             &elf_path,
-            &args.out_dir,
-            format,
+            &out_dir,
         )?;
 
-        eprintln!("Trace written to {}", args.out_dir.display());
+        eprintln!("Trace written to {}", out_dir.display());
         return Ok(());
     }
 
@@ -254,11 +308,10 @@ fn record(args: RecordArgs) -> Result<()> {
         &regs_data,
         &elf_data,
         &elf_path,
-        &args.out_dir,
-        format,
+        &out_dir,
     )?;
 
-    eprintln!("Trace written to {}", args.out_dir.display());
+    eprintln!("Trace written to {}", out_dir.display());
 
     Ok(())
 }
@@ -269,17 +322,17 @@ fn record(args: RecordArgs) -> Result<()> {
 
 /// Execute the `replay` subcommand.
 fn replay(args: ReplayArgs) -> Result<()> {
-    let format = match args.format {
-        OutputFormat::Ctfs => TraceEventsFileFormat::Ctfs,
-        OutputFormat::Binary => TraceEventsFileFormat::Binary,
-        OutputFormat::Json => TraceEventsFileFormat::Json,
-    };
+    if recording_disabled() {
+        eprintln!("{ENV_DISABLED} is set; skipping replay recording (no output written).");
+        return Ok(());
+    }
+
+    let out_dir = resolve_out_dir(args.out_dir);
 
     codetracer_solana_recorder::replay::replay_transaction(
         &args.rpc_url,
         &args.signature,
-        &args.out_dir,
-        format,
+        &out_dir,
         args.program_dir.as_deref(),
     )
 }
