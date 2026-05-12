@@ -552,19 +552,19 @@ fn test_nested_calls_test_via_ct_print_full() {
     // Functions: 1 main + 4 nested fn_at_pc_<pc> = 5 entries in the
     //            functions table.
     // Calls:     `counts.calls` reports the number of completed
-    //            call/exit pairs the writer has flushed — 4 in this
-    //            stream (3 from the backward-jump returns + 1 from
-    //            the final main return).  The 5th call_entry (the
-    //            innermost +3 forward jump) has no matching backward
-    //            jump in the synthetic stream, so it is left
-    //            unbalanced and `counts.calls` stops at 4 even though
-    //            the events array carries 5 call_entry events.
-    //            Spec-compliant DWARF call/return tracking would emit
-    //            5 returns and `counts.calls` would also be 5.
+    //            call/exit pairs the writer has flushed — 5 in this
+    //            stream.  The trace writer's `close()` drains any
+    //            unclosed PendingCalls (LIFO) so partial-trace
+    //            recordings still produce balanced call_entry/call_exit
+    //            pairs: 3 backward-jump returns + 1 inner forward-jump
+    //            flushed at close + 1 outer `main` flushed at close = 5.
+    //            (Before the writer fix, `close()` silently dropped the
+    //            unclosed frames and `counts.calls` stopped at 4 even
+    //            though the events array carried 5 call_entry events.)
     let counts = &doc["counts"];
     assert_eq!(counts["steps"].as_u64(), Some(9), "steps; counts={counts}");
     assert_eq!(counts["functions"].as_u64(), Some(5), "functions; counts={counts}");
-    assert_eq!(counts["calls"].as_u64(), Some(4), "calls; counts={counts}");
+    assert_eq!(counts["calls"].as_u64(), Some(5), "calls; counts={counts}");
     assert_eq!(
         counts["io_events"].as_u64(),
         Some(0),
@@ -572,13 +572,12 @@ fn test_nested_calls_test_via_ct_print_full() {
     );
 
     let events = doc["events"].as_array().expect("events array");
-    // 9 step + 4 call_entry + 4 call_exit = 17 events.  ct-print
-    // elides the outermost `main` frame from the call_entry stream
-    // (it lives in the functions table but does not surface as its
-    // own call_entry event), so the four call_entries here are the
-    // four synthesised callees from the +N forward jumps.  The four
-    // call_exits balance them in LIFO order.
-    assert_eq!(events.len(), 17, "events.len()");
+    // 9 step + 5 call_entry + 5 call_exit = 19 events.  Now that the
+    // writer's `close()` drains unclosed PendingCalls, the outermost
+    // `main` frame surfaces as both a call_entry and a call_exit, in
+    // addition to the four synthesised callees from the +N forward
+    // jumps.  All five call_exits balance the entries in LIFO order.
+    assert_eq!(events.len(), 19, "events.len()");
     assert_step_indices_monotonic(&doc);
 
     let call_exit_count = events
@@ -586,8 +585,8 @@ fn test_nested_calls_test_via_ct_print_full() {
         .filter(|e| e["kind"] == "call_exit")
         .count();
     assert_eq!(
-        call_exit_count, 4,
-        "expected exactly 4 call_exit events; got {call_exit_count}"
+        call_exit_count, 5,
+        "expected exactly 5 call_exit events; got {call_exit_count}"
     );
 
     let step_event_count = events
@@ -599,27 +598,27 @@ fn test_nested_calls_test_via_ct_print_full() {
         "expected exactly 9 step events in the events array; got {step_event_count}"
     );
 
-    // ----- Call entry order: outermost first (ct-print elides `main`) -----
-    // RECORDER BUG / ct-print quirk: the outermost `main` frame is
-    // omitted from the call_entry stream even though it is recorded
-    // in the functions table.  Tracking expectation: the spec-correct
-    // sequence is [main, fn_at_pc_200, fn_at_pc_300, fn_at_pc_400,
-    // fn_at_pc_403].  The strict match below pins the present-day
-    // shape so a regression in either direction (main reappears, or
-    // a nested call drops) is caught immediately.
+    // ----- Call entry order: outermost first ------------------------------
+    // The writer's `close()` drain ensures the outermost `main` frame
+    // appears in the call_entry stream as well as the function table.
+    // The five entries are pinned in entry order (outermost first) so a
+    // regression that re-elides `main` (or that drops/reorders a nested
+    // call) is caught immediately.
     assert_eq!(
         observed_call_sequence(&doc),
         vec![
+            "main".to_string(),
             "fn_at_pc_200".to_string(),
             "fn_at_pc_300".to_string(),
             "fn_at_pc_400".to_string(),
             "fn_at_pc_403".to_string(),
         ],
-        "call_entry events (excluding the elided outer `main`) must \
-         appear in entry order (outermost first)"
+        "call_entry events must include `main` and the four nested \
+         callees in entry order (outermost first)"
     );
 
     // ----- Call exit order: LIFO ------------------------------------------
+    // `main` is the deepest frame (latest to exit) and so appears last.
     assert_eq!(
         observed_exit_sequence(&doc),
         vec![
@@ -627,8 +626,11 @@ fn test_nested_calls_test_via_ct_print_full() {
             "fn_at_pc_400".to_string(),
             "fn_at_pc_300".to_string(),
             "fn_at_pc_200".to_string(),
+            "main".to_string(),
         ],
-        "call_exit events must appear in LIFO order (innermost first)"
+        "call_exit events must appear in LIFO order (innermost first); \
+         the outermost `main` exit is appended last by the writer's \
+         close-time PendingCall drain"
     );
 
     // ----- r0 (return) surfaces 113 on the final snapshot -----------------
