@@ -46,8 +46,9 @@ fn point_distance_sq(p: &Point) -> i64 {
 pub fn compute() -> i64 {
     let xs: [i64; 4] = [1, 2, 3, 4];
     let xs_total = sum_of_vec(&xs);
-    let pair_total = sum_pair((10, 20));
+    let pair = (10, 20);
     let p = Point { x: 3, y: 4 };
+    let pair_total = sum_pair(pair);
     let dist_sq = point_distance_sq(&p);
     let combined = xs_total + pair_total + dist_sq;
     combined

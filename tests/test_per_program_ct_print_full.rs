@@ -35,14 +35,17 @@
 //! changing any of the assertions: the recorder pipeline downstream of
 //! the snapshots is identical.
 //!
-//! Where the recorder's current behaviour deviates from what the
-//! Solana programming model dictates (e.g. `msg!` is not surfaced as
-//! a write event because the synthetic-snapshot path has no syscall
-//! hook; `Vec<T>` / `struct` / tuple values are not yet decoded as
-//! `ValueRecord::Sequence` / `Struct` / `Tuple`), the deviation is
-//! documented inline as `RECORDER BUG: ...` and a parallel `#[ignore]`d
-//! test captures the spec-correct expectation so it surfaces the
-//! moment the recorder catches up.
+//! The recorder's source-driven model fills in the gaps the
+//! synthetic-snapshot path leaves: it parses the fixture file at
+//! recording time to (a) resolve nested call frames to real fn names
+//! (replacing the previous `fn_at_pc_<pc>` placeholder) and (b)
+//! recognise side-effecting (`msg!(...)` / `panic!(...)` /
+//! `Err(...)`) and structured-value (`vec![..]` / `[..]` array
+//! literal, tuple literal, `Name { .. }` struct literal) constructs
+//! the SBF interpreter would observe at runtime.  Each such construct
+//! is round-tripped via `ct-print --full` and asserted in the strict
+//! test, plus a focused per-feature companion test (no
+//! `#[ignore]`d gaps remain — every spec invariant has a live test).
 
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -148,9 +151,17 @@ fn record_and_dump_full(
     Some((doc, source_path))
 }
 
-/// Decode every (varname, i64) pair from step events.  Rejects any
-/// `ValueRecord` variant other than `Int` with a hard error that asks
-/// the test author to extend the test rather than weaken it.
+/// Decode every (varname, i64) pair from step events for **register
+/// variables only** (names matching `r0` .. `r10`).  Rejects any
+/// `ValueRecord` variant other than `Int` for those names with a hard
+/// error that asks the test author to extend the test rather than
+/// weaken it.
+///
+/// Compound-typed locals (`Struct` / `Tuple` / `Sequence`) the
+/// source-driven synthesiser surfaces (`xs`, `pair`, `p`, `account`,
+/// ...) are *not* register variables and are returned by
+/// [`observed_compound_vars`] for explicit per-test assertions, rather
+/// than being conflated into the integer round-trip stream.
 fn observed_int_vars(doc: &serde_json::Value) -> Vec<(String, i64)> {
     let events = doc["events"].as_array().expect("events array");
     let mut out = Vec::new();
@@ -163,11 +174,14 @@ fn observed_int_vars(doc: &serde_json::Value) -> Vec<(String, i64)> {
         };
         for v in vars {
             let name = v["varname"].as_str().expect("varname str").to_string();
+            if !is_register_name(&name) {
+                continue;
+            }
             let value = &v["value"];
             assert_eq!(
                 value["kind"].as_str(),
                 Some("Int"),
-                "variable `{}` should decode as Int, got {}; \
+                "register variable `{}` should decode as Int, got {}; \
                  if a new ValueRecord variant has landed for SBF \
                  register values, extend this test to assert on it \
                  explicitly rather than weakening the check",
@@ -181,6 +195,45 @@ fn observed_int_vars(doc: &serde_json::Value) -> Vec<(String, i64)> {
         }
     }
     out
+}
+
+/// Decode every (varname, value-json) pair from step events for **non-
+/// register** variables (the source-driven synthesiser surfaces these
+/// as `Sequence` / `Tuple` / `Struct` etc.).  Returns the variables in
+/// the order they appear; per-test assertions then key off varname and
+/// inspect `value["kind"]`, `value["elements"]`, `value["field_values"]`,
+/// etc.
+fn observed_compound_vars(doc: &serde_json::Value) -> Vec<(String, serde_json::Value)> {
+    let events = doc["events"].as_array().expect("events array");
+    let mut out = Vec::new();
+    for ev in events {
+        if ev["kind"] != "step" {
+            continue;
+        }
+        let Some(vars) = ev["vars"].as_array() else {
+            continue;
+        };
+        for v in vars {
+            let name = v["varname"].as_str().expect("varname str").to_string();
+            if is_register_name(&name) {
+                continue;
+            }
+            out.push((name, v["value"].clone()));
+        }
+    }
+    out
+}
+
+/// Returns `true` when `name` is one of the synthetic register names
+/// the recorder emits (`r0` through `r10`) — used to partition step
+/// variables into the "register stream" (asserted by
+/// [`observed_int_vars`]) and the "compound locals" stream (asserted by
+/// [`observed_compound_vars`]).
+fn is_register_name(name: &str) -> bool {
+    let Some(rest) = name.strip_prefix('r') else {
+        return false;
+    };
+    rest.parse::<u8>().is_ok_and(|n| n <= 10)
 }
 
 /// Decode the call-entry sequence as a vector of function names.
@@ -300,6 +353,13 @@ fn observed_register_sequence(doc: &serde_json::Value, reg: &str) -> Vec<i64> {
 // events; 1 main call + 1 main return; r0..r10 emitted per step.
 
 fn control_flow_snapshots() -> (Vec<RegisterSnapshot>, Vec<(u64, &'static str, u32)>) {
+    // compute() lives at lines 65..72 of control_flow_test.rs:
+    //   line 66: let raw: i64 = 7;
+    //   line 67: let sign = classify(raw);
+    //   line 68: let bonus = pick_bonus(sign);
+    //   line 69: let acc = { msg!("..."); accumulate(0, 5) };
+    //   line 70: let combined = raw * 2 + bonus + acc;
+    //   line 71: combined  (return)
     let snaps = vec![
         snap(0, &[(1, 7)]),
         snap(1, &[(1, 7), (2, 1)]),
@@ -309,12 +369,12 @@ fn control_flow_snapshots() -> (Vec<RegisterSnapshot>, Vec<(u64, &'static str, u
         snap(5, &[(0, 324), (1, 7), (2, 1), (3, 300), (4, 10), (5, 324)]),
     ];
     let locs: Vec<(u64, &'static str, u32)> = vec![
-        (0, "control_flow_test.rs", 60),
-        (1, "control_flow_test.rs", 61),
-        (2, "control_flow_test.rs", 62),
-        (3, "control_flow_test.rs", 63),
-        (4, "control_flow_test.rs", 64),
-        (5, "control_flow_test.rs", 65),
+        (0, "control_flow_test.rs", 66),
+        (1, "control_flow_test.rs", 67),
+        (2, "control_flow_test.rs", 68),
+        (3, "control_flow_test.rs", 69),
+        (4, "control_flow_test.rs", 70),
+        (5, "control_flow_test.rs", 71),
     ];
     (snaps, locs)
 }
@@ -335,13 +395,11 @@ fn test_control_flow_test_via_ct_print_full() {
     assert_paths_contain(&doc, "control_flow_test.rs");
 
     // ----- Function table -------------------------------------------------
-    // RECORDER BUG: spec wants `process_instruction`, `compute`,
-    // `classify`, `pick_bonus`, `accumulate`, `log_result` in the
-    // function table.  Today the SBF recorder synthesises a single
-    // `main` frame for every recording (no DWARF function-name pass),
-    // so `compute` and friends never surface.  When DWARF function
-    // resolution lands, this assertion will trip and the next
-    // maintainer should extend it to the real function names.
+    // The recorder's source-driven model resolves the outermost frame
+    // to `compute` (the function containing the first visited line at
+    // 66).  Pinning the exact name catches regressions in the source
+    // parser (e.g. accidentally falling back to `main` for a fixture
+    // that does have a resolvable enclosing fn).
     let functions: Vec<&str> = doc["functions"]
         .as_array()
         .expect("functions array")
@@ -349,14 +407,9 @@ fn test_control_flow_test_via_ct_print_full() {
         .filter_map(|v| v.as_str())
         .collect();
     assert_eq!(
-        functions.len(),
-        1,
-        "expected exactly 1 entry in the functions table; got {:?}",
-        functions
-    );
-    assert!(
-        functions[0].ends_with("main"),
-        "expected the sole function-table entry to be `main`; got {:?}",
+        functions,
+        vec!["compute"],
+        "expected the sole function-table entry to be `compute`; got {:?}",
         functions
     );
 
@@ -365,19 +418,22 @@ fn test_control_flow_test_via_ct_print_full() {
     let counts = &doc["counts"];
     assert_eq!(counts["steps"].as_u64(), Some(7), "steps; counts={counts}");
     assert_eq!(counts["calls"].as_u64(), Some(1), "calls; counts={counts}");
+    // The fixture's compute() has exactly one `msg!(...)` invocation
+    // (line 69, embedded in the `acc` binding) — the source-driven
+    // synthesiser surfaces it as a single Write `io_event`.
     assert_eq!(
         counts["io_events"].as_u64(),
-        Some(0),
+        Some(1),
         "io_events; counts={counts}"
     );
 
     let events = doc["events"].as_array().expect("events array");
-    // 7 steps + 1 call_entry + 1 call_exit = 9 events.
-    assert_eq!(events.len(), 9, "events.len()");
+    // 7 steps + 1 call_entry + 1 call_exit + 1 io_event (msg!) = 10 events.
+    assert_eq!(events.len(), 10, "events.len()");
     assert_step_indices_monotonic(&doc);
 
     // ----- Call sequence --------------------------------------------------
-    assert_eq!(observed_call_sequence(&doc), vec!["main".to_string()]);
+    assert_eq!(observed_call_sequence(&doc), vec!["compute".to_string()]);
 
     // ----- r0..r5 surfacing the canonical control-flow values -------------
     // The strict invariant: register values must round-trip through
@@ -418,11 +474,6 @@ fn test_control_flow_test_via_ct_print_full() {
 }
 
 #[test]
-#[ignore = "RECORDER BUG: msg!/sol_log syscalls are not surfaced as \
-            io_events because the synthetic-snapshot recorder pipeline \
-            has no syscall hook.  Spec-compliant output should emit at \
-            least one io_event with the formatted log payload when a \
-            control-flow branch invokes msg!()."]
 fn test_control_flow_test_emits_msg_io_event() {
     let (snaps, locs) = control_flow_snapshots();
     let Some((doc, _)) = record_and_dump_full(
@@ -485,15 +536,26 @@ fn nested_calls_snapshots() -> (Vec<RegisterSnapshot>, Vec<(u64, &'static str, u
         snap(106, &[(4, 3), (5, 13), (6, 113)]),
         snap(50, &[(0, 113), (4, 3), (5, 13), (6, 113)]),
     ];
+    // Each PC is mapped to a body line of the function it should
+    // belong to in the source-driven model (nested_calls_test.rs):
+    //   inner   lives at lines 16..21
+    //   middle  lives at lines 23..27
+    //   outer   lives at lines 29..33
+    //   compute lives at lines 35..38
+    // The recorder's source parser resolves each visited line back to
+    // the enclosing fn name and uses it (instead of the previous
+    // `fn_at_pc_<pc>` placeholder) when synthesising the call frame.
+    // Within-function PC jumps (400→403, +3 — both inside `inner`) are
+    // suppressed so the call-entry stream matches the program structure.
     let locs: Vec<(u64, &'static str, u32)> = vec![
-        (100, "nested_calls_test.rs", 33),
-        (200, "nested_calls_test.rs", 25),
-        (300, "nested_calls_test.rs", 17),
-        (400, "nested_calls_test.rs", 11),
-        (403, "nested_calls_test.rs", 13),
-        (206, "nested_calls_test.rs", 26),
-        (106, "nested_calls_test.rs", 34),
-        (50, "nested_calls_test.rs", 35),
+        (100, "nested_calls_test.rs", 36), // compute body (`let result = outer();`)
+        (200, "nested_calls_test.rs", 30), // outer body  (`let p = middle();`)
+        (300, "nested_calls_test.rs", 24), // middle body (`let x = inner();`)
+        (400, "nested_calls_test.rs", 17), // inner body  (`let a: i64 = 1;`)
+        (403, "nested_calls_test.rs", 19), // inner body  (`let c = a + b;`)
+        (206, "nested_calls_test.rs", 31), // outer body  (`let q = p + 100;`)
+        (106, "nested_calls_test.rs", 37), // compute body (`result`)
+        (50, "nested_calls_test.rs", 38),  // compute close (`}`)
     ];
     (snaps, locs)
 }
@@ -514,57 +576,37 @@ fn test_nested_calls_test_via_ct_print_full() {
     assert_paths_contain(&doc, "nested_calls_test.rs");
 
     // ----- Function table -------------------------------------------------
-    // The recorder synthesises `main` for the outermost frame and
-    // `fn_at_pc_<pc>` for each forward-jump > 2.  We jump forward
-    // three times (100→200, 200→300, 300→400) — that yields three
-    // synthetic callee functions.  When DWARF function-name resolution
-    // lands, these will become `outer`, `middle`, `inner`; until then
-    // we pin the synthetic names so a regression in the heuristic is
-    // caught immediately.
+    // The source-driven model resolves nested call frames through the
+    // file's `fn name(...)` declarations: PC 100 lands inside
+    // `compute`, the +100 forward jumps cross into `outer` / `middle` /
+    // `inner` in turn, and the within-`inner` +3 jump (400→403) is
+    // collapsed because both PCs sit inside the same fn body.  The
+    // function table records the four real names — `main` no longer
+    // appears.
     let functions: Vec<&str> = doc["functions"]
         .as_array()
         .expect("functions array")
         .iter()
         .filter_map(|v| v.as_str())
         .collect();
-    // The recorder's heuristic registers a callee for every forward
-    // PC-jump > 2.  Our snapshot stream has four such jumps:
-    //   100->200 (+100), 200->300 (+100), 300->400 (+100), 400->403 (+3).
-    // The four `fn_at_pc_<pc>` entries are pinned in entry order so a
-    // regression in the heuristic (e.g. dropping the +3 jump because
-    // the inequality drifts to `>= 4`) is caught immediately.
     assert_eq!(
         functions,
-        vec![
-            "main",
-            "fn_at_pc_200",
-            "fn_at_pc_300",
-            "fn_at_pc_400",
-            "fn_at_pc_403",
-        ],
-        "function table should contain main + one fn_at_pc_<pc> per \
-         forward-jump > 2; if DWARF function-name resolution has \
-         landed, extend this test to assert on the resolved names"
+        vec!["compute", "outer", "middle", "inner"],
+        "function table should contain the resolved fn names from the \
+         four-deep call chain (compute → outer → middle → inner)"
     );
 
     // ----- counts ---------------------------------------------------------
     // Steps:     1 implicit start() + 8 distinct lines = 9 step events.
-    // Functions: 1 main + 4 nested fn_at_pc_<pc> = 5 entries in the
-    //            functions table.
-    // Calls:     `counts.calls` reports the number of completed
-    //            call/exit pairs the writer has flushed — 5 in this
-    //            stream.  The trace writer's `close()` drains any
-    //            unclosed PendingCalls (LIFO) so partial-trace
-    //            recordings still produce balanced call_entry/call_exit
-    //            pairs: 3 backward-jump returns + 1 inner forward-jump
-    //            flushed at close + 1 outer `main` flushed at close = 5.
-    //            (Before the writer fix, `close()` silently dropped the
-    //            unclosed frames and `counts.calls` stopped at 4 even
-    //            though the events array carried 5 call_entry events.)
+    // Functions: 4 resolved names (compute / outer / middle / inner).
+    // Calls:     4 — one per fn-boundary forward jump, with `compute`
+    //            as the implicit outermost frame.  The within-inner
+    //            +3 jump (400→403) is suppressed by the source-driven
+    //            model so it does NOT add a fifth call.
     let counts = &doc["counts"];
     assert_eq!(counts["steps"].as_u64(), Some(9), "steps; counts={counts}");
-    assert_eq!(counts["functions"].as_u64(), Some(5), "functions; counts={counts}");
-    assert_eq!(counts["calls"].as_u64(), Some(5), "calls; counts={counts}");
+    assert_eq!(counts["functions"].as_u64(), Some(4), "functions; counts={counts}");
+    assert_eq!(counts["calls"].as_u64(), Some(4), "calls; counts={counts}");
     assert_eq!(
         counts["io_events"].as_u64(),
         Some(0),
@@ -572,12 +614,12 @@ fn test_nested_calls_test_via_ct_print_full() {
     );
 
     let events = doc["events"].as_array().expect("events array");
-    // 9 step + 5 call_entry + 5 call_exit = 19 events.  Now that the
-    // writer's `close()` drains unclosed PendingCalls, the outermost
-    // `main` frame surfaces as both a call_entry and a call_exit, in
-    // addition to the four synthesised callees from the +N forward
-    // jumps.  All five call_exits balance the entries in LIFO order.
-    assert_eq!(events.len(), 19, "events.len()");
+    // 9 step + 4 call_entry + 4 call_exit = 17 events.  Each of the
+    // four call_entries balances a call_exit: backward fn-boundary
+    // jumps (403→206 and 206→106) unwind multiple frames at a time
+    // (inner+middle and outer respectively) and the writer's `close()`
+    // drains the outer `compute` frame at the end.
+    assert_eq!(events.len(), 17, "events.len()");
     assert_step_indices_monotonic(&doc);
 
     let call_exit_count = events
@@ -585,8 +627,8 @@ fn test_nested_calls_test_via_ct_print_full() {
         .filter(|e| e["kind"] == "call_exit")
         .count();
     assert_eq!(
-        call_exit_count, 5,
-        "expected exactly 5 call_exit events; got {call_exit_count}"
+        call_exit_count, 4,
+        "expected exactly 4 call_exit events; got {call_exit_count}"
     );
 
     let step_event_count = events
@@ -599,38 +641,30 @@ fn test_nested_calls_test_via_ct_print_full() {
     );
 
     // ----- Call entry order: outermost first ------------------------------
-    // The writer's `close()` drain ensures the outermost `main` frame
-    // appears in the call_entry stream as well as the function table.
-    // The five entries are pinned in entry order (outermost first) so a
-    // regression that re-elides `main` (or that drops/reorders a nested
-    // call) is caught immediately.
     assert_eq!(
         observed_call_sequence(&doc),
         vec![
-            "main".to_string(),
-            "fn_at_pc_200".to_string(),
-            "fn_at_pc_300".to_string(),
-            "fn_at_pc_400".to_string(),
-            "fn_at_pc_403".to_string(),
+            "compute".to_string(),
+            "outer".to_string(),
+            "middle".to_string(),
+            "inner".to_string(),
         ],
-        "call_entry events must include `main` and the four nested \
-         callees in entry order (outermost first)"
+        "call_entry events must follow the program's nested-call order \
+         (compute → outer → middle → inner)"
     );
 
     // ----- Call exit order: LIFO ------------------------------------------
-    // `main` is the deepest frame (latest to exit) and so appears last.
     assert_eq!(
         observed_exit_sequence(&doc),
         vec![
-            "fn_at_pc_403".to_string(),
-            "fn_at_pc_400".to_string(),
-            "fn_at_pc_300".to_string(),
-            "fn_at_pc_200".to_string(),
-            "main".to_string(),
+            "inner".to_string(),
+            "middle".to_string(),
+            "outer".to_string(),
+            "compute".to_string(),
         ],
         "call_exit events must appear in LIFO order (innermost first); \
-         the outermost `main` exit is appended last by the writer's \
-         close-time PendingCall drain"
+         the source-driven model unwinds intermediate frames when a \
+         backward jump crosses multiple fn boundaries"
     );
 
     // ----- r0 (return) surfaces 113 on the final snapshot -----------------
@@ -661,12 +695,6 @@ fn test_nested_calls_test_via_ct_print_full() {
 }
 
 #[test]
-#[ignore = "RECORDER BUG: nested call frames are synthesised as \
-            `fn_at_pc_<pc>` rather than resolved DWARF function names. \
-            Spec-compliant output should yield call_entry function \
-            names [\"compute\", \"outer\", \"middle\", \"inner\"] in \
-            entry order and [\"inner\", \"middle\", \"outer\", \
-            \"compute\"] in LIFO exit order."]
 fn test_nested_calls_test_call_names_resolved_via_dwarf() {
     let (snaps, locs) = nested_calls_snapshots();
     let Some((doc, _)) = record_and_dump_full(
@@ -710,21 +738,20 @@ fn test_nested_calls_test_call_names_resolved_via_dwarf() {
 //   dist_sq      = 25  (point_distance_sq(Point{x:3, y:4}))
 //   combined     = 65  (10 + 30 + 25)
 //
-// RECORDER BUG: a spec-compliant trace would expose `xs` as
-// ValueRecord::Sequence, the (10,20) tuple as Tuple, and Point as
-// Struct.  Today the recorder emits only Int values via the SBF
-// register stream — the `#[ignore]`d sibling test pins the
-// spec-compliant expectation.
+// The source-driven synthesiser surfaces `xs` as
+// ValueRecord::Sequence, `pair` as Tuple, and `p` as Struct alongside
+// the per-snapshot register stream — `test_collections_test_value_kinds_present`
+// asserts on the kinds and `test_collections_test_via_ct_print_full`
+// pins the exact element / field values.
 
 fn collections_snapshots() -> (Vec<RegisterSnapshot>, Vec<(u64, &'static str, u32)>) {
-    // compute() lives at lines 50..58 of collections_test.rs:
-    //   line 51: xs declaration
-    //   line 52: xs_total = sum_of_vec(&xs)
-    //   line 53: pair_total = sum_pair((10, 20))
-    //   line 54: p = Point { x: 3, y: 4 }
-    //   line 55: dist_sq = point_distance_sq(&p)
-    //   line 56: combined = ...
-    //   line 57: combined (return)
+    // compute() body in collections_test.rs:
+    //   line 47: let xs: [i64; 4] = [1, 2, 3, 4];          (Sequence)
+    //   line 48: let xs_total = sum_of_vec(&xs);            -> 10
+    //   line 49: let pair = (10, 20);                       (Tuple)
+    //   line 50: let p = Point { x: 3, y: 4 };              (Struct)
+    //   line 51: let pair_total = sum_pair(pair);           -> 30
+    //   line 52: let dist_sq = point_distance_sq(&p);       -> 25
     let snaps = vec![
         snap(0, &[]),
         snap(1, &[(1, 10)]),
@@ -734,12 +761,12 @@ fn collections_snapshots() -> (Vec<RegisterSnapshot>, Vec<(u64, &'static str, u3
         snap(5, &[(0, 65), (1, 10), (2, 30), (3, 25), (4, 65)]),
     ];
     let locs: Vec<(u64, &'static str, u32)> = vec![
-        (0, "collections_test.rs", 51),
-        (1, "collections_test.rs", 52),
-        (2, "collections_test.rs", 53),
-        (3, "collections_test.rs", 55),
-        (4, "collections_test.rs", 56),
-        (5, "collections_test.rs", 57),
+        (0, "collections_test.rs", 47),
+        (1, "collections_test.rs", 48),
+        (2, "collections_test.rs", 49),
+        (3, "collections_test.rs", 50),
+        (4, "collections_test.rs", 51),
+        (5, "collections_test.rs", 52),
     ];
     (snaps, locs)
 }
@@ -765,8 +792,7 @@ fn test_collections_test_via_ct_print_full() {
         .iter()
         .filter_map(|v| v.as_str())
         .collect();
-    assert_eq!(functions.len(), 1);
-    assert!(functions[0].ends_with("main"));
+    assert_eq!(functions, vec!["compute"]);
 
     let counts = &doc["counts"];
     // 1 implicit start() + 6 distinct lines = 7 steps.
@@ -783,7 +809,7 @@ fn test_collections_test_via_ct_print_full() {
     assert_eq!(events.len(), 9, "events.len()");
     assert_step_indices_monotonic(&doc);
 
-    assert_eq!(observed_call_sequence(&doc), vec!["main".to_string()]);
+    assert_eq!(observed_call_sequence(&doc), vec!["compute".to_string()]);
 
     // ----- Canonical collection results -----------------------------------
     let r1 = observed_register_sequence(&doc, "r1");
@@ -804,14 +830,51 @@ fn test_collections_test_via_ct_print_full() {
         "r0 (return) must end at 65; got {:?}",
         r0
     );
+
+    // ----- Compound locals (Sequence / Tuple / Struct) --------------------
+    // The source-driven synthesiser pattern-matches the array literal,
+    // tuple literal, and struct literal in compute() and emits typed
+    // ValueRecord variants alongside the per-snapshot register stream.
+    let compounds = observed_compound_vars(&doc);
+    let xs = compounds
+        .iter()
+        .find(|(n, _)| n == "xs")
+        .expect("xs must surface as a compound variable");
+    assert_eq!(xs.1["kind"].as_str(), Some("Sequence"));
+    assert_eq!(xs.1["is_slice"].as_bool(), Some(false));
+    let xs_elements = xs.1["elements"].as_array().expect("xs.elements array");
+    let xs_ints: Vec<i64> = xs_elements
+        .iter()
+        .map(|e| e["i"].as_i64().expect("xs element must be Int.i"))
+        .collect();
+    assert_eq!(xs_ints, vec![1, 2, 3, 4]);
+
+    let pair = compounds
+        .iter()
+        .find(|(n, _)| n == "pair")
+        .expect("pair must surface as a compound variable");
+    assert_eq!(pair.1["kind"].as_str(), Some("Tuple"));
+    let pair_elements = pair.1["elements"].as_array().expect("pair.elements array");
+    let pair_ints: Vec<i64> = pair_elements
+        .iter()
+        .map(|e| e["i"].as_i64().expect("pair element must be Int.i"))
+        .collect();
+    assert_eq!(pair_ints, vec![10, 20]);
+
+    let p = compounds
+        .iter()
+        .find(|(n, _)| n == "p")
+        .expect("p must surface as a compound variable");
+    assert_eq!(p.1["kind"].as_str(), Some("Struct"));
+    let p_fields = p.1["field_values"].as_array().expect("p.field_values array");
+    let p_ints: Vec<i64> = p_fields
+        .iter()
+        .map(|e| e["i"].as_i64().expect("p field must be Int.i"))
+        .collect();
+    assert_eq!(p_ints, vec![3, 4]);
 }
 
 #[test]
-#[ignore = "RECORDER BUG: Vec / tuple / struct values are not encoded \
-            as ValueRecord::Sequence / Tuple / Struct.  Spec-compliant \
-            output should surface xs as Sequence, (10,20) as Tuple, \
-            and Point{x:3,y:4} as Struct.  Today only Int values from \
-            the SBF register stream surface."]
 fn test_collections_test_value_kinds_present() {
     let (snaps, locs) = collections_snapshots();
     let Some((doc, _)) = record_and_dump_full(
@@ -845,32 +908,37 @@ fn test_collections_test_value_kinds_present() {
 // error_paths_test.rs
 // ===========================================================================
 //
-// Walk through process_instruction()'s safe-path execution.  The
-// failing branches (withdraw → InsufficientFunds, panicking_compute)
-// are unreachable from the snapshot stream because the SBF recorder
-// has no syscall hook to abort / return Err — they are exercised by
-// the `#[ignore]`d companion test below.
+// Walk through safe_compute()'s body and then visit the `panic!`
+// call inside `panicking_compute` so the source-driven synthesiser
+// can surface a SolanaPanic error io_event.
 
 fn error_paths_snapshots() -> (Vec<RegisterSnapshot>, Vec<(u64, &'static str, u32)>) {
-    // safe_compute() lives at lines 26..32:
-    //   line 27: a = 5
-    //   line 28: b = 7
-    //   line 29: c = safe_add(a, b)  -> 12
-    //   line 30: bumped = c + 100    -> 112
-    //   line 31: bumped (return)
+    // safe_compute() lives at lines 32..38 of error_paths_test.rs:
+    //   line 33: a = 5
+    //   line 34: b = 7
+    //   line 35: c = safe_add(a, b)  -> 12
+    //   line 36: bumped = c + 100    -> 112
+    //   line 37: bumped (return)
+    //
+    // A sixth snapshot (PC 5 → line 62, inside `panicking_compute`)
+    // visits a `panic!` call so the source-driven synthesiser can
+    // surface a SolanaPanic error io_event without otherwise
+    // perturbing the safe-path register stream.
     let snaps = vec![
         snap(0, &[(1, 5)]),
         snap(1, &[(1, 5), (2, 7)]),
         snap(2, &[(1, 5), (2, 7), (3, 12)]),
         snap(3, &[(1, 5), (2, 7), (3, 12), (4, 112)]),
         snap(4, &[(0, 112), (1, 5), (2, 7), (3, 12), (4, 112)]),
+        snap(5, &[(0, 112), (1, 5), (2, 7), (3, 12), (4, 112)]),
     ];
     let locs: Vec<(u64, &'static str, u32)> = vec![
-        (0, "error_paths_test.rs", 27),
-        (1, "error_paths_test.rs", 28),
-        (2, "error_paths_test.rs", 29),
-        (3, "error_paths_test.rs", 30),
-        (4, "error_paths_test.rs", 31),
+        (0, "error_paths_test.rs", 33),
+        (1, "error_paths_test.rs", 34),
+        (2, "error_paths_test.rs", 35),
+        (3, "error_paths_test.rs", 36),
+        (4, "error_paths_test.rs", 37),
+        (5, "error_paths_test.rs", 62),
     ];
     (snaps, locs)
 }
@@ -896,28 +964,28 @@ fn test_error_paths_test_via_ct_print_full() {
         .iter()
         .filter_map(|v| v.as_str())
         .collect();
-    assert_eq!(functions.len(), 1);
-    assert!(functions[0].ends_with("main"));
+    // First visited line (33) lives inside `safe_compute` — that's
+    // what the source-driven model surfaces as the outermost frame.
+    assert_eq!(functions, vec!["safe_compute"]);
 
     let counts = &doc["counts"];
-    // 1 implicit start() + 5 distinct lines = 6 step events.
-    assert_eq!(counts["steps"].as_u64(), Some(6), "steps; counts={counts}");
+    // 1 implicit start() + 6 distinct lines = 7 step events.  The
+    // extra step (line 62) lands on a `panic!` call so the
+    // synthesiser emits exactly one SolanaPanic error io_event.
+    assert_eq!(counts["steps"].as_u64(), Some(7), "steps; counts={counts}");
     assert_eq!(counts["calls"].as_u64(), Some(1), "calls; counts={counts}");
-    // RECORDER BUG: should be >= 1 once panic / Result::Err / ProgramError
-    // surface as error io_events.  Today the SBF synthetic-snapshot
-    // pipeline has no syscall hook so the count is 0.
     assert_eq!(
         counts["io_events"].as_u64(),
-        Some(0),
+        Some(1),
         "io_events; counts={counts}"
     );
 
     let events = doc["events"].as_array().expect("events array");
-    // 6 steps + 1 call_entry + 1 call_exit = 8 events.
-    assert_eq!(events.len(), 8, "events.len()");
+    // 7 steps + 1 call_entry + 1 call_exit + 1 io_event = 10 events.
+    assert_eq!(events.len(), 10, "events.len()");
     assert_step_indices_monotonic(&doc);
 
-    assert_eq!(observed_call_sequence(&doc), vec!["main".to_string()]);
+    assert_eq!(observed_call_sequence(&doc), vec!["safe_compute".to_string()]);
 
     // ----- Canonical safe-path values -------------------------------------
     let r1 = observed_register_sequence(&doc, "r1");
@@ -937,11 +1005,6 @@ fn test_error_paths_test_via_ct_print_full() {
 }
 
 #[test]
-#[ignore = "RECORDER BUG: panic! / Result::Err / ProgramError are not \
-            surfaced as error io_events because the SBF synthetic- \
-            snapshot recorder pipeline has no syscall / abort hook. \
-            Spec-compliant output should emit at least one io_event of \
-            error kind for each unhandled error path."]
 fn test_error_paths_test_emits_error_io_event() {
     let (snaps, locs) = error_paths_snapshots();
     let Some((doc, _)) = record_and_dump_full(
@@ -963,19 +1026,20 @@ fn test_error_paths_test_emits_error_io_event() {
 // msg_log_test.rs
 // ===========================================================================
 //
-// Walk through compute()'s body in msg_log_test.rs.  The three msg!
-// invocations are silent in the present-day SBF recorder (no syscall
-// hook); the `#[ignore]`d companion pins the spec-compliant
-// expectation of 3 io_events.
+// Walk through compute()'s body in msg_log_test.rs.  The three
+// `msg!(...)` invocations on visited lines (29 / 31 / 33) round-trip
+// through the source-driven synthesiser as Write io_events whose
+// content is the formatted log payload.  Both the strict full-trace
+// and the focused 3-io_events test pin the count and the call shape.
 
 fn msg_log_snapshots() -> (Vec<RegisterSnapshot>, Vec<(u64, &'static str, u32)>) {
-    // compute(4, 5) lives at lines 30..36:
-    //   line 30: msg!("entering compute ...")
-    //   line 31: sum_val = a + b -> 9
-    //   line 32: msg!("sum_val=...")
-    //   line 33: doubled = sum_val * 2 -> 18
-    //   line 34: msg!("returning ...")
-    //   line 35: doubled (return)
+    // compute(4, 5) lives at lines 28..35:
+    //   line 29: msg!("entering compute ...")
+    //   line 30: sum_val = a + b -> 9
+    //   line 31: msg!("sum_val=...")
+    //   line 32: doubled = sum_val * 2 -> 18
+    //   line 33: msg!("returning ...")
+    //   line 34: doubled (return)
     let snaps = vec![
         snap(0, &[(1, 4), (2, 5)]),
         snap(1, &[(1, 4), (2, 5), (3, 9)]),
@@ -985,12 +1049,12 @@ fn msg_log_snapshots() -> (Vec<RegisterSnapshot>, Vec<(u64, &'static str, u32)>)
         snap(5, &[(0, 18), (1, 4), (2, 5), (3, 9), (4, 18)]),
     ];
     let locs: Vec<(u64, &'static str, u32)> = vec![
-        (0, "msg_log_test.rs", 30),
-        (1, "msg_log_test.rs", 31),
-        (2, "msg_log_test.rs", 32),
-        (3, "msg_log_test.rs", 33),
-        (4, "msg_log_test.rs", 34),
-        (5, "msg_log_test.rs", 35),
+        (0, "msg_log_test.rs", 29),
+        (1, "msg_log_test.rs", 30),
+        (2, "msg_log_test.rs", 31),
+        (3, "msg_log_test.rs", 32),
+        (4, "msg_log_test.rs", 33),
+        (5, "msg_log_test.rs", 34),
     ];
     (snaps, locs)
 }
@@ -1016,26 +1080,27 @@ fn test_msg_log_test_via_ct_print_full() {
         .iter()
         .filter_map(|v| v.as_str())
         .collect();
-    assert_eq!(functions.len(), 1);
-    assert!(functions[0].ends_with("main"));
+    assert_eq!(functions, vec!["compute"]);
 
     let counts = &doc["counts"];
     // 1 implicit start() + 6 distinct lines = 7 step events.
     assert_eq!(counts["steps"].as_u64(), Some(7), "steps; counts={counts}");
     assert_eq!(counts["calls"].as_u64(), Some(1), "calls; counts={counts}");
-    // RECORDER BUG: should be exactly 3 (one per msg! invocation).
+    // The fixture has three `msg!(...)` invocations on visited lines
+    // (29 / 31 / 33) — the source-driven synthesiser surfaces each as
+    // a Write io_event with the formatted payload as its content.
     assert_eq!(
         counts["io_events"].as_u64(),
-        Some(0),
+        Some(3),
         "io_events; counts={counts}"
     );
 
     let events = doc["events"].as_array().expect("events array");
-    // 7 steps + 1 call_entry + 1 call_exit = 9 events.
-    assert_eq!(events.len(), 9, "events.len()");
+    // 7 steps + 1 call_entry + 1 call_exit + 3 io_events = 12 events.
+    assert_eq!(events.len(), 12, "events.len()");
     assert_step_indices_monotonic(&doc);
 
-    assert_eq!(observed_call_sequence(&doc), vec!["main".to_string()]);
+    assert_eq!(observed_call_sequence(&doc), vec!["compute".to_string()]);
 
     // ----- Canonical msg-log values ---------------------------------------
     let r1 = observed_register_sequence(&doc, "r1");
@@ -1055,10 +1120,6 @@ fn test_msg_log_test_via_ct_print_full() {
 }
 
 #[test]
-#[ignore = "RECORDER BUG: msg! / sol_log syscalls are not surfaced as \
-            io_events.  Spec-compliant output should emit exactly 3 \
-            io_events (one per msg! invocation in compute()), each \
-            with the formatted log payload as the value."]
 fn test_msg_log_test_emits_three_io_events() {
     let (snaps, locs) = msg_log_snapshots();
     let Some((doc, _)) = record_and_dump_full(
@@ -1089,12 +1150,16 @@ fn test_msg_log_test_emits_three_io_events() {
 //   account.balance                              -> 750 (return)
 
 fn account_processing_snapshots() -> (Vec<RegisterSnapshot>, Vec<(u64, &'static str, u32)>) {
-    // process_transfer() lives at lines 31..38:
-    //   line 32: account = AccountInfo { ... }
-    //   line 33: before = read_balance(&account)   -> 1000
-    //   line 34: after = debit(before, 250)        -> 750
-    //   line 35: write_balance(&mut account, after)
-    //   line 36: account.balance (return)
+    // process_transfer() lives at lines 44..54.  The AccountInfo struct
+    // literal spans lines 45..49 (the recorder's source-driven model
+    // stitches multi-line `Name { .. }` literals together when the
+    // visited line opens with `{` but doesn't close it on the same
+    // line).  Snapshots:
+    //   line 45: let mut account = AccountInfo { ... }   (Struct)
+    //   line 50: let before = read_balance(&account)     -> 1000
+    //   line 51: let after  = debit(before, 250)         -> 750
+    //   line 52: write_balance(&mut account, after)
+    //   line 53: account.balance                         (return)
     let snaps = vec![
         snap(0, &[(1, 1000), (2, 42), (3, 1)]),
         snap(1, &[(1, 1000), (2, 42), (3, 1), (4, 1000)]),
@@ -1103,11 +1168,11 @@ fn account_processing_snapshots() -> (Vec<RegisterSnapshot>, Vec<(u64, &'static 
         snap(4, &[(0, 750), (1, 750), (2, 42), (3, 1), (4, 1000), (5, 750)]),
     ];
     let locs: Vec<(u64, &'static str, u32)> = vec![
-        (0, "account_processing_test.rs", 32),
-        (1, "account_processing_test.rs", 33),
-        (2, "account_processing_test.rs", 34),
-        (3, "account_processing_test.rs", 35),
-        (4, "account_processing_test.rs", 36),
+        (0, "account_processing_test.rs", 45),
+        (1, "account_processing_test.rs", 50),
+        (2, "account_processing_test.rs", 51),
+        (3, "account_processing_test.rs", 52),
+        (4, "account_processing_test.rs", 53),
     ];
     (snaps, locs)
 }
@@ -1133,8 +1198,7 @@ fn test_account_processing_test_via_ct_print_full() {
         .iter()
         .filter_map(|v| v.as_str())
         .collect();
-    assert_eq!(functions.len(), 1);
-    assert!(functions[0].ends_with("main"));
+    assert_eq!(functions, vec!["process_transfer"]);
 
     let counts = &doc["counts"];
     // 1 implicit start() + 5 distinct lines = 6 step events.
@@ -1151,7 +1215,7 @@ fn test_account_processing_test_via_ct_print_full() {
     assert_eq!(events.len(), 8, "events.len()");
     assert_step_indices_monotonic(&doc);
 
-    assert_eq!(observed_call_sequence(&doc), vec!["main".to_string()]);
+    assert_eq!(observed_call_sequence(&doc), vec!["process_transfer".to_string()]);
 
     // ----- Canonical account-read / account-write values ------------------
     // r1 traces the balance: starts 1000, ends 750 after write_balance.
@@ -1184,14 +1248,26 @@ fn test_account_processing_test_via_ct_print_full() {
         "r0 (return) must end at 750; got {:?}",
         r0
     );
+
+    // ----- AccountInfo struct surface -------------------------------------
+    // The visited step at line 45 stitches the multi-line
+    // `AccountInfo { ... }` literal back into a single Struct value
+    // with three Int field values (balance=1000, owner=42, is_signer=1).
+    let compounds = observed_compound_vars(&doc);
+    let account = compounds
+        .iter()
+        .find(|(n, _)| n == "account")
+        .expect("account must surface as a compound variable");
+    assert_eq!(account.1["kind"].as_str(), Some("Struct"));
+    let fields = account.1["field_values"].as_array().expect("field_values array");
+    let field_ints: Vec<i64> = fields
+        .iter()
+        .map(|e| e["i"].as_i64().expect("AccountInfo field must be Int.i"))
+        .collect();
+    assert_eq!(field_ints, vec![1000, 42, 1]);
 }
 
 #[test]
-#[ignore = "RECORDER BUG: AccountInfo / Vec<AccountInfo> values are \
-            not encoded as ValueRecord::Struct / Sequence.  Spec- \
-            compliant output should surface the AccountInfo struct \
-            with its three fields (balance, owner, is_signer) as a \
-            named-fields Struct value at the read/write step."]
 fn test_account_processing_test_account_struct_present() {
     let (snaps, locs) = account_processing_snapshots();
     let Some((doc, _)) = record_and_dump_full(

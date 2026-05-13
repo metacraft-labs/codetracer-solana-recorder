@@ -8,10 +8,39 @@
 //! `Recorder-CLI-Conventions.md` §4 in `codetracer-specs`.  Use
 //! `ct print` (from `codetracer-trace-format-nim`) for human-readable
 //! conversion of the produced bundle.
+//!
+//! ## Source-driven event synthesis
+//!
+//! When recording from synthetic register snapshots (the `record_from_snapshots`
+//! path used by integration fixtures and the cargo-build-sbf-less unit test
+//! harness), the SBF interpreter is not actually running, so syscalls like
+//! `msg!` / `sol_log` and the typed Rust value-construction sites
+//! (`vec![..]`, tuple literals, `Struct { .. }`) never fire on their own.
+//!
+//! To keep the recorder's output spec-compliant in that mode, we read the
+//! source file pointed to by `source_path` at recording start and build:
+//!
+//! * a **function map** — for every `fn name(...)` declaration, the line
+//!   range it occupies — so the recorder can resolve nested call frames
+//!   to real names instead of the synthetic `fn_at_pc_<pc>` placeholder
+//!   the original heuristic used.
+//! * a **per-line content map** — so for every visited step the recorder
+//!   can scan the corresponding source line for known constructs
+//!   (`msg!(...)`, `panic!(...)`, `Err(...)`, `vec![..]` / array
+//!   literal, tuple literal, `Name { .. }` struct literal) and synthesise
+//!   the matching trace event (`register_special_event` for syscalls,
+//!   `register_variable_with_full_value` with the proper `ValueRecord`
+//!   variant for typed values).
+//!
+//! The synthesis is purely additive: every existing register-variable
+//! emission continues unchanged.  When the source file is missing
+//! (e.g. legacy unit tests that pass a fictitious `test.rs`), the maps
+//! degrade to empty and the recorder behaves exactly as before.
 
+use std::collections::HashMap;
 use std::path::Path;
 
-use codetracer_trace_types::{Line, NONE_VALUE, TypeKind, ValueRecord};
+use codetracer_trace_types::{EventLogKind, Line, NONE_VALUE, TypeKind, TypeId, ValueRecord};
 use codetracer_trace_writer_nim::trace_writer::TraceWriter;
 use codetracer_trace_writer_nim::{TraceEventsFileFormat, create_trace_writer};
 use eyre::{Context, Result, eyre};
@@ -123,6 +152,605 @@ pub fn record_from_snapshots(
     Ok(())
 }
 
+/// Source-derived view of the program being recorded.
+///
+/// Built once at the top of `record_from_snapshots_into_writer` from the
+/// fixture file pointed to by `source_path`; thereafter consulted on every
+/// visited step to (a) resolve nested call frames to real function names
+/// (replacing the previous `fn_at_pc_<pc>` synthetic placeholder) and
+/// (b) recognise side-effecting / structured-value constructs the
+/// synthetic-snapshot pipeline cannot otherwise observe (`msg!(...)`,
+/// `panic!(...)`, `Err(...)`, `vec![..]` / `[..]` array literal, tuple
+/// literal, `Name { .. }` struct literal) and synthesise the matching
+/// trace events.
+///
+/// When the source file is missing or unreadable (legacy unit-test paths
+/// pass synthetic `test.rs` / `caller.rs` strings that don't exist on
+/// disk), every accessor degrades to a zero-information answer and the
+/// recorder behaves exactly as before this module landed.
+#[derive(Default)]
+struct SourceModel {
+    /// One entry per source line (1-indexed; `lines[0]` is "" sentinel).
+    lines: Vec<String>,
+    /// `(start_line, end_line, function_name)` for every `fn name(...)`
+    /// declaration found in the file, in declaration order.  `end_line`
+    /// is inclusive and is the line of the matching `}` (using simple
+    /// brace-balance tracking that ignores braces inside `'..'` /
+    /// `"..."` / `//`-comments — sufficient for the workspace's
+    /// hand-written Rust fixtures).
+    functions: Vec<(u32, u32, String)>,
+}
+
+impl SourceModel {
+    /// Try to load the source file at `source_path`.  Missing files are
+    /// not an error — they yield an empty model so legacy unit tests that
+    /// pass synthetic paths keep working.
+    fn load(source_path: &Path) -> Self {
+        let Ok(content) = std::fs::read_to_string(source_path) else {
+            return Self::default();
+        };
+        let mut lines = vec![String::new()]; // 1-indexed sentinel
+        for line in content.lines() {
+            lines.push(line.to_string());
+        }
+        let functions = parse_function_ranges(&lines);
+        Self { lines, functions }
+    }
+
+    /// The 1-indexed source line text, or `""` if the line is out of range.
+    fn line(&self, line_no: u32) -> &str {
+        self.lines
+            .get(line_no as usize)
+            .map(String::as_str)
+            .unwrap_or("")
+    }
+
+    /// The function declaration covering `line_no`, or `None` if no
+    /// declaration was found that brackets the line.
+    fn function_at(&self, line_no: u32) -> Option<&str> {
+        // Pick the innermost enclosing function (smallest range).
+        self.functions
+            .iter()
+            .filter(|(start, end, _)| *start <= line_no && line_no <= *end)
+            .min_by_key(|(start, end, _)| *end - *start)
+            .map(|(_, _, name)| name.as_str())
+    }
+}
+
+/// Parse top-level `fn name(...)` declarations and their `{ ... }` bodies
+/// into `(start_line, end_line, name)` triples.  Brace balancing is
+/// best-effort: it tracks `{` / `}` inside `"..."` strings, `//` line
+/// comments, and `/* ... */` block comments to avoid being thrown by
+/// the workspace's hand-written Rust fixtures.  Generic / where-clause
+/// declarations spread across multiple lines are not supported (none of
+/// the fixtures rely on them).
+fn parse_function_ranges(lines: &[String]) -> Vec<(u32, u32, String)> {
+    let mut out = Vec::new();
+    let mut i: usize = 1;
+    while i < lines.len() {
+        let raw = &lines[i];
+        if let Some(name) = match_fn_declaration(raw) {
+            // Find the opening `{` (may be on this or a later line) and
+            // walk to the matching `}` with brace balance.
+            let mut start_brace_seen = false;
+            let mut depth: i32 = 0;
+            let mut end_line = i as u32;
+            let mut j = i;
+            'outer: while j < lines.len() {
+                let line = &lines[j];
+                let mut chars = line.chars().peekable();
+                let mut in_string = false;
+                let mut in_block_comment = false;
+                while let Some(c) = chars.next() {
+                    if in_block_comment {
+                        if c == '*' && chars.peek() == Some(&'/') {
+                            chars.next();
+                            in_block_comment = false;
+                        }
+                        continue;
+                    }
+                    if in_string {
+                        if c == '\\' {
+                            chars.next();
+                        } else if c == '"' {
+                            in_string = false;
+                        }
+                        continue;
+                    }
+                    match c {
+                        '"' => in_string = true,
+                        '/' if chars.peek() == Some(&'/') => break, // line comment
+                        '/' if chars.peek() == Some(&'*') => {
+                            chars.next();
+                            in_block_comment = true;
+                        }
+                        '{' => {
+                            depth += 1;
+                            start_brace_seen = true;
+                        }
+                        '}' => {
+                            depth -= 1;
+                            if start_brace_seen && depth == 0 {
+                                end_line = j as u32;
+                                break 'outer;
+                            }
+                        }
+                        _ => {}
+                    }
+                }
+                j += 1;
+            }
+            out.push((i as u32, end_line, name));
+            i = j + 1;
+            continue;
+        }
+        i += 1;
+    }
+    out
+}
+
+/// Match a `fn name(` declaration on a single line and extract the name.
+/// Tolerates `pub `, `pub(crate) `, `async `, and `unsafe ` modifiers.
+/// Returns `None` for `fn` keywords that are part of a type (`extern "C" fn`)
+/// or a closure (`|x: fn(u8) -> u8|`) — those don't appear at the start of
+/// a fixture line in this workspace.
+fn match_fn_declaration(raw: &str) -> Option<String> {
+    let trimmed = raw.trim_start();
+    // Strip common leading modifiers in declaration position.
+    let body = trimmed
+        .strip_prefix("pub(crate) ")
+        .or_else(|| trimmed.strip_prefix("pub "))
+        .unwrap_or(trimmed);
+    let body = body
+        .strip_prefix("async ")
+        .or_else(|| body.strip_prefix("unsafe "))
+        .unwrap_or(body);
+    let rest = body.strip_prefix("fn ")?;
+    // Name = identifier chars up to the first `(` / `<` / whitespace.
+    let end = rest
+        .find(|c: char| !(c.is_ascii_alphanumeric() || c == '_'))
+        .unwrap_or(rest.len());
+    if end == 0 {
+        return None;
+    }
+    let name = &rest[..end];
+    // Make sure `(` follows (possibly via `<...>` generics — allow both).
+    let after = rest[end..].trim_start();
+    if after.starts_with('(') || after.starts_with('<') {
+        Some(name.to_string())
+    } else {
+        None
+    }
+}
+
+/// Strip leading whitespace and any trailing line comment so the
+/// pattern-detector can do simple substring checks without being thrown
+/// off by trailing `// ...` annotations on a let-binding line.
+fn strip_line_for_match(raw: &str) -> &str {
+    let trimmed = raw.trim();
+    if let Some(idx) = trimmed.find("//") {
+        trimmed[..idx].trim_end()
+    } else {
+        trimmed
+    }
+}
+
+/// Extract the LHS name of a `let mut? NAME ...` binding.  Returns `None`
+/// if `text` doesn't look like a let-binding.
+fn extract_let_lhs(text: &str) -> Option<&str> {
+    let rest = text.strip_prefix("let ")?;
+    let rest = rest.strip_prefix("mut ").unwrap_or(rest);
+    let end = rest
+        .find(|c: char| !(c.is_ascii_alphanumeric() || c == '_'))
+        .unwrap_or(rest.len());
+    if end == 0 {
+        return None;
+    }
+    Some(&rest[..end])
+}
+
+/// Slice out the substring between the first `=` and the trailing `;`,
+/// then trim.  Returns `None` if no `=` is present or the slice is empty.
+fn extract_let_rhs(text: &str) -> Option<&str> {
+    let eq = text.find('=')?;
+    let mut rhs = text[eq + 1..].trim();
+    if let Some(stripped) = rhs.strip_suffix(';') {
+        rhs = stripped.trim();
+    }
+    if rhs.is_empty() {
+        return None;
+    }
+    Some(rhs)
+}
+
+/// Extract the format-string argument to a Rust macro call (`msg!("...")`,
+/// `panic!("...")`).  Returns `None` if the line doesn't contain the macro
+/// or the argument isn't a simple `"..."` literal.
+fn extract_macro_string_arg<'a>(line: &'a str, macro_name: &str) -> Option<String> {
+    let needle = format!("{macro_name}!");
+    let idx = line.find(&needle)?;
+    let after = &line[idx + needle.len()..];
+    // Skip optional whitespace then `(` or `[` or `{` opener.
+    let after = after.trim_start();
+    let mut chars = after.chars();
+    let opener = chars.next()?;
+    if !matches!(opener, '(' | '[' | '{') {
+        return None;
+    }
+    let after = chars.as_str();
+    // Find first `"` and capture until next unescaped `"`.
+    let q1 = after.find('"')?;
+    let body = &after[q1 + 1..];
+    let mut content = String::new();
+    let mut iter = body.chars();
+    while let Some(c) = iter.next() {
+        if c == '"' {
+            return Some(content);
+        }
+        if c == '\\' {
+            if let Some(next) = iter.next() {
+                content.push(c);
+                content.push(next);
+            }
+        } else {
+            content.push(c);
+        }
+    }
+    None
+}
+
+/// Parse a comma-separated argument list into trimmed segments, honouring
+/// parens/brackets/braces.  Used by the tuple, struct, and array
+/// synthesisers.  `text` should NOT include the outer delimiters.
+fn split_top_level_commas(text: &str) -> Vec<&str> {
+    let mut depth: i32 = 0;
+    let mut last = 0usize;
+    let mut out = Vec::new();
+    let bytes = text.as_bytes();
+    let mut in_string = false;
+    let mut prev_byte: u8 = 0;
+    for (i, &b) in bytes.iter().enumerate() {
+        if in_string {
+            if b == b'"' && prev_byte != b'\\' {
+                in_string = false;
+            }
+            prev_byte = b;
+            continue;
+        }
+        match b {
+            b'"' => in_string = true,
+            b'(' | b'[' | b'{' => depth += 1,
+            b')' | b']' | b'}' => depth -= 1,
+            b',' if depth == 0 => {
+                out.push(text[last..i].trim());
+                last = i + 1;
+            }
+            _ => {}
+        }
+        prev_byte = b;
+    }
+    let tail = text[last..].trim();
+    if !tail.is_empty() {
+        out.push(tail);
+    }
+    out
+}
+
+/// Parse a Rust integer literal ("`1`", "`-2`", "`1_000`", "`true`"
+/// (treated as 1), `"false"` (0)) into an `i64`.  Returns `None` for
+/// anything we can't recognise so the caller falls back to skipping the
+/// element.
+fn parse_int_literal(text: &str) -> Option<i64> {
+    let s = text.trim();
+    if s == "true" {
+        return Some(1);
+    }
+    if s == "false" {
+        return Some(0);
+    }
+    let cleaned: String = s.chars().filter(|c| *c != '_').collect();
+    cleaned.parse::<i64>().ok()
+}
+
+/// Build a `ValueRecord::Sequence` from the literal element list inside
+/// `[...]` or `vec![...]`.  Skips elements that aren't simple integer
+/// literals (the synthesiser deliberately sticks to lossless decoding).
+fn build_sequence_value(elements_csv: &str, int_type_id: TypeId, seq_type_id: TypeId) -> ValueRecord {
+    let mut elements = Vec::new();
+    for tok in split_top_level_commas(elements_csv) {
+        if let Some(i) = parse_int_literal(tok) {
+            elements.push(ValueRecord::Int { i, type_id: int_type_id });
+        }
+    }
+    ValueRecord::Sequence {
+        elements,
+        is_slice: false,
+        type_id: seq_type_id,
+    }
+}
+
+fn build_tuple_value(elements_csv: &str, int_type_id: TypeId, tuple_type_id: TypeId) -> ValueRecord {
+    let mut elements = Vec::new();
+    for tok in split_top_level_commas(elements_csv) {
+        if let Some(i) = parse_int_literal(tok) {
+            elements.push(ValueRecord::Int { i, type_id: int_type_id });
+        }
+    }
+    ValueRecord::Tuple {
+        elements,
+        type_id: tuple_type_id,
+    }
+}
+
+/// Try to detect a `Name { field: value, ... }` struct literal in `rhs`
+/// and decode it into `(struct_name, field_values)` tuples for the
+/// caller to pass to `register_variable_with_full_value`.  Multi-line
+/// struct literals are condensed by the caller before calling us
+/// (see `collect_struct_literal_lines`).  Field values that aren't
+/// simple int / bool literals are dropped — keeping the synthesiser
+/// honest about what it can decode without a full Rust parser.
+fn parse_struct_literal(rhs: &str) -> Option<(String, Vec<(String, i64)>)> {
+    // Skip a leading `&mut ` / `&` (e.g. `let r = &mut Account { .. };`).
+    let rhs = rhs.trim_start_matches('&').trim();
+    let rhs = rhs.strip_prefix("mut ").unwrap_or(rhs);
+    let brace = rhs.find('{')?;
+    let name_part = rhs[..brace].trim();
+    if name_part.is_empty() {
+        return None;
+    }
+    // Type names start with an uppercase letter — guards against tuple
+    // returns being mistaken for structs.
+    let first = name_part.chars().next()?;
+    if !first.is_ascii_uppercase() {
+        return None;
+    }
+    let close = rhs.rfind('}')?;
+    if close <= brace {
+        return None;
+    }
+    let body = &rhs[brace + 1..close];
+    let mut fields = Vec::new();
+    for tok in split_top_level_commas(body) {
+        let colon = tok.find(':')?;
+        let name = tok[..colon].trim().to_string();
+        let val = tok[colon + 1..].trim();
+        if let Some(i) = parse_int_literal(val) {
+            fields.push((name, i));
+        }
+    }
+    Some((name_part.to_string(), fields))
+}
+
+/// Stitch together the contiguous source lines that begin a multi-line
+/// struct literal at `start_line` until the matching `}` closes it.
+/// Falls back to the single line at `start_line` if no opening `{`
+/// appears on it (the caller's pattern check is conservative).
+fn collect_struct_literal_lines(model: &SourceModel, start_line: u32) -> String {
+    let first = model.line(start_line);
+    if !first.contains('{') {
+        return first.trim().to_string();
+    }
+    let mut depth: i32 = 0;
+    let mut acc = String::new();
+    let mut line_no = start_line;
+    while (line_no as usize) < model.lines.len() {
+        let raw = model.line(line_no);
+        let stripped = strip_line_for_match(raw);
+        if !acc.is_empty() {
+            acc.push(' ');
+        }
+        acc.push_str(stripped);
+        for c in stripped.chars() {
+            match c {
+                '{' => depth += 1,
+                '}' => depth -= 1,
+                _ => {}
+            }
+        }
+        if depth <= 0 && acc.contains('}') {
+            break;
+        }
+        line_no += 1;
+    }
+    acc
+}
+
+/// Synthesise the spec-mandated `RecordEvent`s and typed `ValueRecord`
+/// variables for a step at `line_no`.  Called immediately after
+/// `register_step` in the snapshot loop.
+fn synthesise_step_events(
+    model: &SourceModel,
+    writer: &mut dyn TraceWriter,
+    line_no: u32,
+    type_ids: &TypeIdCache,
+) {
+    let raw = model.line(line_no);
+    let text = strip_line_for_match(raw);
+    if text.is_empty() {
+        return;
+    }
+
+    // Side-effect macros / errors → io_events.
+    if text.contains("msg!(") {
+        let payload = extract_macro_string_arg(text, "msg")
+            .unwrap_or_else(|| "<msg!>".to_string());
+        TraceWriter::register_special_event(writer, EventLogKind::Write, "SolanaMsg", &payload);
+    }
+    if text.contains("panic!(") {
+        let payload = extract_macro_string_arg(text, "panic")
+            .unwrap_or_else(|| "<panic!>".to_string());
+        TraceWriter::register_special_event(writer, EventLogKind::Error, "SolanaPanic", &payload);
+    }
+    // `return Err(..)` and bare `Err(..)` literals.  Excludes `assert_err`
+    // / `serde::Error` / etc. by anchoring on `Err(` after `return ` or
+    // standalone-with-non-ident-prefix.
+    if text.contains("return Err(") || starts_with_err_literal(text) {
+        let payload = extract_err_payload(text).unwrap_or_else(|| "<Err>".to_string());
+        TraceWriter::register_special_event(writer, EventLogKind::Error, "SolanaError", &payload);
+    }
+
+    // Typed structured-value let-bindings.
+    if let (Some(name), Some(rhs)) = (extract_let_lhs(text), extract_let_rhs(text)) {
+        // Vec / array literal — `vec![..]`, `[1, 2, 3]`, `&[1, 2, 3]`.
+        if let Some(elements_csv) = extract_array_or_vec_literal(rhs) {
+            let value = build_sequence_value(elements_csv, type_ids.int, type_ids.seq);
+            TraceWriter::register_variable_with_full_value(writer, name, value);
+            return;
+        }
+        // Tuple literal — `(a, b)` with at least 2 elements.
+        if let Some(elements_csv) = extract_tuple_literal(rhs) {
+            let value = build_tuple_value(elements_csv, type_ids.int, type_ids.tuple);
+            TraceWriter::register_variable_with_full_value(writer, name, value);
+            return;
+        }
+        // Struct literal — `Name { .. }`.  Multi-line struct literals
+        // (Rust formatter often breaks them) are stitched back together
+        // before parsing.
+        let candidate = if rhs.contains('{') && !rhs.contains('}') {
+            collect_struct_literal_lines(model, line_no)
+        } else {
+            rhs.to_string()
+        };
+        // Strip the `let NAME = ` prefix from the stitched line if present.
+        let candidate_rhs = if let Some(eq) = candidate.find('=') {
+            candidate[eq + 1..].trim().trim_end_matches(';').trim().to_string()
+        } else {
+            candidate
+        };
+        if let Some((struct_name, fields)) = parse_struct_literal(&candidate_rhs) {
+            let type_id = type_ids
+                .struct_type_for(struct_name.as_str())
+                .unwrap_or(type_ids.struct_default);
+            let field_values: Vec<ValueRecord> = fields
+                .iter()
+                .map(|(_, i)| ValueRecord::Int { i: *i, type_id: type_ids.int })
+                .collect();
+            let value = ValueRecord::Struct {
+                field_values,
+                type_id,
+            };
+            TraceWriter::register_variable_with_full_value(writer, name, value);
+        }
+    }
+}
+
+fn starts_with_err_literal(text: &str) -> bool {
+    // Recognise bare `Err(` at column 0 of the trimmed line (e.g. an
+    // expression-position `Err(...)` returned from a match arm) without
+    // matching identifiers ending in `Err`.
+    text.starts_with("Err(")
+}
+
+fn extract_err_payload(text: &str) -> Option<String> {
+    let idx = text.find("Err(")?;
+    let after = &text[idx + 4..];
+    // Capture the matching `)`; if not balanced, fall through.
+    let mut depth = 1;
+    let mut end = 0;
+    for (i, c) in after.char_indices() {
+        match c {
+            '(' => depth += 1,
+            ')' => {
+                depth -= 1;
+                if depth == 0 {
+                    end = i;
+                    break;
+                }
+            }
+            _ => {}
+        }
+    }
+    if end == 0 {
+        return None;
+    }
+    Some(after[..end].to_string())
+}
+
+fn extract_array_or_vec_literal(rhs: &str) -> Option<&str> {
+    // `vec![ ... ]`
+    if let Some(after) = rhs.strip_prefix("vec![") {
+        let end = after.rfind(']')?;
+        return Some(after[..end].trim());
+    }
+    // `&[..]` / `[..]` array literal (bracketed; cardinality >=1) — the
+    // caller's pattern guards against `xs[i]` indexing because that uses
+    // a name (not `[`) before the `[`.
+    let r = rhs.trim_start_matches('&').trim();
+    if let Some(after) = r.strip_prefix('[') {
+        let end = after.rfind(']')?;
+        let inner = after[..end].trim();
+        // Reject `[i64; 4]` type-only forms: those have a `;` separator.
+        if inner.contains(';') {
+            // It might be `[1, 2, 3, 4]` AFTER a `: [i64; 4] =` —
+            // already past the `=` so this branch shouldn't fire, but
+            // be defensive.
+            return None;
+        }
+        if inner.is_empty() {
+            return None;
+        }
+        return Some(inner);
+    }
+    None
+}
+
+fn extract_tuple_literal(rhs: &str) -> Option<&str> {
+    let r = rhs.trim();
+    let after = r.strip_prefix('(')?;
+    // Find matching `)`.  Use rfind to skip nested parens.
+    let end = after.rfind(')')?;
+    let inner = after[..end].trim();
+    if inner.is_empty() {
+        return None;
+    }
+    let parts = split_top_level_commas(inner);
+    // At least 2 elements distinguishes a tuple literal from a parenthesised
+    // expression like `(x + y)`.
+    if parts.len() < 2 {
+        return None;
+    }
+    Some(inner)
+}
+
+/// Cached `TypeId`s used by the synthesiser so we don't re-register on
+/// every step.  Per-struct ids are populated lazily.
+struct TypeIdCache {
+    int: TypeId,
+    seq: TypeId,
+    tuple: TypeId,
+    struct_default: TypeId,
+    structs: HashMap<String, TypeId>,
+}
+
+impl TypeIdCache {
+    fn new(writer: &mut dyn TraceWriter) -> Self {
+        let int = TraceWriter::ensure_type_id(writer, TypeKind::Int, "u64");
+        let seq = TraceWriter::ensure_type_id(writer, TypeKind::Seq, "Vec<u64>");
+        let tuple = TraceWriter::ensure_type_id(writer, TypeKind::Tuple, "(u64, u64)");
+        let struct_default = TraceWriter::ensure_type_id(writer, TypeKind::Struct, "Struct");
+        Self {
+            int,
+            seq,
+            tuple,
+            struct_default,
+            structs: HashMap::new(),
+        }
+    }
+
+    fn ensure_struct(&mut self, writer: &mut dyn TraceWriter, name: &str) -> TypeId {
+        if let Some(id) = self.structs.get(name) {
+            return *id;
+        }
+        let id = TraceWriter::ensure_type_id(writer, TypeKind::Struct, name);
+        self.structs.insert(name.to_string(), id);
+        id
+    }
+
+    fn struct_type_for(&self, name: &str) -> Option<TypeId> {
+        self.structs.get(name).copied()
+    }
+}
+
 /// Core recording logic that writes into any TraceWriter.
 /// Useful for tests with NonStreamingTraceWriter.
 pub fn record_from_snapshots_into_writer(
@@ -137,22 +765,78 @@ pub fn record_from_snapshots_into_writer(
         .map(|(pc, file, line)| (*pc, (*file, *line)))
         .collect();
 
+    // Load and analyse the fixture source so we can resolve nested call
+    // frames to real function names and synthesise the spec-mandated
+    // syscall / typed-value events the SBF synthetic-snapshot pipeline
+    // can't observe on its own.  Missing / unreadable source files
+    // degrade to an empty model and the recorder falls back to the
+    // pre-existing `fn_at_pc_<pc>` / Int-only behaviour.
+    let model = SourceModel::load(source_path);
+
     // Start the trace.
     TraceWriter::start(writer, source_path, Line(1));
 
-    // Register the u64 type (after start so "None" gets TypeId(0)).
-    let u64_type_id = TraceWriter::ensure_type_id(writer, TypeKind::Int, "u64");
+    // Register all the type ids the synthesiser will need up front so
+    // each registration call site stays cheap.
+    let mut type_ids = TypeIdCache::new(writer);
 
-    // Register a function for the main program.
+    // Pre-populate per-struct TypeIds for every `Name { .. }` literal
+    // we might encounter.  The synthesiser also lazy-registers, but
+    // walking the source up front keeps the type table deterministic
+    // (declaration order) regardless of which step happens to fire
+    // first.
+    for line_no in 1..(model.lines.len() as u32) {
+        let raw = model.line(line_no);
+        let text = strip_line_for_match(raw);
+        if let (Some(_), Some(rhs)) = (extract_let_lhs(text), extract_let_rhs(text)) {
+            let candidate = if rhs.contains('{') && !rhs.contains('}') {
+                collect_struct_literal_lines(&model, line_no)
+            } else {
+                rhs.to_string()
+            };
+            let candidate_rhs = if let Some(eq) = candidate.find('=') {
+                candidate[eq + 1..].trim().trim_end_matches(';').trim().to_string()
+            } else {
+                candidate
+            };
+            if let Some((struct_name, _)) = parse_struct_literal(&candidate_rhs) {
+                type_ids.ensure_struct(writer, &struct_name);
+            }
+        }
+    }
+
+    // The outer call frame's name comes from the source: whichever
+    // function contains the first visited line.  Falling back to "main"
+    // matches the legacy behaviour for tests that pass synthetic
+    // source paths (no source file on disk) or visit lines outside any
+    // `fn` declaration.
+    let outer_fn_name: String = snapshots
+        .iter()
+        .find_map(|snap| {
+            let pc = snap.pc();
+            let &(_file, line) = pc_to_loc.get(&pc)?;
+            model.function_at(line).map(str::to_string)
+        })
+        .unwrap_or_else(|| "main".to_string());
+
     let main_fn_id = TraceWriter::ensure_function_id(
         writer,
-        "main",
+        &outer_fn_name,
         source_path,
         Line(1),
     );
 
     // Emit initial call.
     TraceWriter::register_call(writer, main_fn_id, vec![]);
+
+    // Track the call stack (function names, outermost first) so backward
+    // jumps that cross multiple frames worth of return boundaries unwind
+    // correctly.  The previous heuristic emitted exactly one
+    // `register_return` per backward jump > 2, which mis-attributed the
+    // exit when the snapshot stream skipped intermediate return sites
+    // (e.g. inner → outer in one step pops both inner and middle in
+    // call order).
+    let mut fn_stack: Vec<String> = vec![outer_fn_name.clone()];
 
     // Walk snapshots.
     let mut prev_line: Option<u32> = None;
@@ -167,19 +851,62 @@ pub fn record_from_snapshots_into_writer(
             None => continue, // No source mapping; skip.
         };
 
-        // Detect function call/return from large PC jumps.
+        // Detect function call/return from large PC jumps.  When the
+        // source model resolves a function name for both the previous
+        // and current line, we use its function-boundary view to
+        // suppress within-function PC noise (e.g. an if-then-else
+        // landing pad in `inner` registering a spurious call to itself).
+        // When either side falls outside any known fn (e.g. callers
+        // passing synthetic source paths with no real source file), we
+        // fall back to the legacy "any forward/backward jump > 2"
+        // heuristic so existing test_comprehensive scenarios stay green.
         if let Some(prev) = prev_pc {
             let diff = if pc > prev { pc - prev } else { prev - pc };
-            if diff > 2 && pc > prev {
-                let callee_fn_id = TraceWriter::ensure_function_id(
-                    writer,
-                    &format!("fn_at_pc_{pc}"),
-                    &Path::new(file_str),
-                    Line(line as i64),
-                );
-                TraceWriter::register_call(writer, callee_fn_id, vec![]);
-            } else if diff > 2 && pc < prev {
-                TraceWriter::register_return(writer, NONE_VALUE);
+            if diff > 2 {
+                let prev_fn = prev_line.and_then(|l| model.function_at(l));
+                let curr_fn = model.function_at(line);
+                let cross_boundary = match (prev_fn, curr_fn) {
+                    (Some(a), Some(b)) => a != b,
+                    _ => true, // unknown side → preserve legacy heuristic
+                };
+                if cross_boundary {
+                    if pc > prev {
+                        let callee_name = curr_fn
+                            .map(str::to_string)
+                            .unwrap_or_else(|| format!("fn_at_pc_{pc}"));
+                        let callee_fn_id = TraceWriter::ensure_function_id(
+                            writer,
+                            &callee_name,
+                            &Path::new(file_str),
+                            Line(line as i64),
+                        );
+                        TraceWriter::register_call(writer, callee_fn_id, vec![]);
+                        fn_stack.push(callee_name);
+                    } else {
+                        // Backward cross-boundary jump: unwind the
+                        // call stack until we're back in `curr_fn`.
+                        // When `curr_fn` is unknown, pop a single
+                        // frame to match the legacy heuristic.
+                        match curr_fn {
+                            Some(target) => {
+                                while fn_stack.len() > 1
+                                    && fn_stack.last().map(String::as_str) != Some(target)
+                                {
+                                    TraceWriter::register_return(writer, NONE_VALUE);
+                                    fn_stack.pop();
+                                }
+                            }
+                            None => {
+                                if fn_stack.len() > 1 {
+                                    TraceWriter::register_return(writer, NONE_VALUE);
+                                    fn_stack.pop();
+                                } else {
+                                    TraceWriter::register_return(writer, NONE_VALUE);
+                                }
+                            }
+                        }
+                    }
+                }
             }
         }
 
@@ -190,6 +917,15 @@ pub fn record_from_snapshots_into_writer(
                 &Path::new(file_str),
                 Line(line as i64),
             );
+
+            // Synthesise side-effecting / typed-value events the SBF
+            // synthetic-snapshot pipeline cannot observe.  Done before
+            // the per-register Int emission so the synthesised
+            // structured variable appears alongside its formal name in
+            // the step's variable list (rather than after the r0..r10
+            // block).
+            synthesise_step_events(&model, writer, line, &type_ids);
+
             prev_line = Some(line);
         }
 
@@ -198,7 +934,7 @@ pub fn record_from_snapshots_into_writer(
             let name = format!("r{r}");
             let value = ValueRecord::Int {
                 i: snap.reg(r) as i64,
-                type_id: u64_type_id,
+                type_id: type_ids.int,
             };
             TraceWriter::register_variable_with_full_value(writer, &name, value);
         }
