@@ -482,6 +482,97 @@ fn build_tuple_value(elements_csv: &str, int_type_id: TypeId, tuple_type_id: Typ
     }
 }
 
+/// Try to detect an `EnumPath::Variant ...` enum-variant construction
+/// in `rhs` and decode it into the enum path, the variant name, and a
+/// payload shape (struct-form named fields, tuple-form positional
+/// values, or a unit variant).  Returns `None` when `rhs` doesn't look
+/// like an enum-variant construction — the caller falls back to the
+/// existing struct-literal detector.
+///
+/// Recognised forms (all real Solana instruction-enum idioms):
+///   * `MyInstruction::Init { lamports: 500 }` (struct-like variant)
+///   * `MyInstruction::Update(7)` (tuple-like variant; positional ints)
+///   * `MyInstruction::Close` (unit variant)
+///
+/// The path must contain `::` and start with an uppercase letter so we
+/// don't accidentally match `account.field` access (no `::`) or a bare
+/// type name (no `::`) which is already handled by the struct-literal
+/// detector.
+fn parse_variant_construction(
+    rhs: &str,
+) -> Option<(String, String, VariantPayload)> {
+    let rhs = rhs.trim_start_matches('&').trim();
+    let rhs = rhs.strip_prefix("mut ").unwrap_or(rhs);
+    // The path component is everything before the first `{` / `(` / end.
+    let mut head_end = rhs.len();
+    for (i, c) in rhs.char_indices() {
+        if c == '{' || c == '(' || c.is_whitespace() {
+            head_end = i;
+            break;
+        }
+    }
+    let head = rhs[..head_end].trim();
+    if head.is_empty() {
+        return None;
+    }
+    // Require an `::` separator and an uppercase first character so we
+    // distinguish enum variants from struct literals and function calls.
+    let sep = head.rfind("::")?;
+    if !head.chars().next().is_some_and(|c| c.is_ascii_uppercase()) {
+        return None;
+    }
+    let enum_path = head[..sep].trim().to_string();
+    let variant = head[sep + 2..].trim().to_string();
+    if enum_path.is_empty() || variant.is_empty() {
+        return None;
+    }
+    // The variant name must start with an uppercase letter.  Guards
+    // against `account.is_signer::clone` (no chance in practice but be
+    // safe) and turbofish-style `::<T>` references.
+    if !variant.chars().next().is_some_and(|c| c.is_ascii_uppercase()) {
+        return None;
+    }
+    let tail = rhs[head_end..].trim();
+    if let Some(after_brace) = tail.strip_prefix('{') {
+        // Struct-form variant: `MyInstruction::Init { lamports: 500 }`.
+        let close = after_brace.rfind('}')?;
+        let body = &after_brace[..close];
+        let mut fields = Vec::new();
+        for tok in split_top_level_commas(body) {
+            let Some(colon) = tok.find(':') else { continue };
+            let name = tok[..colon].trim().to_string();
+            let val = tok[colon + 1..].trim();
+            if let Some(i) = parse_int_literal(val) {
+                fields.push((name, i));
+            }
+        }
+        return Some((enum_path, variant, VariantPayload::Struct(fields)));
+    }
+    if let Some(after_paren) = tail.strip_prefix('(') {
+        let close = after_paren.rfind(')')?;
+        let body = after_paren[..close].trim();
+        let mut elements = Vec::new();
+        for tok in split_top_level_commas(body) {
+            if let Some(i) = parse_int_literal(tok) {
+                elements.push(i);
+            }
+        }
+        return Some((enum_path, variant, VariantPayload::Tuple(elements)));
+    }
+    // Unit variant (no `{` / `(` follows).
+    if tail.is_empty() || tail == ";" {
+        return Some((enum_path, variant, VariantPayload::Unit));
+    }
+    None
+}
+
+#[derive(Debug)]
+enum VariantPayload {
+    Struct(Vec<(String, i64)>),
+    Tuple(Vec<i64>),
+    Unit,
+}
+
 /// Try to detect a `Name { field: value, ... }` struct literal in `rhs`
 /// and decode it into `(struct_name, field_values)` tuples for the
 /// caller to pass to `register_variable_with_full_value`.  Multi-line
@@ -562,7 +653,7 @@ fn synthesise_step_events(
     model: &SourceModel,
     writer: &mut dyn TraceWriter,
     line_no: u32,
-    type_ids: &TypeIdCache,
+    type_ids: &mut TypeIdCache,
 ) {
     let raw = model.line(line_no);
     let text = strip_line_for_match(raw);
@@ -591,11 +682,66 @@ fn synthesise_step_events(
 
     // Typed structured-value let-bindings.
     if let (Some(name), Some(rhs)) = (extract_let_lhs(text), extract_let_rhs(text)) {
-        // Vec / array literal — `vec![..]`, `[1, 2, 3]`, `&[1, 2, 3]`.
-        if let Some(elements_csv) = extract_array_or_vec_literal(rhs) {
-            let value = build_sequence_value(elements_csv, type_ids.int, type_ids.seq);
+        // Enum-variant construction — `MyInstruction::Init { lamports: 500 }`,
+        // `MyInstruction::Update(7)`, `MyInstruction::Close`.  Checked
+        // before the struct-literal branch because `Name::Variant { .. }`
+        // would otherwise be decoded as a struct with the path as its name.
+        if let Some((enum_path, variant, payload)) = parse_variant_construction(rhs) {
+            let int_type_id = type_ids.int;
+            let struct_type_id = type_ids
+                .struct_type_for(&variant)
+                .unwrap_or(type_ids.struct_default);
+            let tuple_type_id = type_ids.tuple;
+            let contents = match payload {
+                VariantPayload::Struct(fields) => {
+                    let field_values: Vec<ValueRecord> = fields
+                        .iter()
+                        .map(|(_, i)| ValueRecord::Int { i: *i, type_id: int_type_id })
+                        .collect();
+                    ValueRecord::Struct {
+                        field_values,
+                        type_id: struct_type_id,
+                    }
+                }
+                VariantPayload::Tuple(values) => {
+                    let elements: Vec<ValueRecord> = values
+                        .iter()
+                        .map(|i| ValueRecord::Int { i: *i, type_id: int_type_id })
+                        .collect();
+                    ValueRecord::Tuple {
+                        elements,
+                        type_id: tuple_type_id,
+                    }
+                }
+                VariantPayload::Unit => ValueRecord::Tuple {
+                    elements: Vec::new(),
+                    type_id: tuple_type_id,
+                },
+            };
+            let variant_type_id = type_ids.ensure_variant(writer, &enum_path);
+            let value = ValueRecord::Variant {
+                discriminator: variant.clone(),
+                contents: Box::new(contents),
+                type_id: variant_type_id,
+            };
             TraceWriter::register_variable_with_full_value(writer, name, value);
             return;
+        }
+        // Vec / array literal — `vec![..]`, `[1, 2, 3]`, `&[1, 2, 3]`.
+        // Only emit when at least one element decoded as an int literal —
+        // arrays-of-byte-strings (`[b"vault", payer.as_ref()]`) and other
+        // shapes the synthesiser can't lossily decode are skipped rather
+        // than surfaced as empty `Sequence` placeholders.
+        if let Some(elements_csv) = extract_array_or_vec_literal(rhs) {
+            let value = build_sequence_value(elements_csv, type_ids.int, type_ids.seq);
+            let has_elements = match &value {
+                ValueRecord::Sequence { elements, .. } => !elements.is_empty(),
+                _ => false,
+            };
+            if has_elements {
+                TraceWriter::register_variable_with_full_value(writer, name, value);
+                return;
+            }
         }
         // Tuple literal — `(a, b)` with at least 2 elements.
         if let Some(elements_csv) = extract_tuple_literal(rhs) {
@@ -719,7 +865,16 @@ struct TypeIdCache {
     seq: TypeId,
     tuple: TypeId,
     struct_default: TypeId,
+    /// Fallback variant TypeId for the rare case where the synthesiser
+    /// needs to emit a `ValueRecord::Variant` for an enum path that
+    /// wasn't pre-registered.  Today every emission path uses
+    /// `ensure_variant`, but the field is kept symmetric with
+    /// `struct_default` so future code paths that lazy-emit before the
+    /// pre-scan completes have a deterministic fallback.
+    #[allow(dead_code)]
+    variant_default: TypeId,
     structs: HashMap<String, TypeId>,
+    variants: HashMap<String, TypeId>,
 }
 
 impl TypeIdCache {
@@ -728,12 +883,15 @@ impl TypeIdCache {
         let seq = TraceWriter::ensure_type_id(writer, TypeKind::Seq, "Vec<u64>");
         let tuple = TraceWriter::ensure_type_id(writer, TypeKind::Tuple, "(u64, u64)");
         let struct_default = TraceWriter::ensure_type_id(writer, TypeKind::Struct, "Struct");
+        let variant_default = TraceWriter::ensure_type_id(writer, TypeKind::Variant, "Variant");
         Self {
             int,
             seq,
             tuple,
             struct_default,
+            variant_default,
             structs: HashMap::new(),
+            variants: HashMap::new(),
         }
     }
 
@@ -748,6 +906,15 @@ impl TypeIdCache {
 
     fn struct_type_for(&self, name: &str) -> Option<TypeId> {
         self.structs.get(name).copied()
+    }
+
+    fn ensure_variant(&mut self, writer: &mut dyn TraceWriter, enum_path: &str) -> TypeId {
+        if let Some(id) = self.variants.get(enum_path) {
+            return *id;
+        }
+        let id = TraceWriter::ensure_type_id(writer, TypeKind::Variant, enum_path);
+        self.variants.insert(enum_path.to_string(), id);
+        id
     }
 }
 
@@ -780,15 +947,21 @@ pub fn record_from_snapshots_into_writer(
     // each registration call site stays cheap.
     let mut type_ids = TypeIdCache::new(writer);
 
-    // Pre-populate per-struct TypeIds for every `Name { .. }` literal
-    // we might encounter.  The synthesiser also lazy-registers, but
-    // walking the source up front keeps the type table deterministic
-    // (declaration order) regardless of which step happens to fire
-    // first.
+    // Pre-populate per-struct / per-variant TypeIds for every literal
+    // construction we might encounter.  The synthesiser also lazy-registers,
+    // but walking the source up front keeps the type table deterministic
+    // (declaration order) regardless of which step happens to fire first.
     for line_no in 1..(model.lines.len() as u32) {
         let raw = model.line(line_no);
         let text = strip_line_for_match(raw);
         if let (Some(_), Some(rhs)) = (extract_let_lhs(text), extract_let_rhs(text)) {
+            // Enum-variant construction takes priority over struct detection
+            // because `Foo::Bar { .. }` would otherwise be registered as a
+            // struct named `Foo::Bar`.
+            if let Some((enum_path, _variant, _payload)) = parse_variant_construction(rhs) {
+                type_ids.ensure_variant(writer, &enum_path);
+                continue;
+            }
             let candidate = if rhs.contains('{') && !rhs.contains('}') {
                 collect_struct_literal_lines(&model, line_no)
             } else {
@@ -924,7 +1097,7 @@ pub fn record_from_snapshots_into_writer(
             // structured variable appears alongside its formal name in
             // the step's variable list (rather than after the r0..r10
             // block).
-            synthesise_step_events(&model, writer, line, &type_ids);
+            synthesise_step_events(&model, writer, line, &mut type_ids);
 
             prev_line = Some(line);
         }
