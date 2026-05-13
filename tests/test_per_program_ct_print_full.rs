@@ -1322,3 +1322,718 @@ fn test_step_count_helper_matches_counts_field() {
          in events ({from_helper})"
     );
 }
+
+// ===========================================================================
+// M11: instruction_enum_dispatch_test.rs
+// ===========================================================================
+//
+// Canonical native-program shape: a `MyInstruction` enum with typed
+// variants, decoded from `instruction_data[0]`.  The strict pin
+// asserts that `let init = MyInstruction::Init { lamports: 500 };`
+// surfaces as a `ValueRecord::Variant { discriminator, contents }`
+// where `contents` is a `Struct` carrying the field values — the
+// recorder's first emission of a `Variant`-typed local.
+
+fn instruction_enum_dispatch_snapshots()
+-> (Vec<RegisterSnapshot>, Vec<(u64, &'static str, u32)>) {
+    // process_instruction() body in instruction_enum_dispatch_test.rs:
+    //   line 61: let discriminator = instruction_data[0];   r1 = 0
+    //   line 62: let init = MyInstruction::Init { lamports: 500 };
+    //   line 63: let result = handle_init(500);             r2 = 501
+    //   line 66: result                                     r0 = 501
+    let snaps = vec![
+        snap(0, &[(1, 0)]),
+        snap(1, &[(1, 0)]),
+        snap(2, &[(1, 0), (2, 501)]),
+        snap(3, &[(0, 501), (1, 0), (2, 501)]),
+    ];
+    let locs: Vec<(u64, &'static str, u32)> = vec![
+        (0, "instruction_enum_dispatch_test.rs", 61),
+        (1, "instruction_enum_dispatch_test.rs", 62),
+        (2, "instruction_enum_dispatch_test.rs", 63),
+        (3, "instruction_enum_dispatch_test.rs", 66),
+    ];
+    (snaps, locs)
+}
+
+#[test]
+fn test_instruction_enum_dispatch_test_via_ct_print_full() {
+    let (snaps, locs) = instruction_enum_dispatch_snapshots();
+    let Some((doc, source_path)) = record_and_dump_full(
+        "test_instruction_enum_dispatch_test_via_ct_print_full",
+        "instruction_enum_dispatch_test.rs",
+        &snaps,
+        &locs,
+    ) else {
+        return;
+    };
+
+    assert_metadata_program_ends_with(&doc, &source_path);
+    assert_paths_contain(&doc, "instruction_enum_dispatch_test.rs");
+
+    let functions: Vec<&str> = doc["functions"]
+        .as_array()
+        .expect("functions array")
+        .iter()
+        .filter_map(|v| v.as_str())
+        .collect();
+    assert_eq!(functions, vec!["process_instruction"]);
+
+    let counts = &doc["counts"];
+    // 1 implicit start() + 4 distinct lines = 5 step events.
+    assert_eq!(counts["steps"].as_u64(), Some(5), "steps; counts={counts}");
+    assert_eq!(counts["calls"].as_u64(), Some(1), "calls; counts={counts}");
+    assert_eq!(
+        counts["io_events"].as_u64(),
+        Some(0),
+        "io_events; counts={counts}"
+    );
+
+    let events = doc["events"].as_array().expect("events array");
+    // 5 steps + 1 call_entry + 1 call_exit = 7 events.
+    assert_eq!(events.len(), 7, "events.len()");
+    assert_step_indices_monotonic(&doc);
+
+    assert_eq!(
+        observed_call_sequence(&doc),
+        vec!["process_instruction".to_string()],
+    );
+
+    // ----- Canonical register stream --------------------------------------
+    let r2 = observed_register_sequence(&doc, "r2");
+    assert_eq!(
+        r2,
+        vec![0, 0, 501, 501],
+        "r2 must surface handle_init(500) -> 501",
+    );
+    let r0 = observed_register_sequence(&doc, "r0");
+    assert_eq!(
+        r0,
+        vec![0, 0, 0, 501],
+        "r0 (return) must end at 501",
+    );
+
+    // ----- Variant decode --------------------------------------------------
+    // The `let init = MyInstruction::Init { lamports: 500 };` step
+    // surfaces as `ValueRecord::Variant` with `discriminator="Init"`
+    // and a `Struct` contents carrying the `lamports=500` field.
+    let compounds = observed_compound_vars(&doc);
+    let init = compounds
+        .iter()
+        .find(|(n, _)| n == "init")
+        .expect("init must surface as a compound variable");
+    assert_eq!(init.1["kind"].as_str(), Some("Variant"));
+    assert_eq!(init.1["discriminator"].as_str(), Some("Init"));
+    let contents = &init.1["contents"];
+    assert_eq!(contents["kind"].as_str(), Some("Struct"));
+    let field_values = contents["field_values"]
+        .as_array()
+        .expect("contents.field_values array");
+    let ints: Vec<i64> = field_values
+        .iter()
+        .map(|e| e["i"].as_i64().expect("variant field must be Int.i"))
+        .collect();
+    assert_eq!(ints, vec![500]);
+}
+
+#[test]
+fn test_instruction_enum_dispatch_variant_kinds_present() {
+    let (snaps, locs) = instruction_enum_dispatch_snapshots();
+    let Some((doc, _)) = record_and_dump_full(
+        "test_instruction_enum_dispatch_variant_kinds_present",
+        "instruction_enum_dispatch_test.rs",
+        &snaps,
+        &locs,
+    ) else {
+        return;
+    };
+    let mut kinds = std::collections::BTreeSet::new();
+    for ev in doc["events"].as_array().unwrap() {
+        if ev["kind"] != "step" {
+            continue;
+        }
+        for v in ev["vars"].as_array().cloned().unwrap_or_default() {
+            if let Some(k) = v["value"]["kind"].as_str() {
+                kinds.insert(k.to_string());
+            }
+        }
+    }
+    assert!(
+        kinds.contains("Variant"),
+        "expected Variant ValueRecord variant in instruction-enum dispatch trace; \
+         got {kinds:?}"
+    );
+}
+
+// ===========================================================================
+// M11: cpi_invoke_signed_test.rs
+// ===========================================================================
+//
+// Drives a snapshot stream through `process_instruction` and crosses
+// into `invoke_signed` via a PC jump >> 2 so the recorder's
+// source-driven call-resolution path emits both as named call frames.
+// Pins the canonical CPI shape: PDA-signed System Program CreateAccount.
+//
+// The CPI surfacing here uses `record_from_snapshots_into_writer` (the
+// source-model-aware path) — `record_with_cpi` does NOT use SourceModel
+// today and would emit `fn_at_pc_<pc>` placeholders.  The sibling
+// `#[ignore]`d test below documents that gap.
+
+fn cpi_invoke_signed_snapshots()
+-> (Vec<RegisterSnapshot>, Vec<(u64, &'static str, u32)>) {
+    // process_instruction body lives at lines 108..119:
+    //   line 109: let program_id = SYSTEM_PROGRAM_ID;
+    //   line 114: let ix = create_account(payer, &pda, ..);
+    //   line 115: msg!("invoking ...")
+    //   line 116: let result = invoke_signed(..);
+    //   line 118: result
+    // invoke_signed body lives at lines 86..95:
+    //   line 91: let _ = ix;
+    //   line 94: 1_000_000  (return value)
+    //
+    // PC jumps:
+    //   100..103 stay inside process_instruction (diff=1, no call).
+    //   103 -> 500 crosses fn boundary forward -> register_call invoke_signed.
+    //   500 -> 501 stays inside invoke_signed.
+    //   501 -> 104 crosses fn boundary backward -> register_return.
+    let snaps = vec![
+        snap(100, &[]),
+        snap(101, &[(1, 1)]),
+        snap(102, &[(1, 1)]),
+        snap(103, &[(1, 1)]),
+        snap(500, &[(1, 1)]),
+        snap(501, &[(0, 1_000_000), (1, 1)]),
+        snap(104, &[(0, 1_000_000), (1, 1), (3, 1_000_000)]),
+    ];
+    let locs: Vec<(u64, &'static str, u32)> = vec![
+        (100, "cpi_invoke_signed_test.rs", 109),
+        (101, "cpi_invoke_signed_test.rs", 114),
+        (102, "cpi_invoke_signed_test.rs", 115),
+        (103, "cpi_invoke_signed_test.rs", 116),
+        (500, "cpi_invoke_signed_test.rs", 91),
+        (501, "cpi_invoke_signed_test.rs", 94),
+        (104, "cpi_invoke_signed_test.rs", 118),
+    ];
+    (snaps, locs)
+}
+
+#[test]
+fn test_cpi_invoke_signed_test_via_ct_print_full() {
+    let (snaps, locs) = cpi_invoke_signed_snapshots();
+    let Some((doc, source_path)) = record_and_dump_full(
+        "test_cpi_invoke_signed_test_via_ct_print_full",
+        "cpi_invoke_signed_test.rs",
+        &snaps,
+        &locs,
+    ) else {
+        return;
+    };
+
+    assert_metadata_program_ends_with(&doc, &source_path);
+    assert_paths_contain(&doc, "cpi_invoke_signed_test.rs");
+
+    let functions: Vec<&str> = doc["functions"]
+        .as_array()
+        .expect("functions array")
+        .iter()
+        .filter_map(|v| v.as_str())
+        .collect();
+    assert_eq!(
+        functions,
+        vec!["process_instruction", "invoke_signed"],
+        "function table must surface both the caller and the CPI target \
+         resolved via SourceModel"
+    );
+
+    let counts = &doc["counts"];
+    // 1 implicit start() + 7 distinct lines = 8 step events.
+    assert_eq!(counts["steps"].as_u64(), Some(8), "steps; counts={counts}");
+    assert_eq!(counts["functions"].as_u64(), Some(2), "functions; counts={counts}");
+    assert_eq!(counts["calls"].as_u64(), Some(2), "calls; counts={counts}");
+    // The fixture has one `msg!(...)` invocation (line 115).
+    assert_eq!(
+        counts["io_events"].as_u64(),
+        Some(1),
+        "io_events; counts={counts}"
+    );
+
+    let events = doc["events"].as_array().expect("events array");
+    // 8 steps + 2 call_entry + 2 call_exit + 1 io_event = 13 events.
+    assert_eq!(events.len(), 13, "events.len()");
+    assert_step_indices_monotonic(&doc);
+
+    assert_eq!(
+        observed_call_sequence(&doc),
+        vec![
+            "process_instruction".to_string(),
+            "invoke_signed".to_string(),
+        ],
+        "call_entry order: caller first, then CPI target",
+    );
+
+    assert_eq!(
+        observed_exit_sequence(&doc),
+        vec![
+            "invoke_signed".to_string(),
+            "process_instruction".to_string(),
+        ],
+        "call_exit order is LIFO (CPI target unwinds before the caller)",
+    );
+
+    // ----- r0 surfaces the post-CPI return value ---------------------------
+    let r0 = observed_register_sequence(&doc, "r0");
+    assert_eq!(
+        r0.last().copied(),
+        Some(1_000_000),
+        "r0 (return) must end at 1_000_000 (invoke_signed's return); got {:?}",
+        r0,
+    );
+}
+
+#[test]
+#[ignore = "M10 known limitation: record_with_cpi (the CPI-aware \
+            recording path) does NOT use SourceModel — it would emit \
+            `fn_at_pc_<pc>` placeholders and Int-only locals.  This \
+            test stays ignored until that path is migrated to the \
+            source-pattern synthesis approach; the live \
+            test_cpi_invoke_signed_test_via_ct_print_full above pins \
+            the source-model-aware path."]
+fn test_cpi_invoke_signed_source_model_pin() {
+    // Documents the gap.  When record_with_cpi adopts SourceModel, the
+    // assertion below would parallel the live test's call-sequence
+    // check and surface `process_instruction` / `invoke_signed` (not
+    // `fn_at_pc_500`) in the function table.
+    panic!(
+        "pin: record_with_cpi must adopt SourceModel so CPI targets \
+         surface with their source-resolved function names instead of \
+         fn_at_pc_<pc> placeholders",
+    );
+}
+
+// ===========================================================================
+// M11: anchor_program_test.rs
+// ===========================================================================
+//
+// Anchor is the dominant modern Solana dev framework.  Real Anchor
+// programs declare handlers inside a `#[program] mod my_program { .. }`
+// block whose `pub fn` declarations expand into a discriminator-prefixed
+// dispatcher at compile time.  The recorder's source-driven model
+// parses the original `pub fn initialize(..)` declaration (not the
+// macro-expanded `__handler` shim) so the call trace surfaces the
+// user-written handler name.
+
+fn anchor_program_snapshots()
+-> (Vec<RegisterSnapshot>, Vec<(u64, &'static str, u32)>) {
+    // process_instruction body (lines 99..107):
+    //   line 100: let ctx = Context { program_id: 1, bump: 254, signer: 7 };
+    //   line 105: let result = initialize(ctx, 5);
+    //   line 106: result
+    // initialize body (lines 80..85):
+    //   line 81: msg!("initialize handler entered")
+    //   line 82: let authority = ctx.authority as i64;
+    //   line 83: let bumped = authority + seed;
+    //   line 84: bumped
+    let snaps = vec![
+        snap(100, &[]),
+        snap(101, &[]),
+        snap(500, &[]),
+        snap(501, &[(1, 1)]),
+        snap(502, &[(1, 1), (2, 6)]),
+        snap(503, &[(0, 6), (1, 1), (2, 6)]),
+        snap(102, &[(0, 6), (1, 1), (2, 6), (3, 6)]),
+    ];
+    let locs: Vec<(u64, &'static str, u32)> = vec![
+        (100, "anchor_program_test.rs", 100),
+        (101, "anchor_program_test.rs", 105),
+        (500, "anchor_program_test.rs", 81),
+        (501, "anchor_program_test.rs", 82),
+        (502, "anchor_program_test.rs", 83),
+        (503, "anchor_program_test.rs", 84),
+        (102, "anchor_program_test.rs", 106),
+    ];
+    (snaps, locs)
+}
+
+#[test]
+fn test_anchor_program_test_via_ct_print_full() {
+    let (snaps, locs) = anchor_program_snapshots();
+    let Some((doc, source_path)) = record_and_dump_full(
+        "test_anchor_program_test_via_ct_print_full",
+        "anchor_program_test.rs",
+        &snaps,
+        &locs,
+    ) else {
+        return;
+    };
+
+    assert_metadata_program_ends_with(&doc, &source_path);
+    assert_paths_contain(&doc, "anchor_program_test.rs");
+
+    let functions: Vec<&str> = doc["functions"]
+        .as_array()
+        .expect("functions array")
+        .iter()
+        .filter_map(|v| v.as_str())
+        .collect();
+    assert_eq!(
+        functions,
+        vec!["process_instruction", "initialize"],
+        "function table must surface the user-written Anchor handler \
+         name (`initialize`), not the macro-generated `__handler` shim"
+    );
+
+    let counts = &doc["counts"];
+    // 1 implicit start() + 7 distinct lines = 8 step events.
+    assert_eq!(counts["steps"].as_u64(), Some(8), "steps; counts={counts}");
+    assert_eq!(counts["functions"].as_u64(), Some(2), "functions; counts={counts}");
+    assert_eq!(counts["calls"].as_u64(), Some(2), "calls; counts={counts}");
+    // The fixture has one `msg!(...)` invocation on a visited line (81).
+    assert_eq!(
+        counts["io_events"].as_u64(),
+        Some(1),
+        "io_events; counts={counts}"
+    );
+
+    let events = doc["events"].as_array().expect("events array");
+    // 8 steps + 2 call_entry + 2 call_exit + 1 io_event = 13 events.
+    assert_eq!(events.len(), 13, "events.len()");
+    assert_step_indices_monotonic(&doc);
+
+    assert_eq!(
+        observed_call_sequence(&doc),
+        vec![
+            "process_instruction".to_string(),
+            "initialize".to_string(),
+        ],
+    );
+
+    // ----- Context struct decode ------------------------------------------
+    // The visited step at line 100 stitches the multi-line `Context { .. }`
+    // literal back into a single Struct value with three Int field values.
+    let compounds = observed_compound_vars(&doc);
+    let ctx = compounds
+        .iter()
+        .find(|(n, _)| n == "ctx")
+        .expect("ctx must surface as a compound variable");
+    assert_eq!(ctx.1["kind"].as_str(), Some("Struct"));
+    let fields = ctx.1["field_values"]
+        .as_array()
+        .expect("ctx.field_values array");
+    let field_ints: Vec<i64> = fields
+        .iter()
+        .map(|e| e["i"].as_i64().expect("Context field must be Int.i"))
+        .collect();
+    assert_eq!(field_ints, vec![1, 254, 7]);
+
+    // ----- r0 returns the handler's final value ---------------------------
+    let r0 = observed_register_sequence(&doc, "r0");
+    assert_eq!(
+        r0.last().copied(),
+        Some(6),
+        "r0 (return) must end at 6 (initialize returns authority+seed=1+5); \
+         got {:?}",
+        r0,
+    );
+}
+
+#[test]
+fn test_anchor_program_handler_name_resolved() {
+    let (snaps, locs) = anchor_program_snapshots();
+    let Some((doc, _)) = record_and_dump_full(
+        "test_anchor_program_handler_name_resolved",
+        "anchor_program_test.rs",
+        &snaps,
+        &locs,
+    ) else {
+        return;
+    };
+    let calls = observed_call_sequence(&doc);
+    assert!(
+        calls.iter().any(|n| n == "initialize"),
+        "expected the user-written Anchor handler `initialize` (not \
+         `__handler` / `fn_at_pc_<pc>`) in the call trace; got {:?}",
+        calls
+    );
+}
+
+// ===========================================================================
+// M11: pda_derivation_test.rs
+// ===========================================================================
+//
+// Program-Derived Addresses are the canonical state-ownership idiom in
+// Solana: `Pubkey::find_program_address(&[seed1, seed2], program_id)`
+// returns `(Pubkey, u8)` — derived address and bump byte.  The strict
+// pin asserts that the seed list (when expressed as an int-array literal)
+// surfaces as `ValueRecord::Sequence` and that the bump byte surfaces
+// as the final `r0` Int.
+
+fn pda_derivation_snapshots()
+-> (Vec<RegisterSnapshot>, Vec<(u64, &'static str, u32)>) {
+    // derive_vault_pda body (lines 57..67):
+    //   line 58: let seeds: [i64; 3] = [1, 2, 3];            (Sequence)
+    //   line 59: let (pda, bump) = find_program_address(..); r1 = 253
+    //   line 62: let derived = create_program_address(..);
+    //   line 63: msg!("derived PDA verified ...")
+    //   line 66: bump (return)                                r0 = 253
+    let snaps = vec![
+        snap(0, &[]),
+        snap(1, &[(1, 253)]),
+        snap(2, &[(1, 253)]),
+        snap(3, &[(1, 253)]),
+        snap(4, &[(0, 253), (1, 253)]),
+    ];
+    let locs: Vec<(u64, &'static str, u32)> = vec![
+        (0, "pda_derivation_test.rs", 58),
+        (1, "pda_derivation_test.rs", 59),
+        (2, "pda_derivation_test.rs", 62),
+        (3, "pda_derivation_test.rs", 63),
+        (4, "pda_derivation_test.rs", 66),
+    ];
+    (snaps, locs)
+}
+
+#[test]
+fn test_pda_derivation_test_seeds_and_bump_recorded() {
+    let (snaps, locs) = pda_derivation_snapshots();
+    let Some((doc, source_path)) = record_and_dump_full(
+        "test_pda_derivation_test_seeds_and_bump_recorded",
+        "pda_derivation_test.rs",
+        &snaps,
+        &locs,
+    ) else {
+        return;
+    };
+
+    assert_metadata_program_ends_with(&doc, &source_path);
+    assert_paths_contain(&doc, "pda_derivation_test.rs");
+
+    let functions: Vec<&str> = doc["functions"]
+        .as_array()
+        .expect("functions array")
+        .iter()
+        .filter_map(|v| v.as_str())
+        .collect();
+    assert_eq!(functions, vec!["derive_vault_pda"]);
+
+    let counts = &doc["counts"];
+    // 1 implicit start() + 5 distinct lines = 6 step events.
+    assert_eq!(counts["steps"].as_u64(), Some(6), "steps; counts={counts}");
+    assert_eq!(counts["calls"].as_u64(), Some(1), "calls; counts={counts}");
+    // One `msg!(...)` invocation on line 63.
+    assert_eq!(
+        counts["io_events"].as_u64(),
+        Some(1),
+        "io_events; counts={counts}"
+    );
+
+    let events = doc["events"].as_array().expect("events array");
+    // 6 steps + 1 call_entry + 1 call_exit + 1 io_event = 9 events.
+    assert_eq!(events.len(), 9, "events.len()");
+    assert_step_indices_monotonic(&doc);
+
+    assert_eq!(observed_call_sequence(&doc), vec!["derive_vault_pda".to_string()]);
+
+    // ----- Seed list as Sequence ------------------------------------------
+    // The `let seeds: [i64; 3] = [1, 2, 3];` step surfaces the array
+    // literal as a `ValueRecord::Sequence` with three Int elements.
+    let compounds = observed_compound_vars(&doc);
+    let seeds = compounds
+        .iter()
+        .find(|(n, _)| n == "seeds")
+        .expect("seeds must surface as a compound variable");
+    assert_eq!(seeds.1["kind"].as_str(), Some("Sequence"));
+    let seed_elements = seeds.1["elements"].as_array().expect("seeds.elements array");
+    let seed_ints: Vec<i64> = seed_elements
+        .iter()
+        .map(|e| e["i"].as_i64().expect("seed element must be Int.i"))
+        .collect();
+    assert_eq!(seed_ints, vec![1, 2, 3]);
+
+    // ----- bump byte as Int ------------------------------------------------
+    // r0 surfaces the final return value (the bump byte).
+    let r0 = observed_register_sequence(&doc, "r0");
+    assert_eq!(
+        r0.last().copied(),
+        Some(253),
+        "r0 (return) must surface the bump byte 253; got {:?}",
+        r0,
+    );
+    let r1 = observed_register_sequence(&doc, "r1");
+    assert!(
+        r1.contains(&253),
+        "r1 must surface bump=253 from find_program_address; got {:?}",
+        r1,
+    );
+}
+
+// ===========================================================================
+// M11: msg_format_args_test.rs
+// ===========================================================================
+//
+// `msg!("balance: {}", balance)` is the canonical Solana debug-logging
+// idiom.  Today the recorder's `extract_macro_string_arg` captures the
+// literal format string only (`balance: {}`) — runtime-value
+// interpolation is M10's documented known limitation.  The strict pin
+// below asserts that present-day shape (literal text in the io_event
+// content); the `#[ignore]`d sibling pins the spec-correct
+// substituted-text expectation.
+
+fn msg_format_args_snapshots()
+-> (Vec<RegisterSnapshot>, Vec<(u64, &'static str, u32)>) {
+    // compute(100, 50) body in msg_format_args_test.rs (lines 25..32):
+    //   line 26: msg!("balance: {}", balance)                  -> io_event
+    //   line 27: let new_balance = balance + delta;  r2 = 150
+    //   line 28: msg!("from {} to {}", balance, new_balance)   -> io_event
+    //   line 29: let doubled = new_balance * 2;      r3 = 300
+    //   line 30: msg!("doubled = {}", doubled)                 -> io_event
+    //   line 31: doubled                              r0 = 300
+    let snaps = vec![
+        snap(0, &[(1, 100)]),
+        snap(1, &[(1, 100), (2, 150)]),
+        snap(2, &[(1, 100), (2, 150)]),
+        snap(3, &[(1, 100), (2, 150), (3, 300)]),
+        snap(4, &[(1, 100), (2, 150), (3, 300)]),
+        snap(5, &[(0, 300), (1, 100), (2, 150), (3, 300)]),
+    ];
+    let locs: Vec<(u64, &'static str, u32)> = vec![
+        (0, "msg_format_args_test.rs", 26),
+        (1, "msg_format_args_test.rs", 27),
+        (2, "msg_format_args_test.rs", 28),
+        (3, "msg_format_args_test.rs", 29),
+        (4, "msg_format_args_test.rs", 30),
+        (5, "msg_format_args_test.rs", 31),
+    ];
+    (snaps, locs)
+}
+
+/// Collect every io_event payload (`text` field) emitted by the
+/// recorder, in events order.  Used by the format-args pins to check
+/// the literal-vs-interpolated text shape.  Note that `ct-print --full`
+/// emits io_events with `kind == "io"` (not `"io_event"`) and the
+/// formatted text in the `text` field — both names are deliberate
+/// shorthand in the renderer.
+fn observed_io_event_contents(doc: &serde_json::Value) -> Vec<String> {
+    doc["events"]
+        .as_array()
+        .expect("events array")
+        .iter()
+        .filter(|e| e["kind"] == "io" || e["kind"] == "io_event")
+        .filter_map(|e| {
+            e["text"]
+                .as_str()
+                .map(|s| s.to_string())
+                .or_else(|| e["content"].as_str().map(|s| s.to_string()))
+        })
+        .collect()
+}
+
+#[test]
+fn test_msg_format_args_test_via_ct_print_full() {
+    let (snaps, locs) = msg_format_args_snapshots();
+    let Some((doc, source_path)) = record_and_dump_full(
+        "test_msg_format_args_test_via_ct_print_full",
+        "msg_format_args_test.rs",
+        &snaps,
+        &locs,
+    ) else {
+        return;
+    };
+
+    assert_metadata_program_ends_with(&doc, &source_path);
+    assert_paths_contain(&doc, "msg_format_args_test.rs");
+
+    let functions: Vec<&str> = doc["functions"]
+        .as_array()
+        .expect("functions array")
+        .iter()
+        .filter_map(|v| v.as_str())
+        .collect();
+    assert_eq!(functions, vec!["compute"]);
+
+    let counts = &doc["counts"];
+    // 1 implicit start() + 6 distinct lines = 7 step events.
+    assert_eq!(counts["steps"].as_u64(), Some(7), "steps; counts={counts}");
+    assert_eq!(counts["calls"].as_u64(), Some(1), "calls; counts={counts}");
+    // Three msg!(...) invocations.
+    assert_eq!(
+        counts["io_events"].as_u64(),
+        Some(3),
+        "io_events; counts={counts}"
+    );
+
+    let events = doc["events"].as_array().expect("events array");
+    // 7 steps + 1 call_entry + 1 call_exit + 3 io_events = 12 events.
+    assert_eq!(events.len(), 12, "events.len()");
+    assert_step_indices_monotonic(&doc);
+
+    assert_eq!(observed_call_sequence(&doc), vec!["compute".to_string()]);
+
+    // ----- Present-day literal format-string capture ----------------------
+    // The recorder's `extract_macro_string_arg` captures the *literal*
+    // format string from each msg! invocation, with the `{}` placeholders
+    // preserved verbatim — runtime interpolation is M10's documented
+    // limitation (see the `#[ignore]`d sibling below).
+    let contents = observed_io_event_contents(&doc);
+    assert_eq!(
+        contents,
+        vec![
+            "balance: {}".to_string(),
+            "from {} to {}".to_string(),
+            "doubled = {}".to_string(),
+        ],
+        "io_event payloads must contain the literal format strings; \
+         runtime interpolation is the M10-pinned limitation captured \
+         by the ignored sibling test below",
+    );
+
+    // ----- Register stream surfaces the runtime values --------------------
+    // Even though the io_event text isn't substituted, the runtime
+    // values still appear in the per-step register stream so a debugger
+    // can correlate the placeholder with the local at the call site.
+    let r1 = observed_register_sequence(&doc, "r1");
+    assert!(r1.contains(&100), "balance=100 must surface in r1; got {:?}", r1);
+    let r2 = observed_register_sequence(&doc, "r2");
+    assert!(r2.contains(&150), "new_balance=150 must surface in r2; got {:?}", r2);
+    let r3 = observed_register_sequence(&doc, "r3");
+    assert!(r3.contains(&300), "doubled=300 must surface in r3; got {:?}", r3);
+    let r0 = observed_register_sequence(&doc, "r0");
+    assert_eq!(
+        r0.last().copied(),
+        Some(300),
+        "r0 (return) must end at 300; got {:?}",
+        r0,
+    );
+}
+
+#[test]
+#[ignore = "M10 known limitation: extract_macro_string_arg captures the \
+            literal format string only.  msg!(\"balance: {}\", balance) \
+            produces an io_event payload `balance: {}` instead of the \
+            substituted `balance: 100`.  This test stays ignored until \
+            the format-arg interpolation path lands; the live \
+            test_msg_format_args_test_via_ct_print_full above pins the \
+            present-day literal-string shape."]
+fn test_msg_format_args_interpolated() {
+    let (snaps, locs) = msg_format_args_snapshots();
+    let Some((doc, _)) = record_and_dump_full(
+        "test_msg_format_args_interpolated",
+        "msg_format_args_test.rs",
+        &snaps,
+        &locs,
+    ) else {
+        return;
+    };
+    let contents = observed_io_event_contents(&doc);
+    // Spec-correct expectation: format placeholders substituted with
+    // the runtime values seen at each msg! call site.
+    assert_eq!(
+        contents,
+        vec![
+            "balance: 100".to_string(),
+            "from 100 to 150".to_string(),
+            "doubled = 300".to_string(),
+        ],
+        "io_event payloads must contain the substituted runtime values \
+         when the format-arg interpolation path lands"
+    );
+}
