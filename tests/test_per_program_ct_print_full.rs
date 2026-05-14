@@ -50,7 +50,9 @@
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
-use codetracer_solana_recorder::recorder::record_from_snapshots;
+use codetracer_solana_recorder::cpi::CpiDetector;
+use codetracer_solana_recorder::multi_program::ProgramRegistry;
+use codetracer_solana_recorder::recorder::{record_from_snapshots, record_with_cpi};
 use codetracer_solana_recorder::register_trace::RegisterSnapshot;
 
 // ===========================================================================
@@ -1591,22 +1593,90 @@ fn test_cpi_invoke_signed_test_via_ct_print_full() {
 }
 
 #[test]
-#[ignore = "M10 known limitation: record_with_cpi (the CPI-aware \
-            recording path) does NOT use SourceModel — it would emit \
-            `fn_at_pc_<pc>` placeholders and Int-only locals.  This \
-            test stays ignored until that path is migrated to the \
-            source-pattern synthesis approach; the live \
-            test_cpi_invoke_signed_test_via_ct_print_full above pins \
-            the source-model-aware path."]
 fn test_cpi_invoke_signed_source_model_pin() {
-    // Documents the gap.  When record_with_cpi adopts SourceModel, the
-    // assertion below would parallel the live test's call-sequence
-    // check and surface `process_instruction` / `invoke_signed` (not
-    // `fn_at_pc_500`) in the function table.
-    panic!(
-        "pin: record_with_cpi must adopt SourceModel so CPI targets \
-         surface with their source-resolved function names instead of \
-         fn_at_pc_<pc> placeholders",
+    // Drive the same fixture through `record_with_cpi` (the CPI-aware
+    // path) — this used to fall back to `fn_at_pc_500` because the
+    // function table was built from the registry / PC heuristic only.
+    // After the SourceModel migration `record_with_cpi` walks the
+    // primary program's source the same way the non-CPI path does, so
+    // CPI call frames surface with the resolved fn name from the
+    // source file.
+    let Some(ct_print) = ct_print_or_skip("test_cpi_invoke_signed_source_model_pin") else {
+        return;
+    };
+    let (snaps, locs) = cpi_invoke_signed_snapshots();
+
+    // Set up a registry where the primary program owns the
+    // process_instruction PCs (100..200) and a sibling system-program
+    // range owns the invoke_signed PCs (500..600).  Source locations
+    // for the primary program come from the fixture; the sibling
+    // program reuses the same fixture file so the SourceModel can
+    // resolve the CPI-target line as well.
+    let primary_locs: Vec<(u64, String, u32)> = locs
+        .iter()
+        .filter(|(pc, _, _)| *pc < 200)
+        .map(|(pc, f, l)| (*pc, f.to_string(), *l))
+        .collect();
+    let cpi_locs: Vec<(u64, String, u32)> = locs
+        .iter()
+        .filter(|(pc, _, _)| *pc >= 500)
+        .map(|(pc, f, l)| (*pc, f.to_string(), *l))
+        .collect();
+    let mut registry = ProgramRegistry::new();
+    registry.add_synthetic_program("primary", 0..200, primary_locs);
+    registry.add_synthetic_program("system_program", 500..600, cpi_locs);
+
+    let mut detector = CpiDetector::new(0..200);
+    detector.add_program_range("system_program", 500..600);
+
+    let tmp_dir = tempfile::tempdir().expect("tempdir");
+    let out_dir = tmp_dir.path().join("traces");
+    std::fs::create_dir_all(&out_dir).unwrap();
+    let source_path = test_programs_dir().join("cpi_invoke_signed_test.rs");
+    record_with_cpi(&snaps, &registry, &mut detector, &source_path, &out_dir)
+        .expect("record_with_cpi should succeed");
+
+    let ct_files: Vec<_> = std::fs::read_dir(&out_dir)
+        .expect("read out_dir")
+        .filter_map(|e| e.ok())
+        .map(|e| e.path())
+        .filter(|p| p.extension().is_some_and(|ext| ext == "ct"))
+        .collect();
+    assert!(
+        !ct_files.is_empty(),
+        "expected at least one .ct file in {}",
+        out_dir.display()
+    );
+    let output = Command::new(&ct_print)
+        .args(["--full", "--strip-paths"])
+        .arg(&ct_files[0])
+        .output()
+        .expect("failed to run ct-print --full");
+    assert!(
+        output.status.success(),
+        "ct-print --full should succeed; stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let doc: serde_json::Value = serde_json::from_slice(&output.stdout)
+        .expect("ct-print --full should emit valid JSON");
+
+    let functions: Vec<String> = doc["functions"]
+        .as_array()
+        .expect("functions array")
+        .iter()
+        .filter_map(|v| v.as_str().map(str::to_string))
+        .collect();
+    assert!(
+        functions.iter().any(|f| f == "process_instruction"),
+        "function table must contain `process_instruction` (the source-\
+         resolved outer caller); got {:?}",
+        functions,
+    );
+    assert!(
+        !functions.iter().any(|f| f.starts_with("fn_at_pc_")),
+        "function table must NOT contain any `fn_at_pc_<pc>` placeholder \
+         once record_with_cpi adopts SourceModel; got {:?}",
+        functions,
     );
 }
 
@@ -1968,22 +2038,24 @@ fn test_msg_format_args_test_via_ct_print_full() {
 
     assert_eq!(observed_call_sequence(&doc), vec!["compute".to_string()]);
 
-    // ----- Present-day literal format-string capture ----------------------
-    // The recorder's `extract_macro_string_arg` captures the *literal*
-    // format string from each msg! invocation, with the `{}` placeholders
-    // preserved verbatim — runtime interpolation is M10's documented
-    // limitation (see the `#[ignore]`d sibling below).
+    // ----- Spec-correct format-arg interpolation --------------------------
+    // The recorder's source-driven model resolves each positional `{}`
+    // placeholder against the call-site's runtime register values:
+    // function parameters are mapped to r1.. by signature order, and
+    // each `let NAME = ...` binding is mapped to the lowest register
+    // that became live at its line.  At each `msg!` call site the
+    // extracted args (`balance`, `new_balance`, `doubled`) resolve to
+    // their register values and substitute into the format string.
     let contents = observed_io_event_contents(&doc);
     assert_eq!(
         contents,
         vec![
-            "balance: {}".to_string(),
-            "from {} to {}".to_string(),
-            "doubled = {}".to_string(),
+            "balance: 100".to_string(),
+            "from 100 to 150".to_string(),
+            "doubled = 300".to_string(),
         ],
-        "io_event payloads must contain the literal format strings; \
-         runtime interpolation is the M10-pinned limitation captured \
-         by the ignored sibling test below",
+        "io_event payloads must contain the substituted runtime values \
+         the source-driven synthesiser resolves at each msg! call site",
     );
 
     // ----- Register stream surfaces the runtime values --------------------
@@ -2006,13 +2078,6 @@ fn test_msg_format_args_test_via_ct_print_full() {
 }
 
 #[test]
-#[ignore = "M10 known limitation: extract_macro_string_arg captures the \
-            literal format string only.  msg!(\"balance: {}\", balance) \
-            produces an io_event payload `balance: {}` instead of the \
-            substituted `balance: 100`.  This test stays ignored until \
-            the format-arg interpolation path lands; the live \
-            test_msg_format_args_test_via_ct_print_full above pins the \
-            present-day literal-string shape."]
 fn test_msg_format_args_interpolated() {
     let (snaps, locs) = msg_format_args_snapshots();
     let Some((doc, _)) = record_and_dump_full(
