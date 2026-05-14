@@ -40,7 +40,7 @@
 use std::collections::HashMap;
 use std::path::Path;
 
-use codetracer_trace_types::{EventLogKind, Line, NONE_VALUE, TypeKind, TypeId, ValueRecord};
+use codetracer_trace_types::{EventLogKind, Line, NONE_VALUE, TypeId, TypeKind, ValueRecord};
 use codetracer_trace_writer_nim::trace_writer::TraceWriter;
 use codetracer_trace_writer_nim::{TraceEventsFileFormat, create_trace_writer};
 use eyre::{Context, Result, eyre};
@@ -138,8 +138,7 @@ pub fn record_from_snapshots(
         .map_err(|e| eyre!("{e}"))?;
     TraceWriter::begin_writing_trace_metadata(&mut *writer, &metadata_path)
         .map_err(|e| eyre!("{e}"))?;
-    TraceWriter::begin_writing_trace_paths(&mut *writer, &paths_path)
-        .map_err(|e| eyre!("{e}"))?;
+    TraceWriter::begin_writing_trace_paths(&mut *writer, &paths_path).map_err(|e| eyre!("{e}"))?;
 
     record_from_snapshots_into_writer(snapshots, source_locations, source_path, &mut *writer)?;
 
@@ -566,7 +565,9 @@ struct VarEnv {
 
 impl VarEnv {
     fn new() -> Self {
-        Self { names: HashMap::new() }
+        Self {
+            names: HashMap::new(),
+        }
     }
 
     /// Pre-load function parameter names from a `fn NAME(p1: T1, p2: T2, ...)`
@@ -575,8 +576,12 @@ impl VarEnv {
     /// hand-written fixtures.
     fn load_params_from_fn(&mut self, fn_decl_line: &str) {
         // Strip leading `fn NAME` and capture the parenthesised arg list.
-        let Some(open) = fn_decl_line.find('(') else { return };
-        let Some(close_off) = fn_decl_line[open + 1..].find(')') else { return };
+        let Some(open) = fn_decl_line.find('(') else {
+            return;
+        };
+        let Some(close_off) = fn_decl_line[open + 1..].find(')') else {
+            return;
+        };
         let body = &fn_decl_line[open + 1..open + 1 + close_off];
         let mut idx = 1usize;
         for tok in split_top_level_commas(body) {
@@ -596,11 +601,7 @@ impl VarEnv {
                 .trim_start_matches('_')
                 .trim_start_matches('&');
             // Skip names that aren't simple identifiers (e.g. tuple-pattern params).
-            if !name.is_empty()
-                && name
-                    .chars()
-                    .all(|c| c.is_ascii_alphanumeric() || c == '_')
-            {
+            if !name.is_empty() && name.chars().all(|c| c.is_ascii_alphanumeric() || c == '_') {
                 if idx <= 10 {
                     self.names.insert(name.to_string(), idx);
                 }
@@ -753,11 +754,18 @@ fn parse_int_literal(text: &str) -> Option<i64> {
 /// Build a `ValueRecord::Sequence` from the literal element list inside
 /// `[...]` or `vec![...]`.  Skips elements that aren't simple integer
 /// literals (the synthesiser deliberately sticks to lossless decoding).
-fn build_sequence_value(elements_csv: &str, int_type_id: TypeId, seq_type_id: TypeId) -> ValueRecord {
+fn build_sequence_value(
+    elements_csv: &str,
+    int_type_id: TypeId,
+    seq_type_id: TypeId,
+) -> ValueRecord {
     let mut elements = Vec::new();
     for tok in split_top_level_commas(elements_csv) {
         if let Some(i) = parse_int_literal(tok) {
-            elements.push(ValueRecord::Int { i, type_id: int_type_id });
+            elements.push(ValueRecord::Int {
+                i,
+                type_id: int_type_id,
+            });
         }
     }
     ValueRecord::Sequence {
@@ -767,11 +775,18 @@ fn build_sequence_value(elements_csv: &str, int_type_id: TypeId, seq_type_id: Ty
     }
 }
 
-fn build_tuple_value(elements_csv: &str, int_type_id: TypeId, tuple_type_id: TypeId) -> ValueRecord {
+fn build_tuple_value(
+    elements_csv: &str,
+    int_type_id: TypeId,
+    tuple_type_id: TypeId,
+) -> ValueRecord {
     let mut elements = Vec::new();
     for tok in split_top_level_commas(elements_csv) {
         if let Some(i) = parse_int_literal(tok) {
-            elements.push(ValueRecord::Int { i, type_id: int_type_id });
+            elements.push(ValueRecord::Int {
+                i,
+                type_id: int_type_id,
+            });
         }
     }
     ValueRecord::Tuple {
@@ -796,9 +811,7 @@ fn build_tuple_value(elements_csv: &str, int_type_id: TypeId, tuple_type_id: Typ
 /// don't accidentally match `account.field` access (no `::`) or a bare
 /// type name (no `::`) which is already handled by the struct-literal
 /// detector.
-fn parse_variant_construction(
-    rhs: &str,
-) -> Option<(String, String, VariantPayload)> {
+fn parse_variant_construction(rhs: &str) -> Option<(String, String, VariantPayload)> {
     let rhs = rhs.trim_start_matches('&').trim();
     let rhs = rhs.strip_prefix("mut ").unwrap_or(rhs);
     // The path component is everything before the first `{` / `(` / end.
@@ -827,7 +840,11 @@ fn parse_variant_construction(
     // The variant name must start with an uppercase letter.  Guards
     // against `account.is_signer::clone` (no chance in practice but be
     // safe) and turbofish-style `::<T>` references.
-    if !variant.chars().next().is_some_and(|c| c.is_ascii_uppercase()) {
+    if !variant
+        .chars()
+        .next()
+        .is_some_and(|c| c.is_ascii_uppercase())
+    {
         return None;
     }
     let tail = rhs[head_end..].trim();
@@ -905,6 +922,369 @@ fn parse_struct_literal(rhs: &str) -> Option<(String, Vec<(String, i64)>)> {
         let val = tok[colon + 1..].trim();
         if let Some(i) = parse_int_literal(val) {
             fields.push((name, i));
+        }
+    }
+    Some((name_part.to_string(), fields))
+}
+
+/// Strip an outer `"..."` Rust string literal and return its inner text.
+/// Returns `None` if `text` doesn't begin and end with `"` (so callers
+/// fall through to other decode paths).  Backslash escapes are preserved
+/// verbatim — the synthesiser treats the literal as opaque text the
+/// debugger can render however it likes.
+fn parse_string_literal(text: &str) -> Option<String> {
+    let s = text.trim();
+    let inner = s.strip_prefix('"')?.strip_suffix('"')?;
+    Some(inner.to_string())
+}
+
+/// Decode an `&[u8; 32]` byte-array literal that surfaces inside a
+/// `Pubkey::new_from_array([..])` call.  Returns the canonical base58
+/// placeholder for the "all-zeros" case (`Pubkey::default()`) and the
+/// raw `[..]` token form otherwise — the synthesiser's job is to
+/// surface the *shape* of the literal, not to perform real base58
+/// encoding (which would require pulling in `bs58` for a placeholder).
+fn pubkey_call_to_string(rhs: &str) -> Option<String> {
+    let s = rhs.trim();
+    // `Pubkey::default()` → canonical 11111... placeholder.  The string
+    // matches what `bs58::encode([0u8; 32])` would produce so a debugger
+    // rendering this trace shows the expected on-chain key.
+    if s == "Pubkey::default()" {
+        return Some("11111111111111111111111111111111".to_string());
+    }
+    // `Pubkey::new_from_array([..])` → preserve the array literal as the
+    // placeholder text.  Real base58 encoding is the recorder's job once
+    // the SBF VM is wired up; today the strict tests pin the literal
+    // surface form so a regression in the parser is loud.
+    let after = s.strip_prefix("Pubkey::new_from_array(")?;
+    let close = after.rfind(')')?;
+    Some(format!("Pubkey::new_from_array({})", after[..close].trim()))
+}
+
+/// Decode a single field-value RHS expression into a `ValueRecord`.
+/// Supports:
+///   * integer / bool literals (`42`, `true`),
+///   * string literals (`"hello"`),
+///   * `vec![..]` / `[..]` array literals (Sequence),
+///   * tuple literals (`(a, b)` with at least 2 elements),
+///   * nested `Name { .. }` struct literals (recursive),
+///   * `Pubkey::default()` / `Pubkey::new_from_array([..])`
+///     (decoded as `String` placeholders so the strict pin can assert
+///     on the canonical surface form without a live SBF VM).
+///
+/// Returns `None` for anything else so the caller can drop the field
+/// (mirrors the legacy int/bool-only behaviour for unknown shapes).
+fn decode_value_literal(
+    rhs: &str,
+    type_ids: &mut TypeIdCache,
+    writer: &mut dyn TraceWriter,
+) -> Option<ValueRecord> {
+    let s = rhs.trim().trim_end_matches(',');
+    if s.is_empty() {
+        return None;
+    }
+    // Pubkey calls — both `Pubkey::default()` and
+    // `Pubkey::new_from_array([..])` decode as base58 / shape placeholders.
+    if s.starts_with("Pubkey::") {
+        if let Some(text) = pubkey_call_to_string(s) {
+            return Some(ValueRecord::String {
+                text,
+                type_id: type_ids.string,
+            });
+        }
+    }
+    // String literal.
+    if let Some(text) = parse_string_literal(s) {
+        return Some(ValueRecord::String {
+            text,
+            type_id: type_ids.string,
+        });
+    }
+    // Bool / int literal.
+    if let Some(i) = parse_int_literal(s) {
+        return Some(ValueRecord::Int {
+            i,
+            type_id: type_ids.int,
+        });
+    }
+    // `vec![..]` / `[..]` sequence literal.
+    if let Some(elements_csv) = extract_array_or_vec_literal(s) {
+        let mut elements = Vec::new();
+        for tok in split_top_level_commas(elements_csv) {
+            if let Some(v) = decode_value_literal(tok, type_ids, writer) {
+                elements.push(v);
+            }
+        }
+        if !elements.is_empty() {
+            return Some(ValueRecord::Sequence {
+                elements,
+                is_slice: false,
+                type_id: type_ids.seq,
+            });
+        }
+    }
+    // Tuple literal.
+    if let Some(elements_csv) = extract_tuple_literal(s) {
+        let mut elements = Vec::new();
+        for tok in split_top_level_commas(elements_csv) {
+            if let Some(v) = decode_value_literal(tok, type_ids, writer) {
+                elements.push(v);
+            }
+        }
+        if elements.len() >= 2 {
+            return Some(ValueRecord::Tuple {
+                elements,
+                type_id: type_ids.tuple,
+            });
+        }
+    }
+    // Nested `Name { .. }` struct literal — recurse via the rich parser.
+    if let Some((struct_name, fields)) = parse_struct_literal_rich(s, type_ids, writer) {
+        let type_id = type_ids.ensure_struct(writer, &struct_name);
+        let field_values = fields.into_iter().map(|(_, v)| v).collect();
+        return Some(ValueRecord::Struct {
+            field_values,
+            type_id,
+        });
+    }
+    None
+}
+
+/// Returns `true` when `value` is a `Result`-shaped `Variant` whose
+/// outer discriminator is `"Err"`.  Used by the recorder loop to
+/// identify error-shaped returns that should fill the
+/// `?`-propagation slot (`last_err_return`) so the caller's
+/// `?`-bearing line can re-emit the same typed value without
+/// re-parsing the callee's source.
+fn is_err_variant(value: &ValueRecord) -> bool {
+    matches!(
+        value,
+        ValueRecord::Variant { discriminator, .. } if discriminator == "Err"
+    )
+}
+
+/// `synthesise_return_value` extended with `?`-propagation: when the
+/// source line at `line_no` ends in a `?;` (the canonical
+/// early-return shape), the recorder re-emits the most recently
+/// observed `Err`-shaped return value from `last_err`.  This mirrors
+/// Rust's `?` semantics — the operator forwards the same `Err`
+/// up the call stack rather than chaining a fresh wrapper.
+fn synthesise_return_value_with_propagation(
+    model: &SourceModel,
+    line_no: u32,
+    type_ids: &mut TypeIdCache,
+    writer: &mut dyn TraceWriter,
+    last_err: Option<&ValueRecord>,
+) -> Option<ValueRecord> {
+    if let Some(v) = synthesise_return_value(model, line_no, type_ids, writer) {
+        return Some(v);
+    }
+    let raw = model.line(line_no);
+    let text = strip_line_for_match(raw);
+    if line_carries_propagation(text) {
+        return last_err.cloned();
+    }
+    None
+}
+
+/// Returns `true` when `text` carries a `?` operator at expression
+/// position — the canonical early-return shape (`let v = call()?;` or
+/// `call()?` as an expression statement).  Excludes `?` characters
+/// inside string literals via a simple state machine so commented or
+/// quoted markers don't fire.
+fn line_carries_propagation(text: &str) -> bool {
+    let mut in_string = false;
+    let mut prev = ' ';
+    for c in text.chars() {
+        if in_string {
+            if c == '"' && prev != '\\' {
+                in_string = false;
+            }
+            prev = c;
+            continue;
+        }
+        if c == '"' {
+            in_string = true;
+        } else if c == '?' {
+            return true;
+        }
+        prev = c;
+    }
+    false
+}
+
+/// Inspect the source text at `line_no` for a `return Err(..)` /
+/// `return Ok(..)` / bare `Err(..)` / bare `Ok(..)` expression and
+/// synthesise the matching `Result`-shaped `ValueRecord::Variant`.
+/// Returns `None` when the line doesn't carry an explicit return shape
+/// — the caller falls back to `NONE_VALUE` (today's behaviour).
+///
+/// Decoding rules for the inner payload:
+///   * `Path::Variant` (unit variant) → `Variant { discriminator, contents: Tuple([]) }`
+///   * `Path::Variant(args)` (tuple variant) → `Variant { discriminator, contents: Tuple(args) }`
+///   * Any other recognised literal → handled via [`decode_value_literal`].
+///   * Unrecognised shapes degrade to a `String` placeholder carrying
+///     the raw payload text so the strict test can still pin a stable
+///     surface form without needing a full Rust parser.
+fn synthesise_return_value(
+    model: &SourceModel,
+    line_no: u32,
+    type_ids: &mut TypeIdCache,
+    writer: &mut dyn TraceWriter,
+) -> Option<ValueRecord> {
+    let raw = model.line(line_no);
+    let text = strip_line_for_match(raw);
+    if text.is_empty() {
+        return None;
+    }
+    let (discriminator, payload_text) = if text.contains("return Err(") {
+        ("Err".to_string(), extract_err_payload(text)?)
+    } else if text.starts_with("Err(") {
+        ("Err".to_string(), extract_err_payload(text)?)
+    } else if let Some(stripped) = text.strip_prefix("return Ok(") {
+        let close = stripped.rfind(')')?;
+        ("Ok".to_string(), stripped[..close].trim().to_string())
+    } else if let Some(stripped) = text.strip_prefix("Ok(") {
+        let close = stripped.rfind(')')?;
+        ("Ok".to_string(), stripped[..close].trim().to_string())
+    } else {
+        return None;
+    };
+    let inner = decode_return_payload(&payload_text, type_ids, writer);
+    let result_type_id = type_ids.ensure_variant(writer, "Result");
+    Some(ValueRecord::Variant {
+        discriminator,
+        contents: Box::new(inner),
+        type_id: result_type_id,
+    })
+}
+
+/// Decode the inner payload of a `Result::Err(..)` / `Result::Ok(..)`
+/// expression into a typed `ValueRecord`.  Recognises:
+///   * `Path::Variant` unit-variant constructions (canonical
+///     `ProgramError::MissingRequiredSignature` shape) — surface as a
+///     nested `Variant` whose discriminator is the variant name.
+///   * `Path::Variant(args)` tuple-variant constructions
+///     (`ProgramError::Custom(42)` shape) — surface as a nested
+///     `Variant` whose contents is the decoded `Tuple`.
+///   * Any expression `decode_value_literal` recognises (int / bool /
+///     string / vec / array / tuple / struct / Pubkey-call) — surface
+///     directly.
+///   * Unrecognised shapes — degrade to a `String` placeholder
+///     carrying the verbatim payload text so the strict pin still has
+///     a deterministic surface.
+fn decode_return_payload(
+    payload: &str,
+    type_ids: &mut TypeIdCache,
+    writer: &mut dyn TraceWriter,
+) -> ValueRecord {
+    let s = payload.trim();
+    // Enum-variant style payloads: `EnumPath::Variant`
+    // (unit) or `EnumPath::Variant(args)` (tuple).  Reuse
+    // `parse_variant_construction` so the decode rules stay aligned
+    // with the let-binding-side variant emission.
+    if let Some((enum_path, variant, vp)) = parse_variant_construction(s) {
+        let contents = match vp {
+            VariantPayload::Struct(fields) => {
+                let field_values: Vec<ValueRecord> = fields
+                    .iter()
+                    .map(|(_, i)| ValueRecord::Int {
+                        i: *i,
+                        type_id: type_ids.int,
+                    })
+                    .collect();
+                let struct_type_id = type_ids
+                    .struct_type_for(&variant)
+                    .unwrap_or(type_ids.struct_default);
+                ValueRecord::Struct {
+                    field_values,
+                    type_id: struct_type_id,
+                }
+            }
+            VariantPayload::Tuple(values) => {
+                let elements: Vec<ValueRecord> = values
+                    .iter()
+                    .map(|i| ValueRecord::Int {
+                        i: *i,
+                        type_id: type_ids.int,
+                    })
+                    .collect();
+                ValueRecord::Tuple {
+                    elements,
+                    type_id: type_ids.tuple,
+                }
+            }
+            VariantPayload::Unit => ValueRecord::Tuple {
+                elements: Vec::new(),
+                type_id: type_ids.tuple,
+            },
+        };
+        let variant_type_id = type_ids.ensure_variant(writer, &enum_path);
+        return ValueRecord::Variant {
+            discriminator: variant,
+            contents: Box::new(contents),
+            type_id: variant_type_id,
+        };
+    }
+    if let Some(value) = decode_value_literal(s, type_ids, writer) {
+        return value;
+    }
+    // Fallback: surface the verbatim payload text so the strict pin
+    // can still anchor on it (rather than a NONE placeholder).
+    ValueRecord::String {
+        text: s.to_string(),
+        type_id: type_ids.string,
+    }
+}
+
+/// Rich variant of [`parse_struct_literal`] that decodes each field
+/// value into a typed [`ValueRecord`] via [`decode_value_literal`]
+/// rather than dropping non-int fields.  Used by the synthesiser's
+/// emission path so nested struct literals, string fields, `Vec<T>`
+/// fields, and `Pubkey::default()` placeholders all surface with their
+/// proper types instead of being silently elided.
+///
+/// Field values that don't match any known literal shape are still
+/// dropped (no `Raw`/`Error` placeholders) — mirrors the legacy
+/// behaviour so unrecognised shapes never produce ghost fields the
+/// strict tests would have to special-case.
+fn parse_struct_literal_rich(
+    rhs: &str,
+    type_ids: &mut TypeIdCache,
+    writer: &mut dyn TraceWriter,
+) -> Option<(String, Vec<(String, ValueRecord)>)> {
+    // Mirror `parse_struct_literal`'s outer-shape detection so the two
+    // entry points stay in lock-step.
+    let rhs = rhs.trim_start_matches('&').trim();
+    let rhs = rhs.strip_prefix("mut ").unwrap_or(rhs);
+    let brace = rhs.find('{')?;
+    let name_part = rhs[..brace].trim();
+    if name_part.is_empty() {
+        return None;
+    }
+    let first = name_part.chars().next()?;
+    if !first.is_ascii_uppercase() {
+        return None;
+    }
+    // Reject `Foo::Bar { .. }` enum-variant constructions — those have
+    // their own dedicated decode path (`parse_variant_construction`)
+    // and would otherwise be mis-registered as a struct named
+    // `Foo::Bar`.
+    if name_part.contains("::") {
+        return None;
+    }
+    let close = rhs.rfind('}')?;
+    if close <= brace {
+        return None;
+    }
+    let body = &rhs[brace + 1..close];
+    let mut fields: Vec<(String, ValueRecord)> = Vec::new();
+    for tok in split_top_level_commas(body) {
+        let Some(colon) = tok.find(':') else { continue };
+        let name = tok[..colon].trim().to_string();
+        let val = tok[colon + 1..].trim();
+        if let Some(v) = decode_value_literal(val, type_ids, writer) {
+            fields.push((name, v));
         }
     }
     Some((name_part.to_string(), fields))
@@ -1013,7 +1393,10 @@ fn synthesise_step_events(
                 VariantPayload::Struct(fields) => {
                     let field_values: Vec<ValueRecord> = fields
                         .iter()
-                        .map(|(_, i)| ValueRecord::Int { i: *i, type_id: int_type_id })
+                        .map(|(_, i)| ValueRecord::Int {
+                            i: *i,
+                            type_id: int_type_id,
+                        })
                         .collect();
                     ValueRecord::Struct {
                         field_values,
@@ -1023,7 +1406,10 @@ fn synthesise_step_events(
                 VariantPayload::Tuple(values) => {
                     let elements: Vec<ValueRecord> = values
                         .iter()
-                        .map(|i| ValueRecord::Int { i: *i, type_id: int_type_id })
+                        .map(|i| ValueRecord::Int {
+                            i: *i,
+                            type_id: int_type_id,
+                        })
                         .collect();
                     ValueRecord::Tuple {
                         elements,
@@ -1076,18 +1462,21 @@ fn synthesise_step_events(
         };
         // Strip the `let NAME = ` prefix from the stitched line if present.
         let candidate_rhs = if let Some(eq) = candidate.find('=') {
-            candidate[eq + 1..].trim().trim_end_matches(';').trim().to_string()
+            candidate[eq + 1..]
+                .trim()
+                .trim_end_matches(';')
+                .trim()
+                .to_string()
         } else {
             candidate
         };
-        if let Some((struct_name, fields)) = parse_struct_literal(&candidate_rhs) {
+        if let Some((struct_name, fields)) =
+            parse_struct_literal_rich(&candidate_rhs, type_ids, writer)
+        {
             let type_id = type_ids
                 .struct_type_for(struct_name.as_str())
-                .unwrap_or(type_ids.struct_default);
-            let field_values: Vec<ValueRecord> = fields
-                .iter()
-                .map(|(_, i)| ValueRecord::Int { i: *i, type_id: type_ids.int })
-                .collect();
+                .unwrap_or_else(|| type_ids.ensure_struct(writer, &struct_name));
+            let field_values: Vec<ValueRecord> = fields.into_iter().map(|(_, v)| v).collect();
             let value = ValueRecord::Struct {
                 field_values,
                 type_id,
@@ -1181,6 +1570,7 @@ struct TypeIdCache {
     int: TypeId,
     seq: TypeId,
     tuple: TypeId,
+    string: TypeId,
     struct_default: TypeId,
     /// Fallback variant TypeId for the rare case where the synthesiser
     /// needs to emit a `ValueRecord::Variant` for an enum path that
@@ -1199,12 +1589,14 @@ impl TypeIdCache {
         let int = TraceWriter::ensure_type_id(writer, TypeKind::Int, "u64");
         let seq = TraceWriter::ensure_type_id(writer, TypeKind::Seq, "Vec<u64>");
         let tuple = TraceWriter::ensure_type_id(writer, TypeKind::Tuple, "(u64, u64)");
+        let string = TraceWriter::ensure_type_id(writer, TypeKind::String, "string");
         let struct_default = TraceWriter::ensure_type_id(writer, TypeKind::Struct, "Struct");
         let variant_default = TraceWriter::ensure_type_id(writer, TypeKind::Variant, "Variant");
         Self {
             int,
             seq,
             tuple,
+            string,
             struct_default,
             variant_default,
             structs: HashMap::new(),
@@ -1285,7 +1677,11 @@ pub fn record_from_snapshots_into_writer(
                 rhs.to_string()
             };
             let candidate_rhs = if let Some(eq) = candidate.find('=') {
-                candidate[eq + 1..].trim().trim_end_matches(';').trim().to_string()
+                candidate[eq + 1..]
+                    .trim()
+                    .trim_end_matches(';')
+                    .trim()
+                    .to_string()
             } else {
                 candidate
             };
@@ -1309,12 +1705,7 @@ pub fn record_from_snapshots_into_writer(
         })
         .unwrap_or_else(|| "main".to_string());
 
-    let main_fn_id = TraceWriter::ensure_function_id(
-        writer,
-        &outer_fn_name,
-        source_path,
-        Line(1),
-    );
+    let main_fn_id = TraceWriter::ensure_function_id(writer, &outer_fn_name, source_path, Line(1));
 
     // Emit initial call.
     TraceWriter::register_call(writer, main_fn_id, vec![]);
@@ -1338,6 +1729,13 @@ pub fn record_from_snapshots_into_writer(
     let mut prev_line: Option<u32> = None;
     let mut prev_pc: Option<u64> = None;
     let mut prev_regs: [u64; 12] = [0u64; 12];
+
+    // Track the most recently synthesised `Err`-shaped return value so
+    // `?`-propagation in the caller can re-emit it without re-parsing
+    // the callee's source.  Updated each time the recorder emits a
+    // typed `Result::Err` return (via `synthesise_return_value`); reset
+    // to `None` whenever a non-error return is emitted.
+    let mut last_err_return: Option<ValueRecord> = None;
 
     for snap in snapshots {
         let pc = snap.pc();
@@ -1385,23 +1783,56 @@ pub fn record_from_snapshots_into_writer(
                         // call stack until we're back in `curr_fn`.
                         // When `curr_fn` is unknown, pop a single
                         // frame to match the legacy heuristic.
+                        //
+                        // The synthesised return value comes from the
+                        // last visited line of the unwinding frame —
+                        // when that line is `return Err(..)` /
+                        // `return Ok(..)`, the recorder surfaces the
+                        // typed `Result`-shaped Variant instead of the
+                        // legacy `NONE_VALUE` placeholder.  When the
+                        // unwinding fn's last line carries a `?`
+                        // operator, the recorder propagates the most
+                        // recently synthesised `Err`-shaped value
+                        // (mirrors Rust's `?` semantics: re-emit, NOT
+                        // chain).
+                        let return_value = prev_line
+                            .and_then(|l| {
+                                synthesise_return_value_with_propagation(
+                                    &model,
+                                    l,
+                                    &mut type_ids,
+                                    writer,
+                                    last_err_return.as_ref(),
+                                )
+                            })
+                            .unwrap_or(NONE_VALUE);
+                        // Update `last_err_return` so the caller's
+                        // closing `?`-bearing line can re-emit it.
+                        if is_err_variant(&return_value) {
+                            last_err_return = Some(return_value.clone());
+                        } else if !matches!(return_value, ValueRecord::None { .. }) {
+                            // A non-error typed return (e.g. `Ok(..)`)
+                            // wipes the propagation slot so a later
+                            // `?` doesn't accidentally pick it up.
+                            last_err_return = None;
+                        }
                         match curr_fn {
                             Some(target) => {
                                 while fn_stack.len() > 1
                                     && fn_stack.last().map(String::as_str) != Some(target)
                                 {
-                                    TraceWriter::register_return(writer, NONE_VALUE);
+                                    TraceWriter::register_return(writer, return_value.clone());
                                     fn_stack.pop();
                                     env_stack.pop();
                                 }
                             }
                             None => {
                                 if fn_stack.len() > 1 {
-                                    TraceWriter::register_return(writer, NONE_VALUE);
+                                    TraceWriter::register_return(writer, return_value);
                                     fn_stack.pop();
                                     env_stack.pop();
                                 } else {
-                                    TraceWriter::register_return(writer, NONE_VALUE);
+                                    TraceWriter::register_return(writer, return_value);
                                 }
                             }
                         }
@@ -1412,11 +1843,7 @@ pub fn record_from_snapshots_into_writer(
 
         // Emit step when line changes.
         if prev_line != Some(line) {
-            TraceWriter::register_step(
-                writer,
-                &Path::new(file_str),
-                Line(line as i64),
-            );
+            TraceWriter::register_step(writer, &Path::new(file_str), Line(line as i64));
 
             // Update the active frame's variable→register env from any
             // `let NAME = ...` binding visible on this step before
@@ -1434,10 +1861,7 @@ pub fn record_from_snapshots_into_writer(
             // structured variable appears alongside its formal name in
             // the step's variable list (rather than after the r0..r10
             // block).
-            let active_env = env_stack
-                .last()
-                .cloned()
-                .unwrap_or_else(VarEnv::new);
+            let active_env = env_stack.last().cloned().unwrap_or_else(VarEnv::new);
             synthesise_step_events(&model, writer, line, &mut type_ids, &active_env, snap);
 
             prev_line = Some(line);
@@ -1457,8 +1881,23 @@ pub fn record_from_snapshots_into_writer(
         prev_regs = snap.registers;
     }
 
-    // Emit return for the main function.
-    TraceWriter::register_return(writer, NONE_VALUE);
+    // Emit return for the main function.  When the last visited line
+    // is itself a `return Err(..)` / `Err(..)` / `?`-bearing
+    // expression, the synthesiser surfaces the typed Variant return so
+    // a stepping debugger sees the same shape an in-VM run would emit
+    // (e.g. `?`-propagated `Err(..)` re-emerging from the outer fn).
+    let final_return = prev_line
+        .and_then(|l| {
+            synthesise_return_value_with_propagation(
+                &model,
+                l,
+                &mut type_ids,
+                writer,
+                last_err_return.as_ref(),
+            )
+        })
+        .unwrap_or(NONE_VALUE);
+    TraceWriter::register_return(writer, final_return);
 
     Ok(())
 }
@@ -1502,8 +1941,7 @@ pub fn record_with_cpi(
         .map_err(|e| eyre!("{e}"))?;
     TraceWriter::begin_writing_trace_metadata(&mut *writer, &metadata_path)
         .map_err(|e| eyre!("{e}"))?;
-    TraceWriter::begin_writing_trace_paths(&mut *writer, &paths_path)
-        .map_err(|e| eyre!("{e}"))?;
+    TraceWriter::begin_writing_trace_paths(&mut *writer, &paths_path).map_err(|e| eyre!("{e}"))?;
 
     // Load the primary program's source so we can resolve nested call
     // frames to their real `fn name(...)` declarations and synthesise
@@ -1537,7 +1975,11 @@ pub fn record_with_cpi(
                 rhs.to_string()
             };
             let candidate_rhs = if let Some(eq) = candidate.find('=') {
-                candidate[eq + 1..].trim().trim_end_matches(';').trim().to_string()
+                candidate[eq + 1..]
+                    .trim()
+                    .trim_end_matches(';')
+                    .trim()
+                    .to_string()
             } else {
                 candidate
             };
@@ -1560,12 +2002,8 @@ pub fn record_with_cpi(
         })
         .unwrap_or_else(|| "main".to_string());
 
-    let main_fn_id = TraceWriter::ensure_function_id(
-        &mut *writer,
-        &outer_fn_name,
-        source_path,
-        Line(1),
-    );
+    let main_fn_id =
+        TraceWriter::ensure_function_id(&mut *writer, &outer_fn_name, source_path, Line(1));
 
     // Emit initial call.
     TraceWriter::register_call(&mut *writer, main_fn_id, vec![]);
@@ -1615,8 +2053,7 @@ pub fn record_with_cpi(
                 // Mirrors the `register_call_arg` / `arg` pattern from the
                 // Ruby (1.22) and JS (1.38) recorders — see section 5.6 of
                 // /tmp/isonim-migration.txt.
-                let pc_type_id =
-                    TraceWriter::ensure_type_id(&mut *writer, TypeKind::Int, "u64");
+                let pc_type_id = TraceWriter::ensure_type_id(&mut *writer, TypeKind::Int, "u64");
                 let str_type_id =
                     TraceWriter::ensure_type_id(&mut *writer, TypeKind::String, "string");
                 let _ = TraceWriter::arg(
@@ -1692,30 +2129,20 @@ pub fn record_with_cpi(
                                 match curr_fn {
                                     Some(target) => {
                                         while fn_stack.len() > 1
-                                            && fn_stack.last().map(String::as_str)
-                                                != Some(target)
+                                            && fn_stack.last().map(String::as_str) != Some(target)
                                         {
-                                            TraceWriter::register_return(
-                                                &mut *writer,
-                                                NONE_VALUE,
-                                            );
+                                            TraceWriter::register_return(&mut *writer, NONE_VALUE);
                                             fn_stack.pop();
                                             env_stack.pop();
                                         }
                                     }
                                     None => {
                                         if fn_stack.len() > 1 {
-                                            TraceWriter::register_return(
-                                                &mut *writer,
-                                                NONE_VALUE,
-                                            );
+                                            TraceWriter::register_return(&mut *writer, NONE_VALUE);
                                             fn_stack.pop();
                                             env_stack.pop();
                                         } else {
-                                            TraceWriter::register_return(
-                                                &mut *writer,
-                                                NONE_VALUE,
-                                            );
+                                            TraceWriter::register_return(&mut *writer, NONE_VALUE);
                                         }
                                     }
                                 }
@@ -1738,11 +2165,7 @@ pub fn record_with_cpi(
 
         // Emit step when line changes.
         if prev_line != Some(line) {
-            TraceWriter::register_step(
-                &mut *writer,
-                &Path::new(&file_str),
-                Line(line as i64),
-            );
+            TraceWriter::register_step(&mut *writer, &Path::new(&file_str), Line(line as i64));
 
             // Update the active frame's variable→register env from any
             // `let NAME = ...` binding visible on this step before
@@ -1754,18 +2177,8 @@ pub fn record_with_cpi(
             }
 
             // Synthesise side-effecting / typed-value events.
-            let active_env = env_stack
-                .last()
-                .cloned()
-                .unwrap_or_else(VarEnv::new);
-            synthesise_step_events(
-                &model,
-                &mut *writer,
-                line,
-                &mut type_ids,
-                &active_env,
-                snap,
-            );
+            let active_env = env_stack.last().cloned().unwrap_or_else(VarEnv::new);
+            synthesise_step_events(&model, &mut *writer, line, &mut type_ids, &active_env, snap);
 
             prev_line = Some(line);
         }
