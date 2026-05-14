@@ -3022,3 +3022,628 @@ fn test_sysvar_clock_rent_test_via_ct_print_full() {
         "Rent fields in source order: lamports_per_byte_year, exemption_threshold",
     );
 }
+
+// ===========================================================================
+// M11: declare_id_entrypoint_test.rs
+// ===========================================================================
+//
+// Regression coverage for the source-pattern matcher's macro-recognition
+// scope.  The fixture's top-of-`lib.rs` `declare_id!("11111...")` and
+// `entrypoint!(process_instruction)` macros must NOT produce spurious
+// `SolanaMsg`/`SolanaPanic` io_events.  Today the synthesiser anchors on
+// the literal substrings `"msg!("` / `"panic!("` (plus the
+// `sol_log_data!(` / `sol_log_compute_units!(` recognisers added in
+// this batch), so neither macro line can false-match — this test pins
+// that property so any future widening of the matcher to "any
+// `name!(` invocation" still keeps these lines silent.
+
+fn declare_id_entrypoint_snapshots() -> (Vec<RegisterSnapshot>, Vec<(u64, &'static str, u32)>) {
+    // Snapshot stream visits:
+    //   line 56: declare_id!("11111111111111111111111111111112");
+    //   line 58: entrypoint!(process_instruction);
+    //   line 65: let value: u64 = 7;
+    //   line 66: msg!("processing instruction with value={}", value);
+    //   line 67: value  (return)
+    let snaps = vec![
+        snap(0, &[]),
+        snap(1, &[]),
+        snap(2, &[(1, 7)]),
+        snap(3, &[(1, 7)]),
+        snap(4, &[(0, 7), (1, 7)]),
+    ];
+    let locs: Vec<(u64, &'static str, u32)> = vec![
+        (0, "declare_id_entrypoint_test.rs", 56),
+        (1, "declare_id_entrypoint_test.rs", 58),
+        (2, "declare_id_entrypoint_test.rs", 65),
+        (3, "declare_id_entrypoint_test.rs", 66),
+        (4, "declare_id_entrypoint_test.rs", 67),
+    ];
+    (snaps, locs)
+}
+
+#[test]
+fn test_declare_id_entrypoint_test_via_ct_print_full() {
+    let (snaps, locs) = declare_id_entrypoint_snapshots();
+    let Some((doc, source_path)) = record_and_dump_full(
+        "test_declare_id_entrypoint_test_via_ct_print_full",
+        "declare_id_entrypoint_test.rs",
+        &snaps,
+        &locs,
+    ) else {
+        return;
+    };
+
+    assert_metadata_program_ends_with(&doc, &source_path);
+    assert_paths_contain(&doc, "declare_id_entrypoint_test.rs");
+
+    let functions: Vec<&str> = doc["functions"]
+        .as_array()
+        .expect("functions array")
+        .iter()
+        .filter_map(|v| v.as_str())
+        .collect();
+    assert_eq!(
+        functions,
+        vec!["process_instruction"],
+        "function table must contain only the user-written handler — \
+         the `declare_id!`/`entrypoint!` macro lines live outside any \
+         `fn` body so they cannot register a function frame",
+    );
+
+    let counts = &doc["counts"];
+    // 1 implicit start() + 5 distinct visited lines = 6 step events.
+    // Lines 56 and 58 each emit a step (the recorder's snapshot loop
+    // emits one step per line change regardless of whether the line
+    // sits inside a `fn` body), but neither line emits an io_event.
+    assert_eq!(counts["steps"].as_u64(), Some(6), "steps; counts={counts}");
+    assert_eq!(
+        counts["functions"].as_u64(),
+        Some(1),
+        "functions; counts={counts}"
+    );
+    assert_eq!(
+        counts["calls"].as_u64(),
+        Some(1),
+        "calls; counts={counts} (just the implicit driver frame)"
+    );
+    // The ONLY io_event the trace must contain is the `msg!` on line 66
+    // — `declare_id!` and `entrypoint!` MUST stay silent.
+    assert_eq!(
+        counts["io_events"].as_u64(),
+        Some(1),
+        "io_events; counts={counts} (declare_id! / entrypoint! must NOT \
+         false-match the source-pattern matcher into a SolanaMsg event)"
+    );
+
+    let events = doc["events"].as_array().expect("events array");
+    // 6 steps + 1 call_entry + 1 call_exit + 1 io_event = 9 events.
+    assert_eq!(events.len(), 9, "events.len()");
+    assert_step_indices_monotonic(&doc);
+
+    assert_eq!(
+        observed_call_sequence(&doc),
+        vec!["process_instruction".to_string()],
+    );
+
+    // ----- The single io_event is the `msg!` from line 66 ------------------
+    let contents = observed_io_event_contents(&doc);
+    assert_eq!(
+        contents,
+        vec!["processing instruction with value=7".to_string()],
+        "the only io_event must be the `msg!` from line 66 — neither \
+         `declare_id!` nor `entrypoint!` may surface a spurious one",
+    );
+}
+
+// ===========================================================================
+// M11: sol_log_data_compute_test.rs
+// ===========================================================================
+//
+// Exercises the recorder's source-pattern matcher's recognition of two
+// Solana-syscall-shaped macros that are distinct from `msg!`:
+//
+//   * `sol_log_data!(...)` — Solana's binary-log syscall.  Surfaces as
+//     a `TraceLogEvent`-kinded io_event (mapped to `ioStderr` in the
+//     multi-stream IO event stream) so the strict pin can distinguish
+//     it from a `Write`-kinded (`ioStdout`) `msg!` event by `io_kind`.
+//   * `sol_log_compute_units!(N)` — emits the SBF VM's remaining-units
+//     counter.  Also a `TraceLogEvent` event but with a metadata-style
+//     `compute_units_remaining=<N>` payload the recorder parses out of
+//     the macro's single integer literal arg (the synthetic-snapshot
+//     pipeline can't observe the actual BPF VM counter).
+
+fn sol_log_data_compute_snapshots() -> (Vec<RegisterSnapshot>, Vec<(u64, &'static str, u32)>) {
+    // process_instruction body lives at lines 57..63:
+    //   line 58: let payload: u64 = 42;
+    //   line 59: msg!("about to log binary event");
+    //   line 60: sol_log_data!(&[b"event", &payload]);
+    //   line 61: sol_log_compute_units!(199500);
+    //   line 62: payload  (return)
+    let snaps = vec![
+        snap(0, &[(1, 42)]),
+        snap(1, &[(1, 42)]),
+        snap(2, &[(1, 42)]),
+        snap(3, &[(1, 42)]),
+        snap(4, &[(0, 42), (1, 42)]),
+    ];
+    let locs: Vec<(u64, &'static str, u32)> = vec![
+        (0, "sol_log_data_compute_test.rs", 58),
+        (1, "sol_log_data_compute_test.rs", 59),
+        (2, "sol_log_data_compute_test.rs", 60),
+        (3, "sol_log_data_compute_test.rs", 61),
+        (4, "sol_log_data_compute_test.rs", 62),
+    ];
+    (snaps, locs)
+}
+
+/// Decode every (io_kind, text) pair from io_events, in events order.
+/// Used by the `sol_log_data` / `sol_log_compute_units` test to assert
+/// that each macro shape surfaces with its expected `io_kind`
+/// distinguisher (sol_log_data → `ioStderr`, msg! → `ioStdout`).
+fn observed_io_kind_and_text(doc: &serde_json::Value) -> Vec<(String, String)> {
+    doc["events"]
+        .as_array()
+        .expect("events array")
+        .iter()
+        .filter(|e| e["kind"] == "io" || e["kind"] == "io_event")
+        .map(|e| {
+            let io_kind = e["io_kind"].as_str().unwrap_or("").to_string();
+            let text = e["text"]
+                .as_str()
+                .map(|s| s.to_string())
+                .or_else(|| e["content"].as_str().map(|s| s.to_string()))
+                .unwrap_or_default();
+            (io_kind, text)
+        })
+        .collect()
+}
+
+#[test]
+fn test_sol_log_data_compute_test_via_ct_print_full() {
+    let (snaps, locs) = sol_log_data_compute_snapshots();
+    let Some((doc, source_path)) = record_and_dump_full(
+        "test_sol_log_data_compute_test_via_ct_print_full",
+        "sol_log_data_compute_test.rs",
+        &snaps,
+        &locs,
+    ) else {
+        return;
+    };
+
+    assert_metadata_program_ends_with(&doc, &source_path);
+    assert_paths_contain(&doc, "sol_log_data_compute_test.rs");
+
+    let functions: Vec<&str> = doc["functions"]
+        .as_array()
+        .expect("functions array")
+        .iter()
+        .filter_map(|v| v.as_str())
+        .collect();
+    assert_eq!(functions, vec!["process_instruction"]);
+
+    let counts = &doc["counts"];
+    // 1 implicit start() + 5 distinct visited lines = 6 step events.
+    assert_eq!(counts["steps"].as_u64(), Some(6), "steps; counts={counts}");
+    assert_eq!(counts["calls"].as_u64(), Some(1), "calls; counts={counts}");
+    // Three io_events: msg!, sol_log_data!, sol_log_compute_units!.
+    assert_eq!(
+        counts["io_events"].as_u64(),
+        Some(3),
+        "io_events; counts={counts}"
+    );
+
+    let events = doc["events"].as_array().expect("events array");
+    // 6 steps + 1 call_entry + 1 call_exit + 3 io_events = 11 events.
+    assert_eq!(events.len(), 11, "events.len()");
+    assert_step_indices_monotonic(&doc);
+
+    // ----- io_kind partitioning + payload pinning --------------------------
+    // The strict pin asserts each macro form produces a distinct
+    // `(io_kind, text)` pair so the trace consumer can demux them.
+    let kinds_and_text = observed_io_kind_and_text(&doc);
+    assert_eq!(
+        kinds_and_text,
+        vec![
+            (
+                "ioStdout".to_string(),
+                "about to log binary event".to_string(),
+            ),
+            (
+                "ioStderr".to_string(),
+                "data:&[b\"event\", &payload]".to_string(),
+            ),
+            (
+                "ioStderr".to_string(),
+                "compute_units_remaining=199500".to_string(),
+            ),
+        ],
+        "msg! must surface as `Write`/`ioStdout`; both `sol_log_data!` \
+         and `sol_log_compute_units!` must surface as `TraceLogEvent`/\
+         `ioStderr` with their respective payloads (binary-log args + \
+         parsed compute-units integer)",
+    );
+}
+
+// ===========================================================================
+// M11: memory_borrow_test.rs
+// ===========================================================================
+//
+// Exercises the canonical account-data borrow + instruction-data
+// slice-indexing idioms.  After the recorder's
+// `is_borrowed_slice_rhs` extension:
+//
+//   * `let data = account.try_borrow_data().unwrap();` recognises the
+//     `try_borrow_data(` substring and surfaces `data` as
+//     `Sequence { is_slice: true }`.
+//   * `let prefix = &instruction_data[..32];` and
+//     `let rest = &instruction_data[32..];` recognise the
+//     `&IDENT[range]` slice-indexing shape and surface each as
+//     `Sequence { is_slice: true }`.
+//   * `let count = from_le_bytes_u64(&data);` produces a balanced
+//     Call/Return pair through the existing source-driven call-frame
+//     resolver — the helper's `u64::from_le_bytes(...)` body line is
+//     visited so the Call event surfaces with the helper's resolved
+//     name (NOT a `fn_at_pc_<pc>` placeholder).
+
+fn memory_borrow_snapshots() -> (Vec<RegisterSnapshot>, Vec<(u64, &'static str, u32)>) {
+    // process_instruction body lives at lines 58..64:
+    //   line 59: let data = account.try_borrow_data().unwrap();
+    //   line 60: let count = from_le_bytes_u64(&data);
+    //   line 61: let prefix = &instruction_data[..32];
+    //   line 62: let rest = &instruction_data[32..];
+    //   line 63: count + prefix.len() as u64 + rest.len() as u64
+    // from_le_bytes_u64 body lives at lines 52..54 (body line 53).
+    let snaps = vec![
+        snap(100, &[]),
+        snap(101, &[]),
+        // Helper visit: r0 set to 8 (the parsed u64 — first 8 bytes of
+        // a [8, 0, 0, 0, 0, 0, 0, 0, 99] data buffer).
+        snap(200, &[(0, 8)]),
+        snap(102, &[(0, 8), (1, 8)]),
+        snap(103, &[(0, 8), (1, 8)]),
+        snap(104, &[(0, 8), (1, 8)]),
+    ];
+    let locs: Vec<(u64, &'static str, u32)> = vec![
+        (100, "memory_borrow_test.rs", 59),
+        (101, "memory_borrow_test.rs", 60),
+        (200, "memory_borrow_test.rs", 53),
+        (102, "memory_borrow_test.rs", 61),
+        (103, "memory_borrow_test.rs", 62),
+        (104, "memory_borrow_test.rs", 63),
+    ];
+    (snaps, locs)
+}
+
+#[test]
+fn test_memory_borrow_test_via_ct_print_full() {
+    let (snaps, locs) = memory_borrow_snapshots();
+    let Some((doc, source_path)) = record_and_dump_full(
+        "test_memory_borrow_test_via_ct_print_full",
+        "memory_borrow_test.rs",
+        &snaps,
+        &locs,
+    ) else {
+        return;
+    };
+
+    assert_metadata_program_ends_with(&doc, &source_path);
+    assert_paths_contain(&doc, "memory_borrow_test.rs");
+
+    let functions: Vec<&str> = doc["functions"]
+        .as_array()
+        .expect("functions array")
+        .iter()
+        .filter_map(|v| v.as_str())
+        .collect();
+    assert_eq!(
+        functions,
+        vec!["process_instruction", "from_le_bytes_u64"],
+        "function table must surface the driver and the from_le_bytes \
+         helper resolved via SourceModel",
+    );
+
+    let counts = &doc["counts"];
+    // 1 implicit start() + 6 distinct visited lines = 7 step events.
+    assert_eq!(counts["steps"].as_u64(), Some(7), "steps; counts={counts}");
+    assert_eq!(
+        counts["functions"].as_u64(),
+        Some(2),
+        "functions; counts={counts}"
+    );
+    assert_eq!(
+        counts["calls"].as_u64(),
+        Some(2),
+        "calls; counts={counts} (driver + from_le_bytes_u64)"
+    );
+    // No msg! / panic! / Err / sol_log_* in the fixture body — the
+    // borrowed-slice + helper call shape must NOT surface any io_event.
+    assert_eq!(
+        counts["io_events"].as_u64(),
+        Some(0),
+        "io_events; counts={counts}"
+    );
+
+    let events = doc["events"].as_array().expect("events array");
+    // 7 steps + 2 call_entry + 2 call_exit + 0 io_events = 11 events.
+    assert_eq!(events.len(), 11, "events.len()");
+    assert_step_indices_monotonic(&doc);
+
+    // ----- Call / return shape pins from_le_bytes_u64 as a balanced pair ----
+    assert_eq!(
+        observed_call_sequence(&doc),
+        vec![
+            "process_instruction".to_string(),
+            "from_le_bytes_u64".to_string(),
+        ],
+        "call_entry order: driver first, then the from_le_bytes wrapper",
+    );
+    assert_eq!(
+        observed_exit_sequence(&doc),
+        vec![
+            "from_le_bytes_u64".to_string(),
+            "process_instruction".to_string(),
+        ],
+        "call_exit order: from_le_bytes_u64 unwinds before the driver",
+    );
+
+    // ----- The parsed integer surfaces in the r0 register at the helper's
+    // ----- return — same convention real SBF programs use (r0 carries the
+    // ----- callee return value).
+    let r0 = observed_register_sequence(&doc, "r0");
+    assert_eq!(
+        r0,
+        vec![0, 0, 8, 8, 8, 8],
+        "r0 must carry the parsed integer (8) once the helper has \
+         executed; the leading zeros are the pre-helper steps where r0 \
+         hasn't been written yet",
+    );
+
+    // ----- Borrowed slices surface as Sequence (NOT opaque pointers) ------
+    // Each let-binding in the driver hits the recorder's
+    // `is_borrowed_slice_rhs` recogniser and emits a typed Sequence
+    // (NOT a `Raw` placeholder / `String` pointer).  The Sequence's
+    // `is_slice` flag is hardcoded `false` at the Rust→Nim FFI boundary
+    // today (the FFI's `ct_value_begin_sequence` doesn't take an
+    // is_slice arg) — when that wiring lands the recorder will set
+    // it to `true`, but the strict pin's invariant is that the value
+    // surfaces as `Sequence` rather than `Raw`/`String`.
+    let compounds = observed_compound_vars(&doc);
+    let want_slice_vars = ["data", "prefix", "rest"];
+    for want in want_slice_vars.iter() {
+        let var = compounds
+            .iter()
+            .find(|(n, _)| n == want)
+            .unwrap_or_else(|| {
+                panic!(
+                    "expected `{want}` to surface as a compound variable; \
+                     got {compounds:?}"
+                )
+            });
+        assert_eq!(
+            var.1["kind"].as_str(),
+            Some("Sequence"),
+            "`{want}` must surface as a Sequence (NOT an opaque \
+             pointer); got {}",
+            var.1
+        );
+        // Pin the sequence has a present (possibly empty) elements
+        // array — this distinguishes Sequence from `Raw` (which has
+        // no `elements` field) without depending on the FFI's
+        // hardcoded is_slice false default.
+        assert!(
+            var.1["elements"].is_array(),
+            "`{want}` Sequence must carry an `elements` array; got {}",
+            var.1,
+        );
+        assert_eq!(
+            var.1["is_slice"].as_bool(),
+            Some(false),
+            "`{want}` Sequence's is_slice currently pins to false (FFI \
+             limitation — the Rust→Nim FFI's ct_value_begin_sequence \
+             doesn't yet accept the is_slice flag); got {}",
+            var.1,
+        );
+    }
+}
+
+// ===========================================================================
+// M11: spl_token_transfer_test.rs
+// ===========================================================================
+//
+// Exercises the canonical SPL Token CPI shape — building a
+// `spl_token::instruction::transfer(...)` Instruction and dispatching
+// it through `invoke(...)`.  The strict pin runs through
+// `record_with_cpi` (the CPI-aware recorder path) with a registry
+// that places the SPL Token program at a sibling PC range so the
+// Call event for the CPI carries the `target_program = "spl_token"`
+// arg the existing CPI-tagging machinery emits (see
+// `record_with_cpi`'s `target_program` / `target_pc` arg-staging in
+// `src/recorder.rs`).
+
+fn spl_token_transfer_snapshots() -> (Vec<RegisterSnapshot>, Vec<(u64, &'static str, u32)>) {
+    // process_instruction body lives at lines 92..101:
+    //   line 97: let amount: u64 = 1_000;
+    //   line 98: let ix = transfer(...);  (let-binding step)
+    //   line 99: invoke(&ix, &accounts)?; (CPI call site)
+    //   line 100: Ok(())                  (return)
+    // invoke body lives at lines 84..88 (body line 87 = `Ok(())`).
+    let snaps = vec![
+        snap(100, &[(1, 1_000)]),
+        snap(101, &[(1, 1_000)]),
+        snap(102, &[(1, 1_000)]),
+        snap(500, &[(1, 1_000)]),
+        snap(501, &[(0, 0), (1, 1_000)]),
+        snap(103, &[(0, 0), (1, 1_000)]),
+    ];
+    let locs: Vec<(u64, &'static str, u32)> = vec![
+        (100, "spl_token_transfer_test.rs", 97),
+        (101, "spl_token_transfer_test.rs", 98),
+        (102, "spl_token_transfer_test.rs", 99),
+        (500, "spl_token_transfer_test.rs", 85),
+        (501, "spl_token_transfer_test.rs", 87),
+        (103, "spl_token_transfer_test.rs", 100),
+    ];
+    (snaps, locs)
+}
+
+#[test]
+fn test_spl_token_transfer_test_via_ct_print_full() {
+    let Some(ct_print) = ct_print_or_skip("test_spl_token_transfer_test_via_ct_print_full") else {
+        return;
+    };
+    let (snaps, locs) = spl_token_transfer_snapshots();
+
+    // Primary program owns process_instruction PCs (100..200); the SPL
+    // Token program owns the CPI-target invoke body PCs (500..600).
+    let primary_locs: Vec<(u64, String, u32)> = locs
+        .iter()
+        .filter(|(pc, _, _)| *pc < 200)
+        .map(|(pc, f, l)| (*pc, f.to_string(), *l))
+        .collect();
+    let cpi_locs: Vec<(u64, String, u32)> = locs
+        .iter()
+        .filter(|(pc, _, _)| *pc >= 500)
+        .map(|(pc, f, l)| (*pc, f.to_string(), *l))
+        .collect();
+    let mut registry = ProgramRegistry::new();
+    registry.add_synthetic_program("primary", 0..200, primary_locs);
+    registry.add_synthetic_program("spl_token", 500..600, cpi_locs);
+
+    let mut detector = CpiDetector::new(0..200);
+    detector.add_program_range("spl_token", 500..600);
+
+    let tmp_dir = tempfile::tempdir().expect("tempdir");
+    let out_dir = tmp_dir.path().join("traces");
+    std::fs::create_dir_all(&out_dir).unwrap();
+    let source_path = test_programs_dir().join("spl_token_transfer_test.rs");
+    record_with_cpi(&snaps, &registry, &mut detector, &source_path, &out_dir)
+        .expect("record_with_cpi should succeed");
+
+    let ct_files: Vec<_> = std::fs::read_dir(&out_dir)
+        .expect("read out_dir")
+        .filter_map(|e| e.ok())
+        .map(|e| e.path())
+        .filter(|p| p.extension().is_some_and(|ext| ext == "ct"))
+        .collect();
+    assert!(
+        !ct_files.is_empty(),
+        "expected at least one .ct file in {}",
+        out_dir.display()
+    );
+    let output = Command::new(&ct_print)
+        .args(["--full", "--strip-paths"])
+        .arg(&ct_files[0])
+        .output()
+        .expect("failed to run ct-print --full");
+    assert!(
+        output.status.success(),
+        "ct-print --full should succeed; stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let doc: serde_json::Value =
+        serde_json::from_slice(&output.stdout).expect("ct-print --full should emit valid JSON");
+
+    assert_metadata_program_ends_with(&doc, &source_path);
+    assert_paths_contain(&doc, "spl_token_transfer_test.rs");
+
+    let functions: Vec<String> = doc["functions"]
+        .as_array()
+        .expect("functions array")
+        .iter()
+        .filter_map(|v| v.as_str().map(str::to_string))
+        .collect();
+    assert_eq!(
+        functions,
+        vec!["process_instruction".to_string(), "invoke".to_string()],
+        "function table: driver + the source-resolved CPI target name",
+    );
+
+    // ----- Call sequence: driver first, then the SPL Token CPI -------------
+    assert_eq!(
+        observed_call_sequence(&doc),
+        vec!["process_instruction".to_string(), "invoke".to_string()],
+        "call_entry order: driver first, then the SPL Token CPI target",
+    );
+    assert_eq!(
+        observed_exit_sequence(&doc),
+        vec!["invoke".to_string(), "process_instruction".to_string()],
+        "call_exit order is LIFO (CPI target unwinds before the caller)",
+    );
+
+    // ----- The CPI Call event carries the token-program-id tag -------------
+    // `record_with_cpi` stages `target_program` and `target_pc` as
+    // arg events immediately before the `register_call` for the CPI
+    // target — these surface in the trace as named locals at the CPI
+    // call's enclosing step.  The strict pin asserts:
+    //   * a `target_program` arg with text == "spl_token"
+    //   * a `target_pc` arg with the resolved CPI-target PC
+    let events = doc["events"].as_array().expect("events array");
+    // We don't pin events.len() because record_with_cpi's step
+    // accounting differs subtly from record_from_snapshots
+    // (the CPI path has its own register-step emission cadence).
+    // Instead pin the exact events that matter for the CPI tagging.
+    assert_step_indices_monotonic(&doc);
+
+    let target_program_args: Vec<&str> = events
+        .iter()
+        .filter(|e| e["kind"] == "step")
+        .flat_map(|e| {
+            e["vars"]
+                .as_array()
+                .map(|v| v.as_slice())
+                .unwrap_or(&[])
+                .iter()
+                .filter(|v| v["varname"].as_str() == Some("target_program"))
+                .filter_map(|v| v["value"]["text"].as_str())
+        })
+        .collect();
+    assert_eq!(
+        target_program_args,
+        vec!["spl_token"],
+        "exactly one `target_program` arg must surface, carrying the \
+         CPI target program name `spl_token` — this is the token-\
+         program-id-tagged CPI Call event the strict pin asserts",
+    );
+
+    let target_pc_values: Vec<i64> = events
+        .iter()
+        .filter(|e| e["kind"] == "step")
+        .flat_map(|e| {
+            e["vars"]
+                .as_array()
+                .map(|v| v.as_slice())
+                .unwrap_or(&[])
+                .iter()
+                .filter(|v| v["varname"].as_str() == Some("target_pc"))
+                .filter_map(|v| v["value"]["i"].as_i64())
+        })
+        .collect();
+    assert_eq!(
+        target_pc_values,
+        vec![500],
+        "the `target_pc` arg must carry the CPI target PC (500, where \
+         the SPL Token `invoke` body lives)",
+    );
+
+    // Note: the canonical SPL Token Transfer discriminator byte (3) is
+    // a `vec![3, ...]` literal inside the `transfer()` instruction
+    // builder body.  The synthetic-snapshot pipeline does not visit
+    // that helper body (only `process_instruction` and `invoke`), so
+    // the discriminator never reaches the recorder's vec!-literal
+    // recogniser and there is nothing strict to pin in the trace
+    // output.  The CPI shape is pinned strictly above via the
+    // `target_program == "spl_token"` and `target_pc == 500` args on
+    // the CPI Call event — those are the recorder-observable
+    // invariants for this fixture.
+
+// ----- amount surfaces as a u64 typed local in the driver --------------
+    // Line 78 — `let amount: u64 = 1_000;` — drives the recorder's
+    // existing register-let-binding env so r1 carries the value.  The
+    // strict pin asserts r1 carries 1_000 on every visited snapshot
+    // (six entries, one per snap, all seeded with r1=1_000).
+    assert_eq!(
+        observed_register_sequence(&doc, "r1"),
+        vec![1_000_i64, 1_000, 1_000, 1_000, 1_000, 1_000],
+        "amount=1_000 must surface in r1 on every visited snapshot",
+    );
+}
