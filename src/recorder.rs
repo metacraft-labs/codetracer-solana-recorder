@@ -1376,9 +1376,65 @@ fn synthesise_step_events(
         let payload = extract_err_payload(text).unwrap_or_else(|| "<Err>".to_string());
         TraceWriter::register_special_event(writer, EventLogKind::Error, "SolanaError", &payload);
     }
+    // `sol_log_data!(...)` — Solana's binary log syscall, distinct from
+    // `msg!`.  The args are an arbitrary `&[&[u8]]` slice expression
+    // (e.g. `&[b"event", &payload]`) we don't try to interpret in the
+    // synthetic-snapshot pipeline.  Surfaced as a `TraceLogEvent`
+    // io_event tagged `SolanaLogData` with a `data:<source-text>` payload
+    // so the strict pin can distinguish it from a `Write`-tagged
+    // `msg!` event by `io_kind` (TraceLogEvent maps to `ioStderr` in
+    // the multi-stream IO event stream).
+    if text.contains("sol_log_data!(") {
+        let payload = extract_macro_args_raw(text, "sol_log_data")
+            .map(|a| format!("data:{a}"))
+            .unwrap_or_else(|| "<sol_log_data>".to_string());
+        TraceWriter::register_special_event(
+            writer,
+            EventLogKind::TraceLogEvent,
+            "SolanaLogData",
+            &payload,
+        );
+    }
+    // `sol_log_compute_units!(<remaining>)` — Solana's compute-units
+    // metering syscall.  The synthetic-snapshot pipeline can't observe
+    // the BPF VM's actual remaining-units counter, so the fixture
+    // stand-in macro carries the canonical value in its single integer
+    // literal arg; the recorder parses it out and emits a metadata-style
+    // `TraceLogEvent` event tagged `SolanaCompute` with the
+    // `compute_units_remaining=<N>` payload.
+    if text.contains("sol_log_compute_units!(") {
+        let payload = extract_macro_args_raw(text, "sol_log_compute_units")
+            .and_then(|a| {
+                let trimmed = a.trim();
+                trimmed.parse::<i64>().ok().map(|n| n.to_string())
+            })
+            .map(|n| format!("compute_units_remaining={n}"))
+            .unwrap_or_else(|| "compute_units_remaining=?".to_string());
+        TraceWriter::register_special_event(
+            writer,
+            EventLogKind::TraceLogEvent,
+            "SolanaCompute",
+            &payload,
+        );
+    }
 
     // Typed structured-value let-bindings.
     if let (Some(name), Some(rhs)) = (extract_let_lhs(text), extract_let_rhs(text)) {
+        // Borrowed-slice / slice-indexing patterns — surface as a
+        // `Sequence { is_slice: true }` so the strict pin can
+        // distinguish them from opaque pointers.  Checked first so an
+        // RHS like `&instruction_data[..32]` doesn't accidentally fall
+        // through to the array-literal detector (which would try to
+        // parse the contents of the `[..]` as csv).
+        if is_borrowed_slice_rhs(rhs) {
+            let value = ValueRecord::Sequence {
+                elements: Vec::new(),
+                is_slice: true,
+                type_id: type_ids.seq,
+            };
+            TraceWriter::register_variable_with_full_value(writer, name, value);
+            return;
+        }
         // Enum-variant construction — `MyInstruction::Init { lamports: 500 }`,
         // `MyInstruction::Update(7)`, `MyInstruction::Close`.  Checked
         // before the struct-literal branch because `Name::Variant { .. }`
@@ -1493,6 +1549,50 @@ fn starts_with_err_literal(text: &str) -> bool {
     text.starts_with("Err(")
 }
 
+/// Extract the raw inside-parens text of `<macro_name>!(...)`.  Unlike
+/// [`extract_macro_call`], this does NOT try to parse out a leading
+/// `"format"` string literal — it returns the entire arg expression
+/// verbatim (with leading/trailing whitespace stripped).  Used by the
+/// `sol_log_data!` / `sol_log_compute_units!` recognisers where the
+/// argument is a slice / int literal (no format-string semantics).
+fn extract_macro_args_raw(text: &str, macro_name: &str) -> Option<String> {
+    let needle = format!("{macro_name}!(");
+    let idx = text.find(&needle)?;
+    let after = &text[idx + needle.len()..];
+    // Walk to the matching `)` with depth balance, ignoring `(` / `)`
+    // inside `"..."` strings.
+    let mut depth: i32 = 1;
+    let mut end_byte = after.len();
+    let mut in_string = false;
+    let mut prev: char = ' ';
+    for (i, c) in after.char_indices() {
+        if in_string {
+            if c == '"' && prev != '\\' {
+                in_string = false;
+            }
+            prev = c;
+            continue;
+        }
+        match c {
+            '"' => in_string = true,
+            '(' => depth += 1,
+            ')' => {
+                depth -= 1;
+                if depth == 0 {
+                    end_byte = i;
+                    break;
+                }
+            }
+            _ => {}
+        }
+        prev = c;
+    }
+    if depth != 0 {
+        return None;
+    }
+    Some(after[..end_byte].trim().to_string())
+}
+
 fn extract_err_payload(text: &str) -> Option<String> {
     let idx = text.find("Err(")?;
     let after = &text[idx + 4..];
@@ -1516,6 +1616,52 @@ fn extract_err_payload(text: &str) -> Option<String> {
         return None;
     }
     Some(after[..end].to_string())
+}
+
+/// Recognise a borrowed-slice / slice-indexing / `try_borrow_data()`
+/// RHS so the let-binding surfaces as a `Sequence { is_slice: true }`
+/// rather than being silently dropped by the value-literal detector.
+///
+/// Recognised forms (canonical native-Solana account-data idioms):
+///   * `&IDENT[range]` / `&mut IDENT[range]` — slice-indexing into
+///     `instruction_data` (`&data[..32]`, `&data[32..]`, `&data[A..B]`).
+///   * `*.try_borrow_data()` / `*.try_borrow_mut_data()` — the canonical
+///     `RefCell`-wrapped account-data borrow, optionally followed by
+///     `.unwrap()` / `?` / `.expect(..)` chains.  We only need the
+///     leading `try_borrow_data(` substring to recognise the shape.
+fn is_borrowed_slice_rhs(rhs: &str) -> bool {
+    let trimmed = rhs.trim();
+    // `*.try_borrow_data(` / `*.try_borrow_mut_data(` — chained method
+    // call on an account info or similar.  We accept arbitrary trailing
+    // text (e.g. `.unwrap()` / `?`) so the test fixture's
+    // `account.try_borrow_data().unwrap()` shape matches.
+    if trimmed.contains(".try_borrow_data(") || trimmed.contains(".try_borrow_mut_data(") {
+        return true;
+    }
+    // `&IDENT[range]` / `&mut IDENT[range]` — slice-indexing.  Strip
+    // the leading `&` (and optional `mut `) then look for an identifier
+    // followed by `[<range>]`.  The range MUST contain `..` so we don't
+    // accidentally match a single-element index `xs[i]` (which is an
+    // element access, not a slice).
+    let body = trimmed.strip_prefix('&').unwrap_or(trimmed);
+    let body = body.strip_prefix("mut ").unwrap_or(body);
+    if let Some(open) = body.find('[') {
+        // Identifier-only prefix.
+        let ident = body[..open].trim();
+        let is_ident =
+            !ident.is_empty() && ident.chars().all(|c| c.is_ascii_alphanumeric() || c == '_');
+        if is_ident {
+            // Locate the matching `]` and check the content includes `..`.
+            let after = &body[open + 1..];
+            if let Some(close) = after.find(']') {
+                let inside = &after[..close];
+                if inside.contains("..") {
+                    return true;
+                }
+            }
+        }
+    }
+    false
 }
 
 fn extract_array_or_vec_literal(rhs: &str) -> Option<&str> {
