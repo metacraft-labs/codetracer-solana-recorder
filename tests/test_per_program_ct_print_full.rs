@@ -146,8 +146,8 @@ fn record_and_dump_full(
         String::from_utf8_lossy(&output.stderr)
     );
 
-    let doc: serde_json::Value = serde_json::from_slice(&output.stdout)
-        .expect("ct-print --full should emit valid JSON");
+    let doc: serde_json::Value =
+        serde_json::from_slice(&output.stdout).expect("ct-print --full should emit valid JSON");
 
     drop(tmp_dir);
     Some((doc, source_path))
@@ -607,7 +607,11 @@ fn test_nested_calls_test_via_ct_print_full() {
     //            model so it does NOT add a fifth call.
     let counts = &doc["counts"];
     assert_eq!(counts["steps"].as_u64(), Some(9), "steps; counts={counts}");
-    assert_eq!(counts["functions"].as_u64(), Some(4), "functions; counts={counts}");
+    assert_eq!(
+        counts["functions"].as_u64(),
+        Some(4),
+        "functions; counts={counts}"
+    );
     assert_eq!(counts["calls"].as_u64(), Some(4), "calls; counts={counts}");
     assert_eq!(
         counts["io_events"].as_u64(),
@@ -624,19 +628,13 @@ fn test_nested_calls_test_via_ct_print_full() {
     assert_eq!(events.len(), 17, "events.len()");
     assert_step_indices_monotonic(&doc);
 
-    let call_exit_count = events
-        .iter()
-        .filter(|e| e["kind"] == "call_exit")
-        .count();
+    let call_exit_count = events.iter().filter(|e| e["kind"] == "call_exit").count();
     assert_eq!(
         call_exit_count, 4,
         "expected exactly 4 call_exit events; got {call_exit_count}"
     );
 
-    let step_event_count = events
-        .iter()
-        .filter(|e| e["kind"] == "step")
-        .count();
+    let step_event_count = events.iter().filter(|e| e["kind"] == "step").count();
     assert_eq!(
         step_event_count, 9,
         "expected exactly 9 step events in the events array; got {step_event_count}"
@@ -815,11 +813,23 @@ fn test_collections_test_via_ct_print_full() {
 
     // ----- Canonical collection results -----------------------------------
     let r1 = observed_register_sequence(&doc, "r1");
-    assert!(r1.contains(&10), "xs_total=10 must surface in r1; got {:?}", r1);
+    assert!(
+        r1.contains(&10),
+        "xs_total=10 must surface in r1; got {:?}",
+        r1
+    );
     let r2 = observed_register_sequence(&doc, "r2");
-    assert!(r2.contains(&30), "pair_total=30 must surface in r2; got {:?}", r2);
+    assert!(
+        r2.contains(&30),
+        "pair_total=30 must surface in r2; got {:?}",
+        r2
+    );
     let r3 = observed_register_sequence(&doc, "r3");
-    assert!(r3.contains(&25), "dist_sq=25 must surface in r3; got {:?}", r3);
+    assert!(
+        r3.contains(&25),
+        "dist_sq=25 must surface in r3; got {:?}",
+        r3
+    );
     let r4 = observed_register_sequence(&doc, "r4");
     assert!(
         r4.contains(&65),
@@ -868,7 +878,9 @@ fn test_collections_test_via_ct_print_full() {
         .find(|(n, _)| n == "p")
         .expect("p must surface as a compound variable");
     assert_eq!(p.1["kind"].as_str(), Some("Struct"));
-    let p_fields = p.1["field_values"].as_array().expect("p.field_values array");
+    let p_fields = p.1["field_values"]
+        .as_array()
+        .expect("p.field_values array");
     let p_ints: Vec<i64> = p_fields
         .iter()
         .map(|e| e["i"].as_i64().expect("p field must be Int.i"))
@@ -987,7 +999,10 @@ fn test_error_paths_test_via_ct_print_full() {
     assert_eq!(events.len(), 10, "events.len()");
     assert_step_indices_monotonic(&doc);
 
-    assert_eq!(observed_call_sequence(&doc), vec!["safe_compute".to_string()]);
+    assert_eq!(
+        observed_call_sequence(&doc),
+        vec!["safe_compute".to_string()]
+    );
 
     // ----- Canonical safe-path values -------------------------------------
     let r1 = observed_register_sequence(&doc, "r1");
@@ -997,7 +1012,11 @@ fn test_error_paths_test_via_ct_print_full() {
     let r3 = observed_register_sequence(&doc, "r3");
     assert!(r3.contains(&12), "c=12 must surface in r3; got {:?}", r3);
     let r4 = observed_register_sequence(&doc, "r4");
-    assert!(r4.contains(&112), "bumped=112 must surface in r4; got {:?}", r4);
+    assert!(
+        r4.contains(&112),
+        "bumped=112 must surface in r4; got {:?}",
+        r4
+    );
     let r0 = observed_register_sequence(&doc, "r0");
     assert!(
         r0.last().copied() == Some(112),
@@ -1110,9 +1129,17 @@ fn test_msg_log_test_via_ct_print_full() {
     let r2 = observed_register_sequence(&doc, "r2");
     assert!(r2.contains(&5), "b=5 must surface in r2; got {:?}", r2);
     let r3 = observed_register_sequence(&doc, "r3");
-    assert!(r3.contains(&9), "sum_val=9 must surface in r3; got {:?}", r3);
+    assert!(
+        r3.contains(&9),
+        "sum_val=9 must surface in r3; got {:?}",
+        r3
+    );
     let r4 = observed_register_sequence(&doc, "r4");
-    assert!(r4.contains(&18), "doubled=18 must surface in r4; got {:?}", r4);
+    assert!(
+        r4.contains(&18),
+        "doubled=18 must surface in r4; got {:?}",
+        r4
+    );
     let r0 = observed_register_sequence(&doc, "r0");
     assert!(
         r0.last().copied() == Some(18),
@@ -1167,7 +1194,10 @@ fn account_processing_snapshots() -> (Vec<RegisterSnapshot>, Vec<(u64, &'static 
         snap(1, &[(1, 1000), (2, 42), (3, 1), (4, 1000)]),
         snap(2, &[(1, 1000), (2, 42), (3, 1), (4, 1000), (5, 750)]),
         snap(3, &[(1, 750), (2, 42), (3, 1), (4, 1000), (5, 750)]),
-        snap(4, &[(0, 750), (1, 750), (2, 42), (3, 1), (4, 1000), (5, 750)]),
+        snap(
+            4,
+            &[(0, 750), (1, 750), (2, 42), (3, 1), (4, 1000), (5, 750)],
+        ),
     ];
     let locs: Vec<(u64, &'static str, u32)> = vec![
         (0, "account_processing_test.rs", 45),
@@ -1217,7 +1247,10 @@ fn test_account_processing_test_via_ct_print_full() {
     assert_eq!(events.len(), 8, "events.len()");
     assert_step_indices_monotonic(&doc);
 
-    assert_eq!(observed_call_sequence(&doc), vec!["process_transfer".to_string()]);
+    assert_eq!(
+        observed_call_sequence(&doc),
+        vec!["process_transfer".to_string()]
+    );
 
     // ----- Canonical account-read / account-write values ------------------
     // r1 traces the balance: starts 1000, ends 750 after write_balance.
@@ -1261,7 +1294,9 @@ fn test_account_processing_test_via_ct_print_full() {
         .find(|(n, _)| n == "account")
         .expect("account must surface as a compound variable");
     assert_eq!(account.1["kind"].as_str(), Some("Struct"));
-    let fields = account.1["field_values"].as_array().expect("field_values array");
+    let fields = account.1["field_values"]
+        .as_array()
+        .expect("field_values array");
     let field_ints: Vec<i64> = fields
         .iter()
         .map(|e| e["i"].as_i64().expect("AccountInfo field must be Int.i"))
@@ -1336,8 +1371,7 @@ fn test_step_count_helper_matches_counts_field() {
 // where `contents` is a `Struct` carrying the field values — the
 // recorder's first emission of a `Variant`-typed local.
 
-fn instruction_enum_dispatch_snapshots()
--> (Vec<RegisterSnapshot>, Vec<(u64, &'static str, u32)>) {
+fn instruction_enum_dispatch_snapshots() -> (Vec<RegisterSnapshot>, Vec<(u64, &'static str, u32)>) {
     // process_instruction() body in instruction_enum_dispatch_test.rs:
     //   line 61: let discriminator = instruction_data[0];   r1 = 0
     //   line 62: let init = MyInstruction::Init { lamports: 500 };
@@ -1409,11 +1443,7 @@ fn test_instruction_enum_dispatch_test_via_ct_print_full() {
         "r2 must surface handle_init(500) -> 501",
     );
     let r0 = observed_register_sequence(&doc, "r0");
-    assert_eq!(
-        r0,
-        vec![0, 0, 0, 501],
-        "r0 (return) must end at 501",
-    );
+    assert_eq!(r0, vec![0, 0, 0, 501], "r0 (return) must end at 501",);
 
     // ----- Variant decode --------------------------------------------------
     // The `let init = MyInstruction::Init { lamports: 500 };` step
@@ -1481,8 +1511,7 @@ fn test_instruction_enum_dispatch_variant_kinds_present() {
 // today and would emit `fn_at_pc_<pc>` placeholders.  The sibling
 // `#[ignore]`d test below documents that gap.
 
-fn cpi_invoke_signed_snapshots()
--> (Vec<RegisterSnapshot>, Vec<(u64, &'static str, u32)>) {
+fn cpi_invoke_signed_snapshots() -> (Vec<RegisterSnapshot>, Vec<(u64, &'static str, u32)>) {
     // process_instruction body lives at lines 108..119:
     //   line 109: let program_id = SYSTEM_PROGRAM_ID;
     //   line 114: let ix = create_account(payer, &pda, ..);
@@ -1550,7 +1579,11 @@ fn test_cpi_invoke_signed_test_via_ct_print_full() {
     let counts = &doc["counts"];
     // 1 implicit start() + 7 distinct lines = 8 step events.
     assert_eq!(counts["steps"].as_u64(), Some(8), "steps; counts={counts}");
-    assert_eq!(counts["functions"].as_u64(), Some(2), "functions; counts={counts}");
+    assert_eq!(
+        counts["functions"].as_u64(),
+        Some(2),
+        "functions; counts={counts}"
+    );
     assert_eq!(counts["calls"].as_u64(), Some(2), "calls; counts={counts}");
     // The fixture has one `msg!(...)` invocation (line 115).
     assert_eq!(
@@ -1657,8 +1690,8 @@ fn test_cpi_invoke_signed_source_model_pin() {
         "ct-print --full should succeed; stderr: {}",
         String::from_utf8_lossy(&output.stderr)
     );
-    let doc: serde_json::Value = serde_json::from_slice(&output.stdout)
-        .expect("ct-print --full should emit valid JSON");
+    let doc: serde_json::Value =
+        serde_json::from_slice(&output.stdout).expect("ct-print --full should emit valid JSON");
 
     let functions: Vec<String> = doc["functions"]
         .as_array()
@@ -1692,8 +1725,7 @@ fn test_cpi_invoke_signed_source_model_pin() {
 // macro-expanded `__handler` shim) so the call trace surfaces the
 // user-written handler name.
 
-fn anchor_program_snapshots()
--> (Vec<RegisterSnapshot>, Vec<(u64, &'static str, u32)>) {
+fn anchor_program_snapshots() -> (Vec<RegisterSnapshot>, Vec<(u64, &'static str, u32)>) {
     // process_instruction body (lines 99..107):
     //   line 100: let ctx = Context { program_id: 1, bump: 254, signer: 7 };
     //   line 105: let result = initialize(ctx, 5);
@@ -1755,7 +1787,11 @@ fn test_anchor_program_test_via_ct_print_full() {
     let counts = &doc["counts"];
     // 1 implicit start() + 7 distinct lines = 8 step events.
     assert_eq!(counts["steps"].as_u64(), Some(8), "steps; counts={counts}");
-    assert_eq!(counts["functions"].as_u64(), Some(2), "functions; counts={counts}");
+    assert_eq!(
+        counts["functions"].as_u64(),
+        Some(2),
+        "functions; counts={counts}"
+    );
     assert_eq!(counts["calls"].as_u64(), Some(2), "calls; counts={counts}");
     // The fixture has one `msg!(...)` invocation on a visited line (81).
     assert_eq!(
@@ -1771,10 +1807,7 @@ fn test_anchor_program_test_via_ct_print_full() {
 
     assert_eq!(
         observed_call_sequence(&doc),
-        vec![
-            "process_instruction".to_string(),
-            "initialize".to_string(),
-        ],
+        vec!["process_instruction".to_string(), "initialize".to_string(),],
     );
 
     // ----- Context struct decode ------------------------------------------
@@ -1837,8 +1870,7 @@ fn test_anchor_program_handler_name_resolved() {
 // surfaces as `ValueRecord::Sequence` and that the bump byte surfaces
 // as the final `r0` Int.
 
-fn pda_derivation_snapshots()
--> (Vec<RegisterSnapshot>, Vec<(u64, &'static str, u32)>) {
+fn pda_derivation_snapshots() -> (Vec<RegisterSnapshot>, Vec<(u64, &'static str, u32)>) {
     // derive_vault_pda body (lines 57..67):
     //   line 58: let seeds: [i64; 3] = [1, 2, 3];            (Sequence)
     //   line 59: let (pda, bump) = find_program_address(..); r1 = 253
@@ -1901,7 +1933,10 @@ fn test_pda_derivation_test_seeds_and_bump_recorded() {
     assert_eq!(events.len(), 9, "events.len()");
     assert_step_indices_monotonic(&doc);
 
-    assert_eq!(observed_call_sequence(&doc), vec!["derive_vault_pda".to_string()]);
+    assert_eq!(
+        observed_call_sequence(&doc),
+        vec!["derive_vault_pda".to_string()]
+    );
 
     // ----- Seed list as Sequence ------------------------------------------
     // The `let seeds: [i64; 3] = [1, 2, 3];` step surfaces the array
@@ -1912,7 +1947,9 @@ fn test_pda_derivation_test_seeds_and_bump_recorded() {
         .find(|(n, _)| n == "seeds")
         .expect("seeds must surface as a compound variable");
     assert_eq!(seeds.1["kind"].as_str(), Some("Sequence"));
-    let seed_elements = seeds.1["elements"].as_array().expect("seeds.elements array");
+    let seed_elements = seeds.1["elements"]
+        .as_array()
+        .expect("seeds.elements array");
     let seed_ints: Vec<i64> = seed_elements
         .iter()
         .map(|e| e["i"].as_i64().expect("seed element must be Int.i"))
@@ -1948,8 +1985,7 @@ fn test_pda_derivation_test_seeds_and_bump_recorded() {
 // content); the `#[ignore]`d sibling pins the spec-correct
 // substituted-text expectation.
 
-fn msg_format_args_snapshots()
--> (Vec<RegisterSnapshot>, Vec<(u64, &'static str, u32)>) {
+fn msg_format_args_snapshots() -> (Vec<RegisterSnapshot>, Vec<(u64, &'static str, u32)>) {
     // compute(100, 50) body in msg_format_args_test.rs (lines 25..32):
     //   line 26: msg!("balance: {}", balance)                  -> io_event
     //   line 27: let new_balance = balance + delta;  r2 = 150
@@ -2063,11 +2099,23 @@ fn test_msg_format_args_test_via_ct_print_full() {
     // values still appear in the per-step register stream so a debugger
     // can correlate the placeholder with the local at the call site.
     let r1 = observed_register_sequence(&doc, "r1");
-    assert!(r1.contains(&100), "balance=100 must surface in r1; got {:?}", r1);
+    assert!(
+        r1.contains(&100),
+        "balance=100 must surface in r1; got {:?}",
+        r1
+    );
     let r2 = observed_register_sequence(&doc, "r2");
-    assert!(r2.contains(&150), "new_balance=150 must surface in r2; got {:?}", r2);
+    assert!(
+        r2.contains(&150),
+        "new_balance=150 must surface in r2; got {:?}",
+        r2
+    );
     let r3 = observed_register_sequence(&doc, "r3");
-    assert!(r3.contains(&300), "doubled=300 must surface in r3; got {:?}", r3);
+    assert!(
+        r3.contains(&300),
+        "doubled=300 must surface in r3; got {:?}",
+        r3
+    );
     let r0 = observed_register_sequence(&doc, "r0");
     assert_eq!(
         r0.last().copied(),
@@ -2100,5 +2148,877 @@ fn test_msg_format_args_interpolated() {
         ],
         "io_event payloads must contain the substituted runtime values \
          when the format-arg interpolation path lands"
+    );
+}
+
+// ===========================================================================
+// M11: nested_struct_test.rs
+// ===========================================================================
+//
+// Exercises the recorder's parse_struct_literal extension: nested
+// struct literals, string-literal fields, `Vec<T>` element lists, and
+// `Pubkey::default()` placeholders all decode through the recursive
+// `decode_value_literal` path instead of being silently dropped (the
+// pre-M11 int/bool-only behaviour).  The strict pin asserts that
+// `let outer = Outer { ... };` surfaces a `Struct` whose three fields
+// decode as `Struct` (nested Inner), `Sequence` (vec items), and
+// `String` (Pubkey::default placeholder) respectively.
+
+fn nested_struct_snapshots() -> (Vec<RegisterSnapshot>, Vec<(u64, &'static str, u32)>) {
+    // process_instruction body in nested_struct_test.rs:
+    //   line 62: let outer = Outer {                (multi-line literal)
+    //   ...
+    //   line 67: msg!("{:?}", outer);
+    //   line 68: outer.inner.count                  (return)
+    let snaps = vec![
+        snap(0, &[(1, 7)]),
+        snap(1, &[(1, 7)]),
+        snap(2, &[(0, 7), (1, 7)]),
+    ];
+    let locs: Vec<(u64, &'static str, u32)> = vec![
+        (0, "nested_struct_test.rs", 62),
+        (1, "nested_struct_test.rs", 67),
+        (2, "nested_struct_test.rs", 68),
+    ];
+    (snaps, locs)
+}
+
+#[test]
+fn test_nested_struct_test_via_ct_print_full() {
+    let (snaps, locs) = nested_struct_snapshots();
+    let Some((doc, source_path)) = record_and_dump_full(
+        "test_nested_struct_test_via_ct_print_full",
+        "nested_struct_test.rs",
+        &snaps,
+        &locs,
+    ) else {
+        return;
+    };
+
+    assert_metadata_program_ends_with(&doc, &source_path);
+    assert_paths_contain(&doc, "nested_struct_test.rs");
+
+    let functions: Vec<&str> = doc["functions"]
+        .as_array()
+        .expect("functions array")
+        .iter()
+        .filter_map(|v| v.as_str())
+        .collect();
+    assert_eq!(functions, vec!["process_instruction"]);
+
+    let counts = &doc["counts"];
+    // 1 implicit start() + 3 distinct lines = 4 step events.
+    assert_eq!(counts["steps"].as_u64(), Some(4), "steps; counts={counts}");
+    assert_eq!(counts["calls"].as_u64(), Some(1), "calls; counts={counts}");
+    // One msg!(...) on line 67.
+    assert_eq!(
+        counts["io_events"].as_u64(),
+        Some(1),
+        "io_events; counts={counts}"
+    );
+
+    let events = doc["events"].as_array().expect("events array");
+    // 4 steps + 1 call_entry + 1 call_exit + 1 io_event = 7 events.
+    assert_eq!(events.len(), 7, "events.len()");
+    assert_step_indices_monotonic(&doc);
+
+    assert_eq!(
+        observed_call_sequence(&doc),
+        vec!["process_instruction".to_string()],
+    );
+
+    // ----- Outer struct decode --------------------------------------------
+    // The visited step at line 62 stitches the multi-line `Outer { .. }`
+    // literal back into one expression, then `parse_struct_literal_rich`
+    // recursively decodes each field via `decode_value_literal`.
+    let compounds = observed_compound_vars(&doc);
+    let outer = compounds
+        .iter()
+        .find(|(n, _)| n == "outer")
+        .expect("outer must surface as a compound variable");
+    assert_eq!(outer.1["kind"].as_str(), Some("Struct"));
+    let fields = outer.1["field_values"]
+        .as_array()
+        .expect("outer.field_values array");
+    assert_eq!(
+        fields.len(),
+        3,
+        "Outer has three fields (inner, items, owner); got {fields:?}"
+    );
+
+    // field 0 — `inner: Inner { count: 7, label: "hi" }` — recursive Struct.
+    let inner = &fields[0];
+    assert_eq!(inner["kind"].as_str(), Some("Struct"));
+    let inner_fields = inner["field_values"]
+        .as_array()
+        .expect("inner.field_values array");
+    assert_eq!(
+        inner_fields.len(),
+        2,
+        "Inner has two fields (count, label); got {inner_fields:?}"
+    );
+    assert_eq!(inner_fields[0]["kind"].as_str(), Some("Int"));
+    assert_eq!(inner_fields[0]["i"].as_i64(), Some(7));
+    assert_eq!(inner_fields[1]["kind"].as_str(), Some("String"));
+    assert_eq!(inner_fields[1]["text"].as_str(), Some("hi"));
+
+    // field 1 — `items: vec![1, 2, 3]` — Sequence of Int.
+    let items = &fields[1];
+    assert_eq!(items["kind"].as_str(), Some("Sequence"));
+    assert_eq!(items["is_slice"].as_bool(), Some(false));
+    let item_elements = items["elements"].as_array().expect("items.elements array");
+    let item_ints: Vec<i64> = item_elements
+        .iter()
+        .map(|e| e["i"].as_i64().expect("items element must be Int.i"))
+        .collect();
+    assert_eq!(item_ints, vec![1, 2, 3]);
+
+    // field 2 — `owner: Pubkey::default()` — String placeholder.
+    let owner = &fields[2];
+    assert_eq!(owner["kind"].as_str(), Some("String"));
+    assert_eq!(
+        owner["text"].as_str(),
+        Some("11111111111111111111111111111111"),
+        "Pubkey::default() decodes as the canonical base58 all-zeros key",
+    );
+}
+
+// ===========================================================================
+// M11: signer_owner_validation_test.rs
+// ===========================================================================
+//
+// Three canonical pre-execution validation checks every native handler
+// runs (signer / owner / lamports).  Each check lives in its own
+// helper function returning `Result<(), ProgramError>`; the test
+// driver calls all three so the snapshot stream exercises three
+// forward fn-boundary jumps and three matching backward unwinds.
+//
+// After the recorder's `synthesise_return_value` extension, every
+// `return Err(..)` line surfaces:
+//   * an `EventLogKind::Error` io_event whose payload contains the
+//     variant name (`ProgramError::MissingRequiredSignature` etc.),
+//   * a `register_return` carrying a typed `Result`-shaped Variant
+//     whose discriminator is "Err" and whose contents is a nested
+//     Variant wrapping the unit-variant `ProgramError`.
+
+fn signer_owner_validation_snapshots() -> (Vec<RegisterSnapshot>, Vec<(u64, &'static str, u32)>) {
+    // process_instruction body lives at lines 76..81:
+    //   line 77: let _ = check_signer(payer);
+    //   line 78: let _ = check_owner(account, program_id);
+    //   line 79: let _ = check_lamports(account);
+    //   line 80: 0  (return)
+    // check_signer body lives at 47..52:
+    //   line 49: return Err(ProgramError::MissingRequiredSignature);
+    // check_owner body lives at 56..61:
+    //   line 58: return Err(ProgramError::IllegalOwner);
+    // check_lamports body lives at 65..70:
+    //   line 67: return Err(ProgramError::InsufficientFunds);
+    let snaps = vec![
+        snap(100, &[]),
+        snap(200, &[]),
+        snap(201, &[]),
+        snap(101, &[]),
+        snap(300, &[]),
+        snap(301, &[]),
+        snap(102, &[]),
+        snap(400, &[]),
+        snap(401, &[]),
+        snap(103, &[(0, 0)]),
+    ];
+    let locs: Vec<(u64, &'static str, u32)> = vec![
+        (100, "signer_owner_validation_test.rs", 77),
+        (200, "signer_owner_validation_test.rs", 49),
+        (201, "signer_owner_validation_test.rs", 49),
+        (101, "signer_owner_validation_test.rs", 78),
+        (300, "signer_owner_validation_test.rs", 58),
+        (301, "signer_owner_validation_test.rs", 58),
+        (102, "signer_owner_validation_test.rs", 79),
+        (400, "signer_owner_validation_test.rs", 67),
+        (401, "signer_owner_validation_test.rs", 67),
+        (103, "signer_owner_validation_test.rs", 80),
+    ];
+    (snaps, locs)
+}
+
+#[test]
+fn test_signer_owner_validation_test_via_ct_print_full() {
+    let (snaps, locs) = signer_owner_validation_snapshots();
+    let Some((doc, source_path)) = record_and_dump_full(
+        "test_signer_owner_validation_test_via_ct_print_full",
+        "signer_owner_validation_test.rs",
+        &snaps,
+        &locs,
+    ) else {
+        return;
+    };
+
+    assert_metadata_program_ends_with(&doc, &source_path);
+    assert_paths_contain(&doc, "signer_owner_validation_test.rs");
+
+    let functions: Vec<&str> = doc["functions"]
+        .as_array()
+        .expect("functions array")
+        .iter()
+        .filter_map(|v| v.as_str())
+        .collect();
+    assert_eq!(
+        functions,
+        vec![
+            "process_instruction",
+            "check_signer",
+            "check_owner",
+            "check_lamports",
+        ],
+        "function table must surface all four resolved fn names \
+         (driver + three validation helpers)",
+    );
+
+    let counts = &doc["counts"];
+    // Distinct visited lines across the snapshot stream:
+    //   line 77, 49, 78, 58, 79, 67, 80 = 7 lines
+    // + 1 implicit start() step at line 1 = 8 step events.
+    // (PCs that map to the same line collapse to one step thanks to
+    // the recorder's prev_line dedupe.)
+    assert_eq!(counts["steps"].as_u64(), Some(8), "steps; counts={counts}");
+    assert_eq!(
+        counts["functions"].as_u64(),
+        Some(4),
+        "functions; counts={counts}"
+    );
+    assert_eq!(
+        counts["calls"].as_u64(),
+        Some(4),
+        "calls; counts={counts} (driver + three helpers)"
+    );
+    // Three `return Err(..)` lines, each emitting a SolanaError io_event.
+    assert_eq!(
+        counts["io_events"].as_u64(),
+        Some(3),
+        "io_events; counts={counts}"
+    );
+
+    let events = doc["events"].as_array().expect("events array");
+    // 8 steps + 4 call_entry + 4 call_exit + 3 io_events = 19 events.
+    assert_eq!(events.len(), 19, "events.len()");
+    assert_step_indices_monotonic(&doc);
+
+    assert_eq!(
+        observed_call_sequence(&doc),
+        vec![
+            "process_instruction".to_string(),
+            "check_signer".to_string(),
+            "check_owner".to_string(),
+            "check_lamports".to_string(),
+        ],
+        "call_entry order: driver first, then each helper in turn",
+    );
+
+    assert_eq!(
+        observed_exit_sequence(&doc),
+        vec![
+            "check_signer".to_string(),
+            "check_owner".to_string(),
+            "check_lamports".to_string(),
+            "process_instruction".to_string(),
+        ],
+        "call_exit order: each helper unwinds before the next call \
+         and the driver exits last",
+    );
+
+    // ----- Error io_event payloads pin the variant name --------------------
+    // Each `return Err(ProgramError::Variant);` line surfaces as a
+    // SolanaError io_event whose text contains the variant name.
+    let contents = observed_io_event_contents(&doc);
+    assert_eq!(
+        contents,
+        vec![
+            "ProgramError::MissingRequiredSignature".to_string(),
+            "ProgramError::IllegalOwner".to_string(),
+            "ProgramError::InsufficientFunds".to_string(),
+        ],
+        "io_event payloads must carry the ProgramError::Variant text \
+         the synthesiser extracted from each `return Err(..)` line",
+    );
+
+    // ----- Each helper's register_return surfaces the typed Variant --------
+    // After `synthesise_return_value`, the backward fn-boundary jumps
+    // out of each helper carry a `Result`-shaped Variant whose
+    // discriminator is "Err" and whose contents is a nested
+    // `ProgramError` Variant.
+    let returns: Vec<&serde_json::Value> = events
+        .iter()
+        .filter(|e| e["kind"] == "call_exit")
+        .filter(|e| e["return_value"]["kind"].as_str() == Some("Variant"))
+        .collect();
+    assert_eq!(
+        returns.len(),
+        3,
+        "expected three call_exit events with a Variant return_value \
+         (one per helper); got {returns:?}",
+    );
+    let want_inner = [
+        "MissingRequiredSignature",
+        "IllegalOwner",
+        "InsufficientFunds",
+    ];
+    for (ret, want) in returns.iter().zip(want_inner.iter()) {
+        let rv = &ret["return_value"];
+        assert_eq!(rv["kind"].as_str(), Some("Variant"));
+        assert_eq!(
+            rv["discriminator"].as_str(),
+            Some("Err"),
+            "outer Result-shaped Variant discriminator must be `Err`",
+        );
+        let inner = &rv["contents"];
+        assert_eq!(inner["kind"].as_str(), Some("Variant"));
+        assert_eq!(
+            inner["discriminator"].as_str(),
+            Some(*want),
+            "nested ProgramError Variant discriminator must match the \
+             helper's `return Err(ProgramError::<Variant>);` line",
+        );
+    }
+}
+
+// ===========================================================================
+// M11: result_error_propagation_test.rs
+// ===========================================================================
+//
+// `Result<T, ProgramError>` + the `?` operator — the canonical Solana
+// fall-through-on-error idiom.  `helper(0)?` short-circuits, the
+// recorder's `synthesise_return_value` extension produces the typed
+// `Result::Err(ProgramError::Custom(42))` for `helper`'s
+// `register_return`, and the `?`-propagation slot causes
+// `process_instruction`'s closing `register_return` to RE-EMIT the
+// same typed Variant (NOT a fresh wrapper around it).
+//
+// The `msg!("got {}", v);` after `?` is NEVER visited because
+// control left the function at the `?` — the io_event count therefore
+// pins to 1 (only the `Err(..)` line inside `helper`).
+
+fn result_error_propagation_snapshots() -> (Vec<RegisterSnapshot>, Vec<(u64, &'static str, u32)>) {
+    // process_instruction body lives at lines 45..49:
+    //   line 46: let v = helper(0)?;
+    // helper body lives at lines 33..39:
+    //   line 35: Err(ProgramError::Custom(42))
+    let snaps = vec![snap(100, &[]), snap(200, &[]), snap(101, &[])];
+    let locs: Vec<(u64, &'static str, u32)> = vec![
+        (100, "result_error_propagation_test.rs", 46),
+        (200, "result_error_propagation_test.rs", 35),
+        (101, "result_error_propagation_test.rs", 46),
+    ];
+    (snaps, locs)
+}
+
+#[test]
+fn test_result_error_propagation_test_via_ct_print_full() {
+    let (snaps, locs) = result_error_propagation_snapshots();
+    let Some((doc, source_path)) = record_and_dump_full(
+        "test_result_error_propagation_test_via_ct_print_full",
+        "result_error_propagation_test.rs",
+        &snaps,
+        &locs,
+    ) else {
+        return;
+    };
+
+    assert_metadata_program_ends_with(&doc, &source_path);
+    assert_paths_contain(&doc, "result_error_propagation_test.rs");
+
+    let functions: Vec<&str> = doc["functions"]
+        .as_array()
+        .expect("functions array")
+        .iter()
+        .filter_map(|v| v.as_str())
+        .collect();
+    assert_eq!(
+        functions,
+        vec!["process_instruction", "helper"],
+        "function table must contain the driver and the helper",
+    );
+
+    let counts = &doc["counts"];
+    // Distinct visited lines: 1 (implicit start) + 46 + 35 + 46 = 4
+    // step events.  The second visit to line 46 emits a fresh step
+    // because prev_line was 35 when we crossed back, so the
+    // line-change dedupe doesn't elide it.
+    assert_eq!(counts["steps"].as_u64(), Some(4), "steps; counts={counts}");
+    assert_eq!(
+        counts["functions"].as_u64(),
+        Some(2),
+        "functions; counts={counts}"
+    );
+    assert_eq!(
+        counts["calls"].as_u64(),
+        Some(2),
+        "calls; counts={counts} (driver + helper)"
+    );
+    // Exactly one io_event: helper's `Err(ProgramError::Custom(42))`
+    // line.  The `msg!("got {}", v);` after `?` is never visited.
+    assert_eq!(
+        counts["io_events"].as_u64(),
+        Some(1),
+        "io_events; counts={counts}"
+    );
+
+    let events = doc["events"].as_array().expect("events array");
+    // 4 steps + 2 call_entry + 2 call_exit + 1 io_event = 9 events.
+    assert_eq!(events.len(), 9, "events.len()");
+    assert_step_indices_monotonic(&doc);
+
+    assert_eq!(
+        observed_call_sequence(&doc),
+        vec!["process_instruction".to_string(), "helper".to_string()],
+    );
+
+    assert_eq!(
+        observed_exit_sequence(&doc),
+        vec!["helper".to_string(), "process_instruction".to_string()],
+        "call_exit order: helper unwinds first, then process_instruction \
+         re-emits the same error via `?`",
+    );
+
+    // ----- io_event pins the SolanaError text with the Custom(42) payload --
+    let contents = observed_io_event_contents(&doc);
+    assert_eq!(
+        contents,
+        vec!["ProgramError::Custom(42)".to_string()],
+        "io_event payload must carry the `ProgramError::Custom(42)` text \
+         the synthesiser extracted from helper's `Err(..)` line",
+    );
+
+    // ----- Both call_exit events carry the same typed Err Variant ----------
+    // helper's exit and process_instruction's exit both surface a
+    // `Result::Err(ProgramError::Custom(42))` — the `?` operator
+    // forwards the same value, NOT chains a fresh wrapper around it.
+    let returns: Vec<&serde_json::Value> =
+        events.iter().filter(|e| e["kind"] == "call_exit").collect();
+    assert_eq!(returns.len(), 2, "expected two call_exit events");
+    for ret in &returns {
+        let rv = &ret["return_value"];
+        assert_eq!(rv["kind"].as_str(), Some("Variant"));
+        assert_eq!(
+            rv["discriminator"].as_str(),
+            Some("Err"),
+            "both helper and process_instruction return a `Result::Err(..)`",
+        );
+        let inner = &rv["contents"];
+        assert_eq!(inner["kind"].as_str(), Some("Variant"));
+        assert_eq!(
+            inner["discriminator"].as_str(),
+            Some("Custom"),
+            "inner ProgramError::Custom(..) variant",
+        );
+        // The Custom tuple-variant carries one Int field (42).
+        let inner_contents = &inner["contents"];
+        assert_eq!(inner_contents["kind"].as_str(), Some("Tuple"));
+        let elements = inner_contents["elements"]
+            .as_array()
+            .expect("Custom.contents.elements array");
+        let ints: Vec<i64> = elements
+            .iter()
+            .map(|e| e["i"].as_i64().expect("Custom field must be Int.i"))
+            .collect();
+        assert_eq!(ints, vec![42]);
+    }
+}
+
+// ===========================================================================
+// M11: iterator_closures_test.rs
+// ===========================================================================
+//
+// Iterator-adapter chains and for-enumerate per-iteration logging —
+// the bulk-account-processing idioms every native Solana handler
+// uses.  The fixture lifts each iterator chain into its own helper
+// (`count_signers` / `sum_lamports`) and the per-iteration logger
+// into `log_account` so the recorder's existing call-frame
+// resolution surfaces each as a balanced Call/Return pair, and so
+// the source-driven `msg!` substituter can resolve `i` /
+// `account_lamports` against the helper's `r1` / `r2` calling
+// convention.
+
+fn iterator_closures_snapshots() -> (Vec<RegisterSnapshot>, Vec<(u64, &'static str, u32)>) {
+    // process_instruction body lives at lines 64..71:
+    //   line 65: let signer_count = count_signers(accounts);
+    //   line 66: let total_lamports = sum_lamports(accounts);
+    //   line 67: for (i, account) in accounts.iter().enumerate() {
+    //   line 68: log_account(i as u64, account.lamports());
+    //   line 70: signer_count as u64 + total_lamports
+    // count_signers body lives at 42..44:
+    //   line 43: accounts.iter().filter(|a| a.is_signer).count()
+    // sum_lamports body lives at 49..51:
+    //   line 50: accounts.iter().map(|a| a.lamports()).sum()
+    // log_account body lives at 58..60:
+    //   line 59: msg!("account {}: {} lamports", i, account_lamports);
+    let snaps = vec![
+        snap(100, &[]),
+        snap(200, &[]),
+        snap(101, &[]),
+        snap(300, &[]),
+        snap(102, &[]),
+        snap(103, &[]),
+        // iteration 0: log_account(0, 100)
+        snap(400, &[(1, 0), (2, 100)]),
+        snap(104, &[(1, 0), (2, 100)]),
+        // iteration 1: log_account(1, 200)
+        snap(401, &[(1, 1), (2, 200)]),
+        snap(105, &[(1, 1), (2, 200)]),
+        // iteration 2: log_account(2, 300)
+        snap(402, &[(1, 2), (2, 300)]),
+        snap(106, &[(1, 2), (2, 300)]),
+        snap(107, &[(1, 2), (2, 300)]),
+    ];
+    let locs: Vec<(u64, &'static str, u32)> = vec![
+        (100, "iterator_closures_test.rs", 65),
+        (200, "iterator_closures_test.rs", 43),
+        (101, "iterator_closures_test.rs", 66),
+        (300, "iterator_closures_test.rs", 50),
+        (102, "iterator_closures_test.rs", 67),
+        (103, "iterator_closures_test.rs", 68),
+        (400, "iterator_closures_test.rs", 59),
+        (104, "iterator_closures_test.rs", 68),
+        (401, "iterator_closures_test.rs", 59),
+        (105, "iterator_closures_test.rs", 68),
+        (402, "iterator_closures_test.rs", 59),
+        (106, "iterator_closures_test.rs", 68),
+        (107, "iterator_closures_test.rs", 70),
+    ];
+    (snaps, locs)
+}
+
+#[test]
+fn test_iterator_closures_test_via_ct_print_full() {
+    let (snaps, locs) = iterator_closures_snapshots();
+    let Some((doc, source_path)) = record_and_dump_full(
+        "test_iterator_closures_test_via_ct_print_full",
+        "iterator_closures_test.rs",
+        &snaps,
+        &locs,
+    ) else {
+        return;
+    };
+
+    assert_metadata_program_ends_with(&doc, &source_path);
+    assert_paths_contain(&doc, "iterator_closures_test.rs");
+
+    let functions: Vec<&str> = doc["functions"]
+        .as_array()
+        .expect("functions array")
+        .iter()
+        .filter_map(|v| v.as_str())
+        .collect();
+    assert_eq!(
+        functions,
+        vec![
+            "process_instruction",
+            "count_signers",
+            "sum_lamports",
+            "log_account",
+        ],
+        "function table must surface all four helpers in declaration order",
+    );
+
+    let counts = &doc["counts"];
+    // Distinct line transitions:
+    //   1 (implicit start) + 65, 43, 66, 50, 67, 68, 59, 68, 59, 68, 59, 68, 70
+    // = 14 step events.  The for-loop body line 68 emits a fresh
+    // step every time control returns to it from log_account because
+    // prev_line was 59 in between.
+    assert_eq!(counts["steps"].as_u64(), Some(14), "steps; counts={counts}");
+    assert_eq!(
+        counts["functions"].as_u64(),
+        Some(4),
+        "functions; counts={counts}"
+    );
+    // Calls: 1 driver + 1 count_signers + 1 sum_lamports + 3 log_account = 6.
+    assert_eq!(
+        counts["calls"].as_u64(),
+        Some(6),
+        "calls; counts={counts} (driver + 2 chain helpers + 3 log_account)"
+    );
+    // Three log_account msg! invocations.
+    assert_eq!(
+        counts["io_events"].as_u64(),
+        Some(3),
+        "io_events; counts={counts}"
+    );
+
+    let events = doc["events"].as_array().expect("events array");
+    // 14 steps + 6 call_entry + 6 call_exit + 3 io_events = 29 events.
+    assert_eq!(events.len(), 29, "events.len()");
+    assert_step_indices_monotonic(&doc);
+
+    assert_eq!(
+        observed_call_sequence(&doc),
+        vec![
+            "process_instruction".to_string(),
+            "count_signers".to_string(),
+            "sum_lamports".to_string(),
+            "log_account".to_string(),
+            "log_account".to_string(),
+            "log_account".to_string(),
+        ],
+        "call_entry order: driver first, then count_signers, sum_lamports, \
+         and three log_account invocations (one per for-loop iteration)",
+    );
+
+    assert_eq!(
+        observed_exit_sequence(&doc),
+        vec![
+            "count_signers".to_string(),
+            "sum_lamports".to_string(),
+            "log_account".to_string(),
+            "log_account".to_string(),
+            "log_account".to_string(),
+            "process_instruction".to_string(),
+        ],
+        "call_exit order: each helper unwinds before the next call \
+         and the driver exits last",
+    );
+
+    // ----- io_event payloads pin the substituted runtime values ------------
+    // log_account's `msg!("account {}: {} lamports", i, account_lamports)`
+    // resolves both args against the helper's parameter env (i → r1,
+    // account_lamports → r2) and substitutes the snapshot register
+    // values at each call site.
+    let contents = observed_io_event_contents(&doc);
+    assert_eq!(
+        contents,
+        vec![
+            "account 0: 100 lamports".to_string(),
+            "account 1: 200 lamports".to_string(),
+            "account 2: 300 lamports".to_string(),
+        ],
+        "io_event payloads must contain the substituted (i, lamports) \
+         pair from each for-loop iteration's log_account call",
+    );
+}
+
+// ===========================================================================
+// M11: sysvar_clock_rent_test.rs
+// ===========================================================================
+//
+// Canonical Solana sysvar-fetch idioms (`Clock::get()` /
+// `Rent::get()`).  Each fetch surfaces as a balanced Call/Return
+// pair through dedicated `fetch_clock_sysvar` / `fetch_rent_sysvar`
+// helpers, and each subsequent let-binding stitches a typed
+// struct-literal local (`Clock { unix_timestamp, slot, epoch }` /
+// `Rent { lamports_per_byte_year, exemption_threshold }`) the
+// strict pin asserts on by `type_name` plus per-field positional
+// value.
+
+fn sysvar_clock_rent_snapshots() -> (Vec<RegisterSnapshot>, Vec<(u64, &'static str, u32)>) {
+    // process_instruction body lives at lines 63..72:
+    //   line 64: let unix_timestamp = fetch_clock_sysvar();
+    //   line 65: let clock = Clock { ... };
+    //   line 66: let lamports_per_byte_year = fetch_rent_sysvar();
+    //   line 67: let rent = Rent { ... };
+    //   line 68: msg!("clock unix_timestamp={}", unix_timestamp);
+    //   line 69: msg!("rent lamports_per_byte_year={}", lamports_per_byte_year);
+    //   line 71: unix_timestamp + lamports_per_byte_year  (return)
+    // fetch_clock_sysvar body lives at lines 48..50 (body line 49).
+    // fetch_rent_sysvar body lives at lines 54..56 (body line 55).
+    let snaps = vec![
+        snap(100, &[(1, 1700000000)]),
+        snap(200, &[(1, 1700000000)]),
+        snap(101, &[(1, 1700000000)]),
+        snap(102, &[(1, 1700000000), (2, 3480)]),
+        snap(300, &[(1, 1700000000), (2, 3480)]),
+        snap(103, &[(1, 1700000000), (2, 3480)]),
+        snap(104, &[(1, 1700000000), (2, 3480)]),
+        snap(105, &[(1, 1700000000), (2, 3480)]),
+        snap(106, &[(0, 1700003480), (1, 1700000000), (2, 3480)]),
+    ];
+    let locs: Vec<(u64, &'static str, u32)> = vec![
+        (100, "sysvar_clock_rent_test.rs", 64),
+        (200, "sysvar_clock_rent_test.rs", 49),
+        (101, "sysvar_clock_rent_test.rs", 65),
+        (102, "sysvar_clock_rent_test.rs", 66),
+        (300, "sysvar_clock_rent_test.rs", 55),
+        (103, "sysvar_clock_rent_test.rs", 67),
+        (104, "sysvar_clock_rent_test.rs", 68),
+        (105, "sysvar_clock_rent_test.rs", 69),
+        (106, "sysvar_clock_rent_test.rs", 71),
+    ];
+    (snaps, locs)
+}
+
+#[test]
+fn test_sysvar_clock_rent_test_via_ct_print_full() {
+    let (snaps, locs) = sysvar_clock_rent_snapshots();
+    let Some((doc, source_path)) = record_and_dump_full(
+        "test_sysvar_clock_rent_test_via_ct_print_full",
+        "sysvar_clock_rent_test.rs",
+        &snaps,
+        &locs,
+    ) else {
+        return;
+    };
+
+    assert_metadata_program_ends_with(&doc, &source_path);
+    assert_paths_contain(&doc, "sysvar_clock_rent_test.rs");
+
+    let functions: Vec<&str> = doc["functions"]
+        .as_array()
+        .expect("functions array")
+        .iter()
+        .filter_map(|v| v.as_str())
+        .collect();
+    assert_eq!(
+        functions,
+        vec![
+            "process_instruction",
+            "fetch_clock_sysvar",
+            "fetch_rent_sysvar",
+        ],
+        "function table must surface the driver and both sysvar-fetch helpers",
+    );
+
+    let counts = &doc["counts"];
+    // Distinct visited lines: 1 (implicit start) + 64, 49, 65, 66, 55,
+    // 67, 68, 69, 71 = 10 step events.
+    assert_eq!(counts["steps"].as_u64(), Some(10), "steps; counts={counts}");
+    assert_eq!(
+        counts["functions"].as_u64(),
+        Some(3),
+        "functions; counts={counts}"
+    );
+    assert_eq!(
+        counts["calls"].as_u64(),
+        Some(3),
+        "calls; counts={counts} (driver + 2 sysvar fetchers)"
+    );
+    assert_eq!(
+        counts["io_events"].as_u64(),
+        Some(2),
+        "io_events; counts={counts}"
+    );
+
+    let events = doc["events"].as_array().expect("events array");
+    // 10 steps + 3 call_entry + 3 call_exit + 2 io_events = 18 events.
+    assert_eq!(events.len(), 18, "events.len()");
+    assert_step_indices_monotonic(&doc);
+
+    assert_eq!(
+        observed_call_sequence(&doc),
+        vec![
+            "process_instruction".to_string(),
+            "fetch_clock_sysvar".to_string(),
+            "fetch_rent_sysvar".to_string(),
+        ],
+    );
+
+    assert_eq!(
+        observed_exit_sequence(&doc),
+        vec![
+            "fetch_clock_sysvar".to_string(),
+            "fetch_rent_sysvar".to_string(),
+            "process_instruction".to_string(),
+        ],
+    );
+
+    // ----- io_event payloads pin the substituted runtime values ------------
+    let contents = observed_io_event_contents(&doc);
+    assert_eq!(
+        contents,
+        vec![
+            "clock unix_timestamp=1700000000".to_string(),
+            "rent lamports_per_byte_year=3480".to_string(),
+        ],
+    );
+
+    // ----- `clock` surfaces as a typed Clock Struct ------------------------
+    // The struct-literal RHS at line 65 decodes through
+    // `parse_struct_literal_rich` so the local surfaces with a
+    // `type_name` of `Clock` and the three Int field values from the
+    // literal (unix_timestamp, slot, epoch in source order).
+    let step_events: Vec<&serde_json::Value> =
+        events.iter().filter(|e| e["kind"] == "step").collect();
+    // Type-name lookup: the JSON document's `types` array is indexed by
+    // type_id (the `lang_type` field of each `TypeRecord`).  Struct
+    // variables are routed through the writer's CBOR path which
+    // assigns the variable record itself a typeId of 0 (the actual
+    // type lives in the encoded value), so the strict pin reads the
+    // Struct's type via `value.type_id` → `types[type_id]` rather
+    // than the variable record's outer `type_name`.
+    let types_table: Vec<&str> = doc["types"]
+        .as_array()
+        .expect("types array")
+        .iter()
+        .map(|v| v.as_str().expect("types entry must be a string"))
+        .collect();
+    let clock_step = step_events
+        .iter()
+        .find(|s| {
+            s["vars"]
+                .as_array()
+                .map(|vars| vars.iter().any(|v| v["varname"].as_str() == Some("clock")))
+                .unwrap_or(false)
+        })
+        .expect("a step event must surface `clock` as a typed local");
+    let clock_var = clock_step["vars"]
+        .as_array()
+        .expect("clock step vars")
+        .iter()
+        .find(|v| v["varname"].as_str() == Some("clock"))
+        .expect("clock var");
+    let clock_value = &clock_var["value"];
+    assert_eq!(clock_value["kind"].as_str(), Some("Struct"));
+    let clock_type_id = clock_value["type_id"]
+        .as_u64()
+        .expect("Clock value.type_id") as usize;
+    assert_eq!(
+        types_table.get(clock_type_id).copied(),
+        Some("Clock"),
+        "the struct literal at line 65 must register a `Clock` type",
+    );
+    let clock_fields = clock_value["field_values"]
+        .as_array()
+        .expect("Clock.field_values array");
+    let clock_ints: Vec<i64> = clock_fields
+        .iter()
+        .map(|e| e["i"].as_i64().expect("Clock field must be Int.i"))
+        .collect();
+    assert_eq!(
+        clock_ints,
+        vec![1700000000, 200000000, 500],
+        "Clock fields in source order: unix_timestamp, slot, epoch",
+    );
+
+    // ----- `rent` surfaces as a typed Rent Struct --------------------------
+    let rent_step = step_events
+        .iter()
+        .find(|s| {
+            s["vars"]
+                .as_array()
+                .map(|vars| vars.iter().any(|v| v["varname"].as_str() == Some("rent")))
+                .unwrap_or(false)
+        })
+        .expect("a step event must surface `rent` as a typed local");
+    let rent_var = rent_step["vars"]
+        .as_array()
+        .expect("rent step vars")
+        .iter()
+        .find(|v| v["varname"].as_str() == Some("rent"))
+        .expect("rent var");
+    let rent_value = &rent_var["value"];
+    assert_eq!(rent_value["kind"].as_str(), Some("Struct"));
+    let rent_type_id = rent_value["type_id"].as_u64().expect("Rent value.type_id") as usize;
+    assert_eq!(
+        types_table.get(rent_type_id).copied(),
+        Some("Rent"),
+        "the struct literal at line 67 must register a `Rent` type",
+    );
+    let rent_fields = rent_value["field_values"]
+        .as_array()
+        .expect("Rent.field_values array");
+    let rent_ints: Vec<i64> = rent_fields
+        .iter()
+        .map(|e| e["i"].as_i64().expect("Rent field must be Int.i"))
+        .collect();
+    assert_eq!(
+        rent_ints,
+        vec![3480, 2],
+        "Rent fields in source order: lamports_per_byte_year, exemption_threshold",
     );
 }
