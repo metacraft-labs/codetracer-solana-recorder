@@ -3,11 +3,125 @@
 //! These tests bypass DWARF/ELF parsing entirely, using synthetic register
 //! traces and source locations to exercise the recording pipeline.
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
+use std::process::Command;
 
 use codetracer_solana_recorder::recorder::record_from_snapshots;
-use codetracer_solana_recorder::register_trace::{RegisterSnapshot, parse_regs_file, ROW_SIZE};
-use codetracer_trace_types::{FullValueRecord, TraceLowLevelEvent, ValueRecord};
+use codetracer_solana_recorder::register_trace::{parse_regs_file, RegisterSnapshot, ROW_SIZE};
+use codetracer_trace_types::{
+    CallRecord, FullValueRecord, FunctionId, FunctionRecord, Line, PathId, ReturnRecord,
+    StepRecord, TraceLowLevelEvent, TypeId, ValueRecord, VariableId,
+};
+
+// ---------------------------------------------------------------------------
+// CTFS reader: shells out to `ct-print --full --strip-paths` and translates
+// the JSON document into the legacy `TraceLowLevelEvent` stream the
+// downstream assertions consume.  Only the variants the tests in this file
+// (and `test_comprehensive.rs`) check are emitted — `Int`-typed `Value`
+// events, `Step`, `Call`, `Return`, `Function`, `Path`, `VariableName`.
+// Compound `ValueRecord` variants (`Sequence` / `Tuple` / `Struct` / ...)
+// are intentionally skipped because nothing in these tests asserts on them.
+fn parse_events_from_ct(ct_path: &Path) -> Vec<TraceLowLevelEvent> {
+    let ct_print = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("..")
+        .join("codetracer-trace-format-nim")
+        .join("ct-print");
+    assert!(
+        ct_print.exists(),
+        "ct-print binary not found at {}; tests require the \
+         codetracer-trace-format-nim sibling repo",
+        ct_print.display()
+    );
+    let output = Command::new(&ct_print)
+        .args(["--full", "--strip-paths"])
+        .arg(ct_path)
+        .output()
+        .expect("failed to invoke ct-print");
+    assert!(
+        output.status.success(),
+        "ct-print --full failed; stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let doc: serde_json::Value =
+        serde_json::from_slice(&output.stdout).expect("ct-print --full must emit valid JSON");
+
+    let mut events: Vec<TraceLowLevelEvent> = Vec::new();
+
+    for p in doc["paths"].as_array().expect("paths array").iter() {
+        events.push(TraceLowLevelEvent::Path(PathBuf::from(
+            p.as_str().expect("path is string"),
+        )));
+    }
+    for v in doc["varnames"].as_array().expect("varnames array").iter() {
+        events.push(TraceLowLevelEvent::VariableName(
+            v.as_str().expect("varname is string").to_string(),
+        ));
+    }
+    for f in doc["functions"].as_array().expect("functions array").iter() {
+        events.push(TraceLowLevelEvent::Function(FunctionRecord {
+            path_id: PathId(0),
+            line: Line(1),
+            name: f.as_str().expect("function is string").to_string(),
+        }));
+    }
+    for ev in doc["events"].as_array().expect("events array").iter() {
+        match ev["kind"].as_str().expect("kind str") {
+            "step" => {
+                let path_id = ev["path_id"].as_u64().expect("path_id u64") as usize;
+                let line = ev["line"].as_i64().expect("line i64");
+                events.push(TraceLowLevelEvent::Step(StepRecord {
+                    path_id: PathId(path_id),
+                    line: Line(line),
+                }));
+                if let Some(vars) = ev["vars"].as_array() {
+                    for v in vars {
+                        let value = &v["value"];
+                        if value["kind"].as_str() == Some("Int") {
+                            let i = value["i"].as_i64().expect("Int.i must be i64");
+                            let type_id = value["type_id"].as_u64().unwrap_or(0) as usize;
+                            let varname_id =
+                                v["varname_id"].as_u64().expect("varname_id u64") as usize;
+                            events.push(TraceLowLevelEvent::Value(FullValueRecord {
+                                variable_id: VariableId(varname_id),
+                                value: ValueRecord::Int {
+                                    i,
+                                    type_id: TypeId(type_id),
+                                },
+                            }));
+                        }
+                    }
+                }
+            }
+            "call_entry" => {
+                let function_id = ev["function_id"].as_u64().expect("function_id u64") as usize;
+                events.push(TraceLowLevelEvent::Call(CallRecord {
+                    function_id: FunctionId(function_id),
+                    args: vec![],
+                }));
+            }
+            "call_exit" => {
+                events.push(TraceLowLevelEvent::Return(ReturnRecord {
+                    return_value: ValueRecord::None { type_id: TypeId(0) },
+                }));
+            }
+            _ => {} // `io` and any future kinds are not asserted on by these tests.
+        }
+    }
+
+    events
+}
+
+/// Read the single `.ct` file in `dir` and parse its events via ct-print.
+fn read_ct_events(dir: &Path) -> Vec<TraceLowLevelEvent> {
+    let ct_files: Vec<_> = std::fs::read_dir(dir)
+        .unwrap()
+        .filter_map(|e| e.ok())
+        .map(|e| e.path())
+        .filter(|p| p.extension().map_or(false, |ext| ext == "ct"))
+        .collect();
+    assert_eq!(ct_files.len(), 1, "expected exactly one .ct file");
+    parse_events_from_ct(&ct_files[0])
+}
 
 // ---------------------------------------------------------------------------
 // Synthetic test data helpers
@@ -142,42 +256,23 @@ fn test_sbpf_source_mapping() {
 
     // Run through the recorder to ensure it does not panic.
     let tmp = tempfile::TempDir::new().unwrap();
-    record_from_snapshots(
-        &snapshots,
-        &source_locs,
-        Path::new("test.rs"),
-        tmp.path(),
-    )
-    .unwrap();
+    record_from_snapshots(&snapshots, &source_locs, Path::new("test.rs"), tmp.path()).unwrap();
 }
 
 /// Test 3: Verify register values appear as variables in the trace output.
 #[test]
-#[allow(unreachable_code, unused_variables)]
 fn test_sbpf_variable_extraction() {
     let snapshots = synthetic_snapshots();
     let source_locs = create_synthetic_source_locations();
     let tmp = tempfile::TempDir::new().unwrap();
 
-    // CTFS-only output; event-level inspection deferred to ct-print.
-    record_from_snapshots(
-        &snapshots,
-        &source_locs,
-        Path::new("test.rs"),
-        tmp.path(),
-    )
-    .unwrap();
+    record_from_snapshots(&snapshots, &source_locs, Path::new("test.rs"), tmp.path()).unwrap();
 
-    // Verify .ct output.
-    let ct_files: Vec<_> = std::fs::read_dir(tmp.path())
-        .unwrap().filter_map(|e| e.ok()).map(|e| e.path())
-        .filter(|p| p.extension().map_or(false, |ext| ext == "ct")).collect();
-    assert!(!ct_files.is_empty(), "expected .ct file");
-    // Event-level checks deferred until CTFS reader available.
-    let events: Vec<TraceLowLevelEvent> = vec![];
-    if events.is_empty() { return; }
+    let events = read_ct_events(tmp.path());
 
-    // Collect all variable names that were interned.
+    // Variable-name table: the recorder always emits the full r0..r10 set on
+    // every snapshot (see `record_from_snapshots_into_writer`), so the
+    // interning order is fixed and total.
     let var_names: Vec<&str> = events
         .iter()
         .filter_map(|e| match e {
@@ -185,47 +280,27 @@ fn test_sbpf_variable_extraction() {
             _ => None,
         })
         .collect();
+    assert_eq!(
+        var_names,
+        vec!["r0", "r1", "r2", "r3", "r4", "r5", "r6", "r7", "r8", "r9", "r10"],
+    );
 
-    // Register variable names r0-r10 should be interned.
-    for reg in &["r0", "r1", "r2", "r3", "r4", "r5"] {
-        assert!(
-            var_names.contains(reg),
-            "trace should intern variable name '{reg}', found: {var_names:?}"
-        );
-    }
-
-    // Collect all integer values from Value events.
-    let int_values: Vec<i64> = events
+    // Integer values across every Value event, deduplicated and sorted —
+    // this is the strict spec of "what register values appear in the trace"
+    // for the canonical 7-snapshot fixture.
+    let mut int_values: Vec<i64> = events
         .iter()
         .filter_map(|e| match e {
-            TraceLowLevelEvent::Value(FullValueRecord { value: ValueRecord::Int { i, .. }, .. }) => {
-                Some(*i)
-            }
+            TraceLowLevelEvent::Value(FullValueRecord {
+                value: ValueRecord::Int { i, .. },
+                ..
+            }) => Some(*i),
             _ => None,
         })
         .collect();
-
-    // Expected register values at various steps.
-    assert!(
-        int_values.contains(&10),
-        "trace should contain value 10 (r1), found: {int_values:?}"
-    );
-    assert!(
-        int_values.contains(&32),
-        "trace should contain value 32 (r2), found: {int_values:?}"
-    );
-    assert!(
-        int_values.contains(&42),
-        "trace should contain value 42 (r3 = sum), found: {int_values:?}"
-    );
-    assert!(
-        int_values.contains(&84),
-        "trace should contain value 84 (r4 = doubled), found: {int_values:?}"
-    );
-    assert!(
-        int_values.contains(&94),
-        "trace should contain value 94 (r0 = return value), found: {int_values:?}"
-    );
+    int_values.sort_unstable();
+    int_values.dedup();
+    assert_eq!(int_values, vec![0i64, 10, 32, 42, 84, 94]);
 }
 
 /// Test 4: Verify 3-file output (trace.json, trace_metadata.json, trace_paths.json).
@@ -235,51 +310,32 @@ fn test_solana_trace_3file_output() {
     let source_locs = create_synthetic_source_locations();
     let tmp = tempfile::TempDir::new().unwrap();
 
-    record_from_snapshots(
-        &snapshots,
-        &source_locs,
-        Path::new("test.rs"),
-        tmp.path(),
-    )
-    .unwrap();
+    record_from_snapshots(&snapshots, &source_locs, Path::new("test.rs"), tmp.path()).unwrap();
 
     // Verify .ct output with CTFS magic bytes.
     let ct_files: Vec<_> = std::fs::read_dir(tmp.path())
-        .unwrap().filter_map(|e| e.ok()).map(|e| e.path())
-        .filter(|p| p.extension().map_or(false, |ext| ext == "ct")).collect();
+        .unwrap()
+        .filter_map(|e| e.ok())
+        .map(|e| e.path())
+        .filter(|p| p.extension().map_or(false, |ext| ext == "ct"))
+        .collect();
     assert!(!ct_files.is_empty(), "expected .ct file");
     let ct_content = std::fs::read(&ct_files[0]).unwrap();
     assert!(ct_content.len() >= 5);
     assert_eq!(&ct_content[..5], &[0xC0u8, 0xDE, 0x72, 0xAC, 0xE2]);
-
 }
 
 /// Test 5: Verify step count and Call/Return events using parsed trace data.
 #[test]
-#[allow(unreachable_code, unused_variables)]
 fn test_sbpf_step_events() {
     let snapshots = synthetic_snapshots();
     let source_locs = create_synthetic_source_locations();
     let tmp = tempfile::TempDir::new().unwrap();
 
-    // CTFS-only output; structural assertions only.
-    record_from_snapshots(
-        &snapshots,
-        &source_locs,
-        Path::new("test.rs"),
-        tmp.path(),
-    )
-    .unwrap();
+    record_from_snapshots(&snapshots, &source_locs, Path::new("test.rs"), tmp.path()).unwrap();
 
-    // Verify .ct output.
-    let ct_files: Vec<_> = std::fs::read_dir(tmp.path())
-        .unwrap().filter_map(|e| e.ok()).map(|e| e.path())
-        .filter(|p| p.extension().map_or(false, |ext| ext == "ct")).collect();
-    assert!(!ct_files.is_empty(), "expected .ct file");
-    let events: Vec<TraceLowLevelEvent> = vec![];
-    if events.is_empty() { return; }
+    let events = read_ct_events(tmp.path());
 
-    // Count structured event types.
     let step_count = events
         .iter()
         .filter(|e| matches!(e, TraceLowLevelEvent::Step(_)))
@@ -293,50 +349,29 @@ fn test_sbpf_step_events() {
         .filter(|e| matches!(e, TraceLowLevelEvent::Return(_)))
         .count();
 
-    // We have 7 snapshots, each with a unique line, so at least 7 Step events.
-    assert!(
-        step_count >= 7,
-        "expected at least 7 Step events, got {step_count}"
-    );
+    // 1 implicit start step at line 1 + 7 line-changes (5..=11) = 8 step events.
+    assert_eq!(step_count, 8);
+    // 1 outer "main" frame -> 1 call_entry, 1 call_exit.
+    assert_eq!(call_count, 1);
+    assert_eq!(return_count, 1);
 
-    // There should be at least one Call event (the main function call).
-    assert!(
-        call_count >= 1,
-        "expected at least 1 Call event, got {call_count}"
-    );
-
-    // There should be at least one Return event.
-    assert!(
-        return_count >= 1,
-        "expected at least 1 Return event, got {return_count}"
-    );
-
-    // Verify that step events reference the correct source file.
-    let step_events: Vec<_> = events
+    // Path table is exactly the single fixture file.
+    let paths: Vec<&Path> = events
         .iter()
         .filter_map(|e| match e {
-            TraceLowLevelEvent::Step(s) => Some(s),
+            TraceLowLevelEvent::Path(p) => Some(p.as_path()),
             _ => None,
         })
         .collect();
+    assert_eq!(paths, vec![Path::new("test.rs")]);
 
-    // All steps should reference "test.rs" path (by path_id).
-    // Verify we have path events that include "test.rs".
-    let has_test_rs_path = events.iter().any(|e| match e {
-        TraceLowLevelEvent::Path(p) => p.to_string_lossy().contains("test.rs"),
-        _ => false,
-    });
-    assert!(
-        has_test_rs_path,
-        "trace should contain a Path event for 'test.rs'"
-    );
-
-    // Steps should have sequential line numbers (5 through 11).
-    let step_lines: Vec<i64> = step_events.iter().map(|s| s.line.0).collect();
-    for expected_line in 5..=11i64 {
-        assert!(
-            step_lines.contains(&expected_line),
-            "step events should include line {expected_line}, found: {step_lines:?}"
-        );
-    }
+    // Step lines in event order: implicit start at 1, then snapshots' 5..11.
+    let step_lines: Vec<i64> = events
+        .iter()
+        .filter_map(|e| match e {
+            TraceLowLevelEvent::Step(s) => Some(s.line.0),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(step_lines, vec![1i64, 5, 6, 7, 8, 9, 10, 11]);
 }
