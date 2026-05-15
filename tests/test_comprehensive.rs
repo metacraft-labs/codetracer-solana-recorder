@@ -5,25 +5,25 @@
 //! Mollusk execution or real ELF/DWARF files are needed.
 
 use std::path::{Path, PathBuf};
+use std::process::Command;
 
 use codetracer_solana_recorder::account_decoder::{
-    AnchorIdl, BorshDecoder, DecodedField, DecodedValue, IdlType, TypeIds,
-    decoded_fields_to_struct_record,
+    decoded_fields_to_struct_record, AnchorIdl, BorshDecoder, DecodedField, DecodedValue, IdlType,
+    TypeIds,
 };
 use codetracer_solana_recorder::cpi::{CpiDetector, CpiEvent};
 use codetracer_solana_recorder::multi_program::ProgramRegistry;
-use codetracer_solana_recorder::recorder::{record_from_snapshots, record_from_snapshots_into_writer, record_with_cpi};
-use codetracer_solana_recorder::register_trace::{RegisterSnapshot, parse_regs_file, ROW_SIZE};
+use codetracer_solana_recorder::recorder::{record_from_snapshots, record_with_cpi};
+use codetracer_solana_recorder::register_trace::{parse_regs_file, RegisterSnapshot, ROW_SIZE};
 use codetracer_solana_recorder::tracer_trait::{
-    CodeTracerTracer, NoOpTracer, SbpfTracer, replay_snapshots,
+    replay_snapshots, CodeTracerTracer, NoOpTracer, SbpfTracer,
 };
 use codetracer_trace_types::{
-    CallRecord, FullValueRecord, FunctionRecord, Line, ReturnRecord, StepRecord,
-    TraceLowLevelEvent, ValueRecord,
+    CallRecord, FullValueRecord, FunctionId, FunctionRecord, Line, PathId, ReturnRecord,
+    StepRecord, TraceLowLevelEvent, TypeId, ValueRecord, VariableId,
 };
-use codetracer_trace_writer_nim::non_streaming_trace_writer::NonStreamingTraceWriter;
 use codetracer_trace_writer_nim::trace_writer::TraceWriter;
-use codetracer_trace_writer_nim::{TraceEventsFileFormat, create_trace_writer};
+use codetracer_trace_writer_nim::{create_trace_writer, TraceEventsFileFormat};
 
 // ===========================================================================
 // Helpers
@@ -82,44 +82,125 @@ fn encode_regs(snapshots: &[RegisterSnapshot]) -> Vec<u8> {
     data
 }
 
-/// Run `record_from_snapshots` and verify .ct output was produced.
-/// Returns empty Vec since events can't be parsed from .ct without a reader.
-fn record_and_get_events(
-    snapshots: &[RegisterSnapshot],
-    source_locs: &[(u64, &str, u32)],
-    source_path: &str,
-) -> Vec<TraceLowLevelEvent> {
-    let tmp = tempfile::TempDir::new().unwrap();
-    record_from_snapshots(
-        snapshots,
-        source_locs,
-        Path::new(source_path),
-        tmp.path(),
-    )
-    .unwrap();
-    let ct_files: Vec<_> = std::fs::read_dir(tmp.path())
+// ---------------------------------------------------------------------------
+// CTFS reader: shells out to `ct-print --full --strip-paths` and translates
+// the JSON document the Nim binary emits into the legacy
+// `TraceLowLevelEvent` stream the downstream assertions consume.  Mirrors
+// the helper in `test_tracer.rs`.  Only the variants the assertions in
+// this file check are emitted (`Path`, `VariableName`, `Function`, `Step`,
+// `Call`, `Return`, integer-typed `Value`).  Compound `ValueRecord`
+// variants (`Sequence` / `Tuple` / `Struct` / ...) are intentionally
+// skipped because nothing here keys off them — the per-program tests in
+// `test_per_program_ct_print_full.rs` already pin those.
+fn parse_events_from_ct(ct_path: &Path) -> Vec<TraceLowLevelEvent> {
+    let ct_print = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("..")
+        .join("codetracer-trace-format-nim")
+        .join("ct-print");
+    assert!(
+        ct_print.exists(),
+        "ct-print binary not found at {}; tests require the \
+         codetracer-trace-format-nim sibling repo",
+        ct_print.display()
+    );
+    let output = Command::new(&ct_print)
+        .args(["--full", "--strip-paths"])
+        .arg(ct_path)
+        .output()
+        .expect("failed to invoke ct-print");
+    assert!(
+        output.status.success(),
+        "ct-print --full failed; stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let doc: serde_json::Value =
+        serde_json::from_slice(&output.stdout).expect("ct-print --full must emit valid JSON");
+
+    let mut events: Vec<TraceLowLevelEvent> = Vec::new();
+    for p in doc["paths"].as_array().expect("paths array").iter() {
+        events.push(TraceLowLevelEvent::Path(PathBuf::from(
+            p.as_str().expect("path is string"),
+        )));
+    }
+    for v in doc["varnames"].as_array().expect("varnames array").iter() {
+        events.push(TraceLowLevelEvent::VariableName(
+            v.as_str().expect("varname is string").to_string(),
+        ));
+    }
+    for f in doc["functions"].as_array().expect("functions array").iter() {
+        events.push(TraceLowLevelEvent::Function(FunctionRecord {
+            path_id: PathId(0),
+            line: Line(1),
+            name: f.as_str().expect("function is string").to_string(),
+        }));
+    }
+    for ev in doc["events"].as_array().expect("events array").iter() {
+        match ev["kind"].as_str().expect("kind str") {
+            "step" => {
+                let path_id = ev["path_id"].as_u64().expect("path_id u64") as usize;
+                let line = ev["line"].as_i64().expect("line i64");
+                events.push(TraceLowLevelEvent::Step(StepRecord {
+                    path_id: PathId(path_id),
+                    line: Line(line),
+                }));
+                if let Some(vars) = ev["vars"].as_array() {
+                    for v in vars {
+                        let value = &v["value"];
+                        if value["kind"].as_str() == Some("Int") {
+                            let i = value["i"].as_i64().expect("Int.i must be i64");
+                            let type_id = value["type_id"].as_u64().unwrap_or(0) as usize;
+                            let varname_id =
+                                v["varname_id"].as_u64().expect("varname_id u64") as usize;
+                            events.push(TraceLowLevelEvent::Value(FullValueRecord {
+                                variable_id: VariableId(varname_id),
+                                value: ValueRecord::Int {
+                                    i,
+                                    type_id: TypeId(type_id),
+                                },
+                            }));
+                        }
+                    }
+                }
+            }
+            "call_entry" => {
+                let function_id = ev["function_id"].as_u64().expect("function_id u64") as usize;
+                events.push(TraceLowLevelEvent::Call(CallRecord {
+                    function_id: FunctionId(function_id),
+                    args: vec![],
+                }));
+            }
+            "call_exit" => {
+                events.push(TraceLowLevelEvent::Return(ReturnRecord {
+                    return_value: ValueRecord::None { type_id: TypeId(0) },
+                }));
+            }
+            _ => {}
+        }
+    }
+    events
+}
+
+/// Read the single `.ct` file in `dir` and parse its events via ct-print.
+fn read_ct_events(dir: &Path) -> Vec<TraceLowLevelEvent> {
+    let ct_files: Vec<_> = std::fs::read_dir(dir)
         .unwrap()
         .filter_map(|e| e.ok())
         .map(|e| e.path())
         .filter(|p| p.extension().map_or(false, |ext| ext == "ct"))
         .collect();
-    assert!(!ct_files.is_empty(), "expected .ct file");
+    assert_eq!(ct_files.len(), 1, "expected exactly one .ct file");
     let content = std::fs::read(&ct_files[0]).unwrap();
-    assert!(content.len() >= 5, ".ct file too small");
-    assert_eq!(&content[..5], &[0xC0u8, 0xDE, 0x72, 0xAC, 0xE2], "CTFS magic");
-    // Return empty - event verification deferred until CTFS reader available.
-    vec![]
+    assert_eq!(
+        &content[..5],
+        &[0xC0u8, 0xDE, 0x72, 0xAC, 0xE2],
+        "CTFS magic"
+    );
+    parse_events_from_ct(&ct_files[0])
 }
-
 
 // ---------------------------------------------------------------------------
 // Structured trace parsing helpers
 // ---------------------------------------------------------------------------
-
-/// Parse JSON trace content into a Vec of TraceLowLevelEvent.
-fn parse_events(content: &str) -> Vec<TraceLowLevelEvent> {
-    serde_json::from_str(content).expect("trace output should be valid JSON array of events")
-}
 
 /// Collect all Step events from parsed trace events.
 fn step_events(events: &[TraceLowLevelEvent]) -> Vec<&StepRecord> {
@@ -187,65 +268,19 @@ fn variable_name_events(events: &[TraceLowLevelEvent]) -> Vec<&str> {
         .collect()
 }
 
-/// Collect all Value events.
-fn value_events(events: &[TraceLowLevelEvent]) -> Vec<&FullValueRecord> {
-    events
-        .iter()
-        .filter_map(|e| match e {
-            TraceLowLevelEvent::Value(v) => Some(v),
-            _ => None,
-        })
-        .collect()
-}
-
-/// Extract all integer values from Value events.
-fn int_values(events: &[TraceLowLevelEvent]) -> Vec<i64> {
-    value_events(events)
-        .iter()
-        .filter_map(|fv| match &fv.value {
-            ValueRecord::Int { i, .. } => Some(*i),
-            _ => None,
-        })
-        .collect()
-}
-
-/// Check that at least one Value event has the given integer value.
-fn has_int_value(events: &[TraceLowLevelEvent], expected: i64) -> bool {
-    int_values(events).contains(&expected)
-}
-
-/// Check that at least one Path event ends with the given suffix.
-fn has_path_containing(events: &[TraceLowLevelEvent], suffix: &str) -> bool {
-    path_events(events)
-        .iter()
-        .any(|p| p.to_string_lossy().contains(suffix))
-}
-
-/// Check that at least one Function event has the given name.
-fn has_function_named(events: &[TraceLowLevelEvent], name: &str) -> bool {
-    function_events(events).iter().any(|f| f.name == name)
-}
-
-/// Check that at least one VariableName event matches exactly.
-fn has_variable_name(events: &[TraceLowLevelEvent], name: &str) -> bool {
-    variable_name_events(events).contains(&name)
-}
-
-/// Record and verify .ct output was produced. Since the Nim trace writer now
-/// produces CTFS binary format, event-level assertions in tests are skipped
-/// (events vec is empty). The recording itself is verified via CTFS magic bytes.
+/// Record via `record_from_snapshots` and decode the resulting `.ct` file
+/// through `ct-print --full`.  Returns the live `TraceLowLevelEvent` stream.
 fn record_and_parse_events(
     snapshots: &[RegisterSnapshot],
     source_locs: &[(u64, &str, u32)],
     source_path: &str,
 ) -> Vec<TraceLowLevelEvent> {
-    record_and_get_events(snapshots, source_locs, source_path)
-    // Returns empty vec - callers should check `events.is_empty()` and skip
-    // event-level assertions.
+    let tmp = tempfile::TempDir::new().unwrap();
+    record_from_snapshots(snapshots, source_locs, Path::new(source_path), tmp.path()).unwrap();
+    read_ct_events(tmp.path())
 }
 
-/// Record with CPI, verify .ct output, and return an empty event list.
-/// CPI-specific event verification is deferred to when a CTFS reader is available.
+/// Record via `record_with_cpi` and decode through `ct-print --full`.
 fn record_cpi_and_parse_events(
     snapshots: &[RegisterSnapshot],
     registry: &ProgramRegistry,
@@ -261,19 +296,7 @@ fn record_cpi_and_parse_events(
         tmp.path(),
     )
     .unwrap();
-    // Verify .ct output was produced with CTFS magic bytes.
-    let ct_files: Vec<_> = std::fs::read_dir(tmp.path())
-        .unwrap()
-        .filter_map(|e| e.ok())
-        .map(|e| e.path())
-        .filter(|p| p.extension().map_or(false, |ext| ext == "ct"))
-        .collect();
-    assert!(!ct_files.is_empty(), "expected .ct file in CPI output");
-    let content = std::fs::read(&ct_files[0]).unwrap();
-    assert!(content.len() >= 5, ".ct file too small");
-    assert_eq!(&content[..5], &[0xC0u8, 0xDE, 0x72, 0xAC, 0xE2], "CTFS magic");
-    // Return empty - CPI event verification deferred.
-    vec![]
+    read_ct_events(tmp.path())
 }
 
 // ===========================================================================
@@ -309,22 +332,27 @@ fn test_arithmetic_register_patterns() {
     ];
 
     let events = record_and_parse_events(&snapshots, &source_locs, "arith.rs");
-    if events.is_empty() { return; }
 
-    // Verify arithmetic results show up as integer values in Value events.
-    assert!(has_int_value(&events, 130), "ADD result 130 should appear in trace");
-    assert!(has_int_value(&events, 100), "SUB result 100 should appear in trace");
-    assert!(has_int_value(&events, 300), "MUL result 300 should appear in trace");
-    assert!(has_int_value(&events, 30), "DIV result 30 should appear in trace");
+    // Distinct integer values across all Value events: r10=0x3000=12288 frame
+    // pointer, r1=100, r2 ∈ {30,3,10}, r3 ∈ {0,130}, r4 ∈ {0,100}, r5 ∈ {0,300},
+    // r0 ∈ {0,30}, plus the implicit zeros from un-loaded registers.
+    let mut int_values: Vec<i64> = events
+        .iter()
+        .filter_map(|e| match e {
+            TraceLowLevelEvent::Value(FullValueRecord {
+                value: ValueRecord::Int { i, .. },
+                ..
+            }) => Some(*i),
+            _ => None,
+        })
+        .collect();
+    int_values.sort_unstable();
+    int_values.dedup();
+    assert_eq!(int_values, vec![0i64, 3, 10, 30, 100, 130, 300, 0x3000]);
 
-    // Each unique line triggers a Step event. TraceWriter::start also emits
-    // an initial Step, so the total is source lines + 1.
+    // 1 implicit start step at line 1 + 6 line-changes (10..=15) = 7 steps.
     let steps = step_events(&events);
-    assert!(
-        steps.len() >= 6,
-        "expected at least 6 Step events for 6 unique lines, got {}",
-        steps.len()
-    );
+    assert_eq!(steps.len(), 7);
 }
 
 /// Memory access patterns: register values showing stack/heap addresses.
@@ -347,7 +375,9 @@ fn test_memory_access_register_patterns() {
         // Load value from stack into r3
         snap_full(2, 0, stack_addr, heap_addr, 42, 0, 0, 0, 0, 0, 0, frame_ptr),
         // Store to heap via r2, load input region
-        snap_full(3, 0, stack_addr, heap_addr, 42, input_addr, 0, 0, 0, 0, 0, frame_ptr),
+        snap_full(
+            3, 0, stack_addr, heap_addr, 42, input_addr, 0, 0, 0, 0, 0, frame_ptr,
+        ),
     ];
 
     let source_locs: Vec<(u64, &str, u32)> = vec![
@@ -358,24 +388,43 @@ fn test_memory_access_register_patterns() {
     ];
 
     let events = record_and_parse_events(&snapshots, &source_locs, "mem.rs");
-    if events.is_empty() { return; }
 
-    // Frame pointer (r10) should appear as a variable name.
-    assert!(has_variable_name(&events, "r10"), "frame pointer r10 should be in trace");
-
-    // Stack address value should appear as an integer value.
-    assert!(
-        has_int_value(&events, stack_addr as i64),
-        "stack address should appear in trace"
+    // The full r0..r10 register table is interned in declaration order.
+    let var_names: Vec<&str> = variable_name_events(&events);
+    assert_eq!(
+        var_names,
+        vec!["r0", "r1", "r2", "r3", "r4", "r5", "r6", "r7", "r8", "r9", "r10"],
     );
 
-    // Step events for each line, plus the initial start step.
+    // Distinct integer values: 0 (zero registers), the 4 SBF region addresses,
+    // and the frame pointer (which equals the stack address `frame_ptr`).
+    let mut int_values: Vec<i64> = events
+        .iter()
+        .filter_map(|e| match e {
+            TraceLowLevelEvent::Value(FullValueRecord {
+                value: ValueRecord::Int { i, .. },
+                ..
+            }) => Some(*i),
+            _ => None,
+        })
+        .collect();
+    int_values.sort_unstable();
+    int_values.dedup();
+    assert_eq!(
+        int_values,
+        vec![
+            0i64,
+            42,
+            stack_addr as i64,
+            frame_ptr as i64,
+            heap_addr as i64,
+            input_addr as i64,
+        ],
+    );
+
+    // 1 implicit start step at line 1 + 4 line-changes (1..=4) = 5 steps.
     let steps = step_events(&events);
-    assert!(
-        steps.len() >= 4,
-        "expected at least 4 Step events, got {}",
-        steps.len()
-    );
+    assert_eq!(steps.len(), 5);
 }
 
 /// Syscall pattern: register state before/after sol_log, sol_create_program_address.
@@ -439,19 +488,43 @@ fn test_syscall_register_patterns() {
     ];
 
     let events = record_and_parse_events(&snapshots, &source_locs, "syscall.rs");
-    if events.is_empty() { return; }
 
-    // Verify syscall-related register names appear.
-    assert!(has_variable_name(&events, "r1"), "r1 (msg_ptr/seeds_ptr) should be in trace");
-    assert!(has_variable_name(&events, "r2"), "r2 (msg_len/seeds_len) should be in trace");
-    assert!(has_variable_name(&events, "r0"), "r0 (return value) should be in trace");
-
-    let steps = step_events(&events);
-    assert!(
-        steps.len() >= 4,
-        "expected at least 4 Step events, got {}",
-        steps.len()
+    // Variable-name table is the full r0..r10 register set.
+    let var_names: Vec<&str> = variable_name_events(&events);
+    assert_eq!(
+        var_names,
+        vec!["r0", "r1", "r2", "r3", "r4", "r5", "r6", "r7", "r8", "r9", "r10"],
     );
+
+    let mut int_values: Vec<i64> = events
+        .iter()
+        .filter_map(|e| match e {
+            TraceLowLevelEvent::Value(FullValueRecord {
+                value: ValueRecord::Int { i, .. },
+                ..
+            }) => Some(*i),
+            _ => None,
+        })
+        .collect();
+    int_values.sort_unstable();
+    int_values.dedup();
+    assert_eq!(
+        int_values,
+        vec![
+            0i64,
+            2,
+            13,
+            0x3000,
+            msg_ptr as i64,
+            seeds_ptr as i64,
+            program_id_ptr as i64,
+            addr_out_ptr as i64,
+        ],
+    );
+
+    // 1 implicit start step + 4 line-changes (20, 21, 30, 31) = 5 steps.
+    let steps = step_events(&events);
+    assert_eq!(steps.len(), 5);
 }
 
 /// Function call/return: PC jumps indicating function entry/exit.
@@ -480,33 +553,25 @@ fn test_function_call_return_pc_jumps() {
     ];
 
     let events = record_and_parse_events(&snapshots, &source_locs, "caller.rs");
-    if events.is_empty() { return; }
 
-    // Should have multiple Call events: main + fn_at_pc_100.
+    // 2 calls: main (outermost) + the synthesised fn_at_pc_100 frame.
     let calls = call_events(&events);
-    assert!(
-        calls.len() >= 2,
-        "expected at least 2 Call events (main + callee), got {}",
-        calls.len()
-    );
+    assert_eq!(calls.len(), 2);
 
-    // Should have Return events: one for callee return, one for main.
+    // 2 returns: callee return + main return.
     let returns = return_events(&events);
-    assert!(
-        returns.len() >= 2,
-        "expected at least 2 Return events, got {}",
-        returns.len()
-    );
+    assert_eq!(returns.len(), 2);
 
-    // The callee function name should be registered.
-    assert!(
-        has_function_named(&events, "fn_at_pc_100"),
-        "callee function name should reference PC 100"
-    );
+    // Function table is exactly the two resolved names, in registration order.
+    let func_names: Vec<&str> = function_events(&events)
+        .iter()
+        .map(|f| f.name.as_str())
+        .collect();
+    assert_eq!(func_names, vec!["main", "fn_at_pc_100"]);
 
-    // Source files from both caller and callee should appear as Path events.
-    assert!(has_path_containing(&events, "caller.rs"), "caller.rs should be in trace");
-    assert!(has_path_containing(&events, "callee.rs"), "callee.rs should be in trace");
+    // Path table is exactly the two source files, in registration order.
+    let paths: Vec<&Path> = path_events(&events);
+    assert_eq!(paths, vec![Path::new("caller.rs"), Path::new("callee.rs")]);
 }
 
 // ===========================================================================
@@ -528,28 +593,24 @@ fn test_multiple_source_files() {
     let source_locs: Vec<(u64, &str, u32)> = vec![
         (0, "src/lib.rs", 10),
         (1, "src/lib.rs", 11),
-        (2, "src/helpers.rs", 5),  // jump to helper file
+        (2, "src/helpers.rs", 5), // jump to helper file
         (3, "src/helpers.rs", 6),
-        (4, "src/lib.rs", 12),     // back to lib
+        (4, "src/lib.rs", 12), // back to lib
         (5, "src/lib.rs", 13),
     ];
 
     let events = record_and_parse_events(&snapshots, &source_locs, "src/lib.rs");
-    if events.is_empty() { return; }
 
-    assert!(has_path_containing(&events, "src/lib.rs"), "lib.rs should appear in trace");
-    assert!(
-        has_path_containing(&events, "src/helpers.rs"),
-        "helpers.rs should appear in trace"
+    // Path table in registration order.
+    let paths: Vec<&Path> = path_events(&events);
+    assert_eq!(
+        paths,
+        vec![Path::new("src/lib.rs"), Path::new("src/helpers.rs")],
     );
 
-    // All 6 unique lines produce Step events, plus the initial start step.
+    // 1 implicit start step + 6 line-changes = 7 steps.
     let steps = step_events(&events);
-    assert!(
-        steps.len() >= 6,
-        "expected at least 6 Step events, got {}",
-        steps.len()
-    );
+    assert_eq!(steps.len(), 7);
 }
 
 /// Inline function: multiple PCs map to the same source line (DWARF inlining).
@@ -573,16 +634,18 @@ fn test_inline_function_same_line() {
     ];
 
     let events = record_and_parse_events(&snapshots, &source_locs, "lib.rs");
-    if events.is_empty() { return; }
 
     // The recorder deduplicates consecutive identical source lines, so only
     // lines 10 and 11 produce Step events. TraceWriter::start adds an initial
     // Step at the source_path's line 1, giving 3 total.
     let steps = step_events(&events);
     assert_eq!(
-        steps.len(), 3,
+        steps.len(),
+        3,
         "inline expansion should produce 3 Step events (start + line 10 + line 11)"
     );
+    let step_lines: Vec<i64> = steps.iter().map(|s| s.line.0).collect();
+    assert_eq!(step_lines, vec![1i64, 10, 11]);
 }
 
 /// Macro expansion: msg! macro expanding to multiple instructions across files.
@@ -602,28 +665,23 @@ fn test_macro_expansion_multiple_instructions() {
 
     let source_locs: Vec<(u64, &str, u32)> = vec![
         (0, "lib.rs", 15),
-        (1, "lib.rs", 16),           // msg! invocation line
+        (1, "lib.rs", 16),                // msg! invocation line
         (2, "solana_program/log.rs", 42), // macro internal
         (3, "solana_program/log.rs", 43), // macro internal
         (4, "lib.rs", 17),
     ];
 
     let events = record_and_parse_events(&snapshots, &source_locs, "lib.rs");
-    if events.is_empty() { return; }
 
-    assert!(has_path_containing(&events, "lib.rs"), "user source should appear");
-    assert!(
-        has_path_containing(&events, "solana_program/log.rs"),
-        "macro expansion source should appear"
+    let paths: Vec<&Path> = path_events(&events);
+    assert_eq!(
+        paths,
+        vec![Path::new("lib.rs"), Path::new("solana_program/log.rs")],
     );
 
-    // All 5 PCs map to different lines, plus the initial start step.
+    // 1 implicit start step + 5 line-changes (15, 16, 42, 43, 17) = 6 steps.
     let steps = step_events(&events);
-    assert!(
-        steps.len() >= 5,
-        "expected at least 5 Step events, got {}",
-        steps.len()
-    );
+    assert_eq!(steps.len(), 6);
 }
 
 /// Nested function calls with correct source line attribution.
@@ -655,20 +713,28 @@ fn test_nested_function_calls() {
     ];
 
     let events = record_and_parse_events(&snapshots, &source_locs, "caller.rs");
-    if events.is_empty() { return; }
 
-    // Should contain references to all three source files.
-    assert!(has_path_containing(&events, "caller.rs"));
-    assert!(has_path_containing(&events, "foo.rs"));
-    assert!(has_path_containing(&events, "bar.rs"));
-
-    // At least 3 Call events: main, foo, bar.
-    let calls = call_events(&events);
-    assert!(
-        calls.len() >= 3,
-        "expected at least 3 Call events for nested calls, got {}",
-        calls.len()
+    // Path table contains all three source files in registration order.
+    let paths: Vec<&Path> = path_events(&events);
+    assert_eq!(
+        paths,
+        vec![
+            Path::new("caller.rs"),
+            Path::new("foo.rs"),
+            Path::new("bar.rs"),
+        ],
     );
+
+    // 3 calls: main + foo (PC 100 forward jump) + bar (PC 200 forward jump).
+    let calls = call_events(&events);
+    assert_eq!(calls.len(), 3);
+
+    // Function table in registration order.
+    let func_names: Vec<&str> = function_events(&events)
+        .iter()
+        .map(|f| f.name.as_str())
+        .collect();
+    assert_eq!(func_names, vec!["main", "fn_at_pc_100", "fn_at_pc_200"]);
 }
 
 // ===========================================================================
@@ -679,14 +745,14 @@ fn test_nested_function_calls() {
 #[test]
 fn test_cpi_single_call_to_system_program() {
     let snapshots = vec![
-        snap_regs(0, 0, 100, 0, 0),     // primary: setup
-        snap_regs(1, 0, 100, 200, 0),   // primary: prepare accounts
-        snap_regs(2, 0, 100, 200, 0),   // primary: invoke CPI
-        snap_regs(5000, 0, 0, 0, 0),    // system program: entry
-        snap_regs(5001, 0, 0, 0, 0),    // system program: transfer
-        snap_regs(5002, 0, 0, 0, 0),    // system program: done
-        snap_regs(3, 0, 100, 200, 0),   // primary: CPI returned
-        snap_regs(4, 0, 100, 200, 0),   // primary: continue
+        snap_regs(0, 0, 100, 0, 0),   // primary: setup
+        snap_regs(1, 0, 100, 200, 0), // primary: prepare accounts
+        snap_regs(2, 0, 100, 200, 0), // primary: invoke CPI
+        snap_regs(5000, 0, 0, 0, 0),  // system program: entry
+        snap_regs(5001, 0, 0, 0, 0),  // system program: transfer
+        snap_regs(5002, 0, 0, 0, 0),  // system program: done
+        snap_regs(3, 0, 100, 200, 0), // primary: CPI returned
+        snap_regs(4, 0, 100, 200, 0), // primary: continue
     ];
 
     let mut registry = ProgramRegistry::new();
@@ -715,40 +781,42 @@ fn test_cpi_single_call_to_system_program() {
     detector.add_program_range("system_program", 5000..5100);
 
     let events = record_cpi_and_parse_events(&snapshots, &registry, &mut detector, "lib.rs");
-    if events.is_empty() { return; }
-    if events.is_empty() { return; }
 
-    // Call events: main + CPI to system_program.
+    // Function table: outer "main" + the CPI target.
+    let func_names: Vec<&str> = function_events(&events)
+        .iter()
+        .map(|f| f.name.as_str())
+        .collect();
+    assert_eq!(func_names, vec!["main", "system_program"]);
+
+    // 2 calls: main (outermost) + system_program (CPI).
     let calls = call_events(&events);
-    assert!(calls.len() >= 2, "expected >= 2 Call events, got {}", calls.len());
+    assert_eq!(calls.len(), 2);
 
-    // Return events: CPI return + main return.
+    // 2 returns: CPI return + main return.
     let returns = return_events(&events);
-    assert!(returns.len() >= 2, "expected >= 2 Return events, got {}", returns.len());
+    assert_eq!(returns.len(), 2);
 
-    // System program name should appear as a Function event.
-    assert!(has_function_named(&events, "system_program"));
-
-    // Both source files should appear as Path events.
-    assert!(has_path_containing(&events, "lib.rs"));
-    assert!(has_path_containing(&events, "system.rs"));
+    // Path table contains both source files in registration order.
+    let paths: Vec<&Path> = path_events(&events);
+    assert_eq!(paths, vec![Path::new("lib.rs"), Path::new("system.rs")]);
 }
 
 /// Nested CPI: A -> B -> C with program ID changes.
 #[test]
 fn test_cpi_nested_three_programs() {
     let snapshots = vec![
-        snap_pc(10),    // primary
-        snap_pc(11),    // primary
-        snap_pc(1000),  // CPI: primary -> token_program
-        snap_pc(1001),  // token_program
-        snap_pc(2000),  // CPI: token_program -> associated_token
-        snap_pc(2001),  // associated_token
-        snap_pc(2002),  // associated_token
-        snap_pc(1002),  // return: associated_token -> token_program
-        snap_pc(1003),  // token_program continues
-        snap_pc(12),    // return: token_program -> primary
-        snap_pc(13),    // primary continues
+        snap_pc(10),   // primary
+        snap_pc(11),   // primary
+        snap_pc(1000), // CPI: primary -> token_program
+        snap_pc(1001), // token_program
+        snap_pc(2000), // CPI: token_program -> associated_token
+        snap_pc(2001), // associated_token
+        snap_pc(2002), // associated_token
+        snap_pc(1002), // return: associated_token -> token_program
+        snap_pc(1003), // token_program continues
+        snap_pc(12),   // return: token_program -> primary
+        snap_pc(13),   // primary continues
     ];
 
     let mut registry = ProgramRegistry::new();
@@ -786,30 +854,36 @@ fn test_cpi_nested_three_programs() {
     detector.add_program_range("token_program", 1000..1100);
     detector.add_program_range("associated_token", 2000..2100);
 
-    let events =
-        record_cpi_and_parse_events(&snapshots, &registry, &mut detector, "primary.rs");
-    if events.is_empty() { return; }
+    let events = record_cpi_and_parse_events(&snapshots, &registry, &mut detector, "primary.rs");
 
-    // 3 Call events: main + 2 CPI calls.
-    let calls = call_events(&events);
-    assert!(calls.len() >= 3, "expected >= 3 Call events, got {}", calls.len());
-
-    // 3 Return events: 2 CPI returns + main return.
-    let returns = return_events(&events);
-    assert!(
-        returns.len() >= 3,
-        "expected >= 3 Return events, got {}",
-        returns.len()
+    // Function table: outer "main" + the two CPI targets in invocation order.
+    let func_names: Vec<&str> = function_events(&events)
+        .iter()
+        .map(|f| f.name.as_str())
+        .collect();
+    assert_eq!(
+        func_names,
+        vec!["main", "token_program", "associated_token"],
     );
 
-    // All program names should appear as Function events.
-    assert!(has_function_named(&events, "token_program"));
-    assert!(has_function_named(&events, "associated_token"));
+    // 3 calls: main + 2 CPIs.
+    let calls = call_events(&events);
+    assert_eq!(calls.len(), 3);
 
-    // All source files should appear as Path events.
-    assert!(has_path_containing(&events, "primary.rs"));
-    assert!(has_path_containing(&events, "token.rs"));
-    assert!(has_path_containing(&events, "ata.rs"));
+    // 3 returns: 2 CPI returns + main return.
+    let returns = return_events(&events);
+    assert_eq!(returns.len(), 3);
+
+    // Path table in registration order.
+    let paths: Vec<&Path> = path_events(&events);
+    assert_eq!(
+        paths,
+        vec![
+            Path::new("primary.rs"),
+            Path::new("token.rs"),
+            Path::new("ata.rs"),
+        ],
+    );
 }
 
 /// CPI with multiple accounts: verify register values carrying account info.
@@ -821,13 +895,21 @@ fn test_cpi_with_multiple_accounts() {
     let acct3_ptr: u64 = 0x400000200;
 
     let snapshots = vec![
-        snap_full(0, 0, acct1_ptr, acct2_ptr, acct3_ptr, 0, 0, 0, 0, 0, 0, 0x3000),
-        snap_full(1, 0, acct1_ptr, acct2_ptr, acct3_ptr, 3, 0, 0, 0, 0, 0, 0x3000),
+        snap_full(
+            0, 0, acct1_ptr, acct2_ptr, acct3_ptr, 0, 0, 0, 0, 0, 0, 0x3000,
+        ),
+        snap_full(
+            1, 0, acct1_ptr, acct2_ptr, acct3_ptr, 3, 0, 0, 0, 0, 0, 0x3000,
+        ),
         // CPI call
-        snap_full(5000, 0, acct1_ptr, acct2_ptr, acct3_ptr, 3, 0, 0, 0, 0, 0, 0x3000),
+        snap_full(
+            5000, 0, acct1_ptr, acct2_ptr, acct3_ptr, 3, 0, 0, 0, 0, 0, 0x3000,
+        ),
         snap_full(5001, 0, acct1_ptr, acct2_ptr, 0, 0, 0, 0, 0, 0, 0, 0x3000),
         // Return
-        snap_full(2, 0, acct1_ptr, acct2_ptr, acct3_ptr, 3, 0, 0, 0, 0, 0, 0x3000),
+        snap_full(
+            2, 0, acct1_ptr, acct2_ptr, acct3_ptr, 3, 0, 0, 0, 0, 0, 0x3000,
+        ),
     ];
 
     let mut registry = ProgramRegistry::new();
@@ -852,30 +934,53 @@ fn test_cpi_with_multiple_accounts() {
     let mut detector = CpiDetector::new(0..100);
     detector.add_program_range("target", 5000..5100);
 
-    let events =
-        record_cpi_and_parse_events(&snapshots, &registry, &mut detector, "lib.rs");
-    if events.is_empty() { return; }
+    let events = record_cpi_and_parse_events(&snapshots, &registry, &mut detector, "lib.rs");
 
-    // Account pointers should appear as integer values in Value events.
-    assert!(
-        has_int_value(&events, acct1_ptr as i64),
-        "account 1 pointer should be in trace"
+    // Distinct integer values across all Value events.
+    let mut int_values: Vec<i64> = events
+        .iter()
+        .filter_map(|e| match e {
+            TraceLowLevelEvent::Value(FullValueRecord {
+                value: ValueRecord::Int { i, .. },
+                ..
+            }) => Some(*i),
+            _ => None,
+        })
+        .collect();
+    int_values.sort_unstable();
+    int_values.dedup();
+    // 5000 / 5001 are the CPI program-range PC values (stored in r11).
+    assert_eq!(
+        int_values,
+        vec![
+            0i64,
+            3,
+            5000,
+            0x3000,
+            acct1_ptr as i64,
+            acct2_ptr as i64,
+            acct3_ptr as i64,
+        ],
     );
 
-    // CPI target name should appear as a Function event.
-    assert!(has_function_named(&events, "target"));
+    // Function table: main + the CPI target.
+    let func_names: Vec<&str> = function_events(&events)
+        .iter()
+        .map(|f| f.name.as_str())
+        .collect();
+    assert_eq!(func_names, vec!["main", "target"]);
 }
 
 /// CPI return value propagation: callee sets r0 before returning.
 #[test]
 fn test_cpi_return_value_propagation() {
     let snapshots = vec![
-        snap_regs(0, 0, 0, 0, 0),       // primary
-        snap_regs(5000, 0, 0, 0, 0),     // CPI call
-        snap_regs(5001, 0, 0, 0, 0),     // inside CPI
-        snap_regs(5002, 42, 0, 0, 0),    // CPI sets return value in r0
-        snap_regs(1, 42, 0, 0, 0),       // back in primary with r0=42
-        snap_regs(2, 42, 0, 0, 0),       // primary uses return value
+        snap_regs(0, 0, 0, 0, 0),     // primary
+        snap_regs(5000, 0, 0, 0, 0),  // CPI call
+        snap_regs(5001, 0, 0, 0, 0),  // inside CPI
+        snap_regs(5002, 42, 0, 0, 0), // CPI sets return value in r0
+        snap_regs(1, 42, 0, 0, 0),    // back in primary with r0=42
+        snap_regs(2, 42, 0, 0, 0),    // primary uses return value
     ];
 
     let mut registry = ProgramRegistry::new();
@@ -901,15 +1006,31 @@ fn test_cpi_return_value_propagation() {
     let mut detector = CpiDetector::new(0..100);
     detector.add_program_range("callee", 5000..5100);
 
-    let events =
-        record_cpi_and_parse_events(&snapshots, &registry, &mut detector, "primary.rs");
-    if events.is_empty() { return; }
+    let events = record_cpi_and_parse_events(&snapshots, &registry, &mut detector, "primary.rs");
 
-    // r0 = 42 should appear as an integer value in Value events.
-    assert!(
-        has_int_value(&events, 42),
-        "CPI return value 42 should be in trace"
-    );
+    // Distinct integer values across all Value events: 0, 42, plus the
+    // synthetic `target_pc=5000` argument the CPI synthesiser emits when
+    // crossing into `callee`.
+    let mut int_values: Vec<i64> = events
+        .iter()
+        .filter_map(|e| match e {
+            TraceLowLevelEvent::Value(FullValueRecord {
+                value: ValueRecord::Int { i, .. },
+                ..
+            }) => Some(*i),
+            _ => None,
+        })
+        .collect();
+    int_values.sort_unstable();
+    int_values.dedup();
+    assert_eq!(int_values, vec![0i64, 42, 5000]);
+
+    // Function table: outermost + CPI target.
+    let func_names: Vec<&str> = function_events(&events)
+        .iter()
+        .map(|f| f.name.as_str())
+        .collect();
+    assert_eq!(func_names, vec!["main", "callee"]);
 }
 
 // ===========================================================================
@@ -1005,7 +1126,7 @@ fn test_account_decode_nested_struct_flat() {
     data.extend_from_slice(&[0xBB; 8]); // discriminator
     data.extend_from_slice(&[0x42; 32]); // owner pubkey (all 0x42)
     data.extend_from_slice(&500u64.to_le_bytes()); // capacity = 500
-    // meta_name = "MyVault"
+                                                   // meta_name = "MyVault"
     let name = "MyVault";
     data.extend_from_slice(&(name.len() as u32).to_le_bytes());
     data.extend_from_slice(name.as_bytes());
@@ -1064,7 +1185,7 @@ fn test_account_decode_vec_of_u64() {
 
     let mut data = Vec::new();
     data.extend_from_slice(&[0xCC; 8]); // discriminator
-    // scores: Vec<u64> with 3 elements [10, 20, 30]
+                                        // scores: Vec<u64> with 3 elements [10, 20, 30]
     data.extend_from_slice(&3u32.to_le_bytes()); // vec length
     data.extend_from_slice(&10u64.to_le_bytes());
     data.extend_from_slice(&20u64.to_le_bytes());
@@ -1265,18 +1386,14 @@ fn test_decoded_fields_to_struct_record() {
     let mut writer = create_trace_writer("test", &[], TraceEventsFileFormat::Ctfs);
     let tmp = tempfile::TempDir::new().unwrap();
 
-    TraceWriter::begin_writing_trace_events(&mut *writer, &tmp.path().join("trace.json"))
-        .unwrap();
+    TraceWriter::begin_writing_trace_events(&mut *writer, &tmp.path().join("trace.json")).unwrap();
     TraceWriter::begin_writing_trace_metadata(
         &mut *writer,
         &tmp.path().join("trace_metadata.json"),
     )
     .unwrap();
-    TraceWriter::begin_writing_trace_paths(
-        &mut *writer,
-        &tmp.path().join("trace_paths.json"),
-    )
-    .unwrap();
+    TraceWriter::begin_writing_trace_paths(&mut *writer, &tmp.path().join("trace_paths.json"))
+        .unwrap();
     TraceWriter::start(&mut *writer, Path::new("test.rs"), Line(1));
 
     let type_ids = TypeIds::register(&mut *writer);
@@ -1299,8 +1416,7 @@ fn test_decoded_fields_to_struct_record() {
         },
     ];
 
-    let record =
-        decoded_fields_to_struct_record("TestAccount", &fields, &type_ids, &mut *writer);
+    let record = decoded_fields_to_struct_record("TestAccount", &fields, &type_ids, &mut *writer);
 
     match &record {
         ValueRecord::Struct {
@@ -1338,31 +1454,40 @@ fn test_decoded_fields_to_struct_record() {
 fn test_variable_tracking_function_params() {
     // SBF calling convention: r1-r5 are function arguments.
     let snapshots = vec![snap_full(
-        0,
-        0,    // r0 (not set yet)
+        0, 0,    // r0 (not set yet)
         1000, // r1 = param 1
         2000, // r2 = param 2
         3000, // r3 = param 3
         4000, // r4 = param 4
         5000, // r5 = param 5
-        0,
-        0,
-        0,
-        0,
-        0x3000, // r10 = frame pointer
+        0, 0, 0, 0, 0x3000, // r10 = frame pointer
     )];
 
     let source_locs: Vec<(u64, &str, u32)> = vec![(0, "params.rs", 1)];
 
     let events = record_and_parse_events(&snapshots, &source_locs, "params.rs");
-    if events.is_empty() { return; }
 
-    // All parameter registers should be present as variable names with their values.
-    assert!(has_variable_name(&events, "r1") && has_int_value(&events, 1000));
-    assert!(has_variable_name(&events, "r2") && has_int_value(&events, 2000));
-    assert!(has_variable_name(&events, "r3") && has_int_value(&events, 3000));
-    assert!(has_variable_name(&events, "r4") && has_int_value(&events, 4000));
-    assert!(has_variable_name(&events, "r5") && has_int_value(&events, 5000));
+    let var_names: Vec<&str> = variable_name_events(&events);
+    assert_eq!(
+        var_names,
+        vec!["r0", "r1", "r2", "r3", "r4", "r5", "r6", "r7", "r8", "r9", "r10"],
+    );
+
+    // Distinct integer values: zero registers, the 5 params (1000..=5000),
+    // and the frame pointer (0x3000).
+    let mut int_values: Vec<i64> = events
+        .iter()
+        .filter_map(|e| match e {
+            TraceLowLevelEvent::Value(FullValueRecord {
+                value: ValueRecord::Int { i, .. },
+                ..
+            }) => Some(*i),
+            _ => None,
+        })
+        .collect();
+    int_values.sort_unstable();
+    int_values.dedup();
+    assert_eq!(int_values, vec![0i64, 1000, 2000, 3000, 4000, 5000, 0x3000]);
 }
 
 /// Local variables in r6-r9 (callee-saved registers).
@@ -1374,27 +1499,34 @@ fn test_variable_tracking_locals() {
         snap_full(1, 0, 0, 0, 0, 0, 0, 110, 210, 310, 400, 0x3000),
     ];
 
-    let source_locs: Vec<(u64, &str, u32)> = vec![
-        (0, "locals.rs", 10),
-        (1, "locals.rs", 11),
-    ];
+    let source_locs: Vec<(u64, &str, u32)> = vec![(0, "locals.rs", 10), (1, "locals.rs", 11)];
 
     let events = record_and_parse_events(&snapshots, &source_locs, "locals.rs");
-    if events.is_empty() { return; }
 
-    // r6-r9 should be recorded at both steps as variable names.
-    assert!(has_variable_name(&events, "r6"));
-    assert!(has_variable_name(&events, "r7"));
-    assert!(has_variable_name(&events, "r8"));
-    assert!(has_variable_name(&events, "r9"));
-    // Initial values should appear as integer values.
-    assert!(has_int_value(&events, 100));
-    assert!(has_int_value(&events, 200));
-    assert!(has_int_value(&events, 300));
-    // Updated values should appear as integer values.
-    assert!(has_int_value(&events, 110));
-    assert!(has_int_value(&events, 210));
-    assert!(has_int_value(&events, 310));
+    let var_names: Vec<&str> = variable_name_events(&events);
+    assert_eq!(
+        var_names,
+        vec!["r0", "r1", "r2", "r3", "r4", "r5", "r6", "r7", "r8", "r9", "r10"],
+    );
+
+    // Distinct integer values: zero registers + the two snapshots' r6..r10
+    // (initial 100/200/300/400 and updated 110/210/310/400) + frame pointer.
+    let mut int_values: Vec<i64> = events
+        .iter()
+        .filter_map(|e| match e {
+            TraceLowLevelEvent::Value(FullValueRecord {
+                value: ValueRecord::Int { i, .. },
+                ..
+            }) => Some(*i),
+            _ => None,
+        })
+        .collect();
+    int_values.sort_unstable();
+    int_values.dedup();
+    assert_eq!(
+        int_values,
+        vec![0i64, 100, 110, 200, 210, 300, 310, 400, 0x3000],
+    );
 }
 
 /// Return value in r0.
@@ -1406,18 +1538,32 @@ fn test_variable_tracking_return_value() {
         snap_full(2, 30, 10, 20, 30, 0, 0, 0, 0, 0, 0, 0x3000), // r0 = 30 (return value)
     ];
 
-    let source_locs: Vec<(u64, &str, u32)> = vec![
-        (0, "ret.rs", 1),
-        (1, "ret.rs", 2),
-        (2, "ret.rs", 3),
-    ];
+    let source_locs: Vec<(u64, &str, u32)> =
+        vec![(0, "ret.rs", 1), (1, "ret.rs", 2), (2, "ret.rs", 3)];
 
     let events = record_and_parse_events(&snapshots, &source_locs, "ret.rs");
-    if events.is_empty() { return; }
 
-    // r0 should transition from 0 to 30.
-    assert!(has_variable_name(&events, "r0"));
-    assert!(has_int_value(&events, 30));
+    let var_names: Vec<&str> = variable_name_events(&events);
+    assert_eq!(
+        var_names,
+        vec!["r0", "r1", "r2", "r3", "r4", "r5", "r6", "r7", "r8", "r9", "r10"],
+    );
+
+    // Distinct integer values: 0 (zero registers), 10 (r1), 20 (r2),
+    // 30 (r3 / r0 return), 0x3000 (r10 frame pointer).
+    let mut int_values: Vec<i64> = events
+        .iter()
+        .filter_map(|e| match e {
+            TraceLowLevelEvent::Value(FullValueRecord {
+                value: ValueRecord::Int { i, .. },
+                ..
+            }) => Some(*i),
+            _ => None,
+        })
+        .collect();
+    int_values.sort_unstable();
+    int_values.dedup();
+    assert_eq!(int_values, vec![0i64, 10, 20, 30, 0x3000]);
 }
 
 /// Stack pointer in r10 changes across function calls.
@@ -1433,31 +1579,38 @@ fn test_variable_tracking_stack_pointer() {
         snap_full(2, 0, 0, 0, 0, 0, 0, 0, 0, 0, sp3, 0),
     ];
 
-    let source_locs: Vec<(u64, &str, u32)> = vec![
-        (0, "sp.rs", 1),
-        (1, "sp.rs", 2),
-        (2, "sp.rs", 3),
-    ];
+    let source_locs: Vec<(u64, &str, u32)> =
+        vec![(0, "sp.rs", 1), (1, "sp.rs", 2), (2, "sp.rs", 3)];
 
     let events = record_and_parse_events(&snapshots, &source_locs, "sp.rs");
-    if events.is_empty() { return; }
 
-    assert!(has_variable_name(&events, "r10"));
-    // Both stack pointer values should appear as integer values.
-    assert!(has_int_value(&events, sp1 as i64));
-    assert!(has_int_value(&events, sp2 as i64));
+    let var_names: Vec<&str> = variable_name_events(&events);
+    assert_eq!(
+        var_names,
+        vec!["r0", "r1", "r2", "r3", "r4", "r5", "r6", "r7", "r8", "r9", "r10"],
+    );
+
+    // Distinct integer values: 0 (zero registers), and the two distinct
+    // stack-pointer values (sp1 == sp3 so the set has size 2 on r10).
+    let mut int_values: Vec<i64> = events
+        .iter()
+        .filter_map(|e| match e {
+            TraceLowLevelEvent::Value(FullValueRecord {
+                value: ValueRecord::Int { i, .. },
+                ..
+            }) => Some(*i),
+            _ => None,
+        })
+        .collect();
+    int_values.sort_unstable();
+    int_values.dedup();
+    assert_eq!(int_values, vec![0i64, sp2 as i64, sp1 as i64]);
 }
 
 /// PC progression in r11: verify sequential advancement.
 #[test]
 fn test_variable_tracking_pc_progression() {
-    let snapshots = vec![
-        snap_pc(0),
-        snap_pc(1),
-        snap_pc(2),
-        snap_pc(3),
-        snap_pc(4),
-    ];
+    let snapshots = vec![snap_pc(0), snap_pc(1), snap_pc(2), snap_pc(3), snap_pc(4)];
 
     let source_locs: Vec<(u64, &str, u32)> = vec![
         (0, "pc.rs", 1),
@@ -1468,31 +1621,17 @@ fn test_variable_tracking_pc_progression() {
     ];
 
     let events = record_and_parse_events(&snapshots, &source_locs, "pc.rs");
-    if events.is_empty() { return; }
 
-    // No large PC jumps, so no spurious Call/Return events beyond main
-    // and the start-level call.
+    // No large PC jumps, so the trace has exactly one main frame: 1 call,
+    // 1 return.
     let calls = call_events(&events);
-    assert!(
-        calls.len() <= 2,
-        "expected at most 2 Call events for sequential PCs, got {}",
-        calls.len()
-    );
-
+    assert_eq!(calls.len(), 1);
     let returns = return_events(&events);
-    assert!(
-        returns.len() <= 2,
-        "expected at most 2 Return events for sequential PCs, got {}",
-        returns.len()
-    );
+    assert_eq!(returns.len(), 1);
 
-    // 5 unique lines plus the initial start step.
+    // 1 implicit start step + 5 line-changes (1..=5) = 6 step events.
     let steps = step_events(&events);
-    assert!(
-        steps.len() >= 5,
-        "expected at least 5 Step events, got {}",
-        steps.len()
-    );
+    assert_eq!(steps.len(), 6);
 }
 
 // ===========================================================================
@@ -1506,24 +1645,36 @@ fn test_error_path_missing_signature() {
     // Solana ProgramError::MissingRequiredSignature = error code 2
     let error_code: u64 = 2;
     let snapshots = vec![
-        snap_regs(0, 0, 0, 0, 0),               // setup
-        snap_regs(1, 0, 0, 0, 0),               // check signer
-        snap_regs(2, error_code, 0, 0, 0),       // error: r0 = 2
+        snap_regs(0, 0, 0, 0, 0),          // setup
+        snap_regs(1, 0, 0, 0, 0),          // check signer
+        snap_regs(2, error_code, 0, 0, 0), // error: r0 = 2
     ];
 
-    let source_locs: Vec<(u64, &str, u32)> = vec![
-        (0, "error.rs", 1),
-        (1, "error.rs", 2),
-        (2, "error.rs", 3),
-    ];
+    let source_locs: Vec<(u64, &str, u32)> =
+        vec![(0, "error.rs", 1), (1, "error.rs", 2), (2, "error.rs", 3)];
 
     let events = record_and_parse_events(&snapshots, &source_locs, "error.rs");
-    if events.is_empty() { return; }
 
-    // The error code should appear as r0's variable name.
-    assert!(has_variable_name(&events, "r0"));
-    // Value 2 should appear as an integer value for r0.
-    assert!(has_int_value(&events, 2), "error code 2 should appear as integer value");
+    let var_names: Vec<&str> = variable_name_events(&events);
+    assert_eq!(
+        var_names,
+        vec!["r0", "r1", "r2", "r3", "r4", "r5", "r6", "r7", "r8", "r9", "r10"],
+    );
+
+    // Distinct integer values: zero registers + the error code 2 in r0.
+    let mut int_values: Vec<i64> = events
+        .iter()
+        .filter_map(|e| match e {
+            TraceLowLevelEvent::Value(FullValueRecord {
+                value: ValueRecord::Int { i, .. },
+                ..
+            }) => Some(*i),
+            _ => None,
+        })
+        .collect();
+    int_values.sort_unstable();
+    int_values.dedup();
+    assert_eq!(int_values, vec![0i64, error_code as i64]);
 }
 
 /// Custom error enum with error code: simulate via larger r0 value.
@@ -1532,9 +1683,9 @@ fn test_error_path_custom_error_code() {
     // Anchor custom errors start at 6000.
     let custom_error: u64 = 6001; // e.g., ErrorCode::InsufficientFunds
     let snapshots = vec![
-        snap_regs(0, 0, 1000, 2000, 0),          // check balance
-        snap_regs(1, 0, 1000, 2000, 0),          // compare
-        snap_regs(2, custom_error, 0, 0, 0),     // error: insufficient funds
+        snap_regs(0, 0, 1000, 2000, 0),      // check balance
+        snap_regs(1, 0, 1000, 2000, 0),      // compare
+        snap_regs(2, custom_error, 0, 0, 0), // error: insufficient funds
     ];
 
     let source_locs: Vec<(u64, &str, u32)> = vec![
@@ -1544,13 +1695,22 @@ fn test_error_path_custom_error_code() {
     ];
 
     let events = record_and_parse_events(&snapshots, &source_locs, "custom_err.rs");
-    if events.is_empty() { return; }
 
-    // Custom error code 6001 should appear as an integer value.
-    assert!(
-        has_int_value(&events, 6001),
-        "custom error code 6001 should appear in trace"
-    );
+    // Distinct integer values: 0, 1000 (r1 balance), 2000 (r2 needed), 6001
+    // (custom error code in r0).
+    let mut int_values: Vec<i64> = events
+        .iter()
+        .filter_map(|e| match e {
+            TraceLowLevelEvent::Value(FullValueRecord {
+                value: ValueRecord::Int { i, .. },
+                ..
+            }) => Some(*i),
+            _ => None,
+        })
+        .collect();
+    int_values.sort_unstable();
+    int_values.dedup();
+    assert_eq!(int_values, vec![0i64, 1000, 2000, custom_error as i64]);
 }
 
 /// Panic/abort path: PC jumps to a very high address (abort handler).
@@ -1558,10 +1718,10 @@ fn test_error_path_custom_error_code() {
 fn test_error_path_panic_abort() {
     // Simulate a panic: normal execution then PC jumps to abort handler.
     let snapshots = vec![
-        snap_pc(0),      // normal
-        snap_pc(1),      // normal
-        snap_pc(90000),  // panic -> abort handler (massive forward jump)
-        snap_pc(90001),  // inside abort handler
+        snap_pc(0),     // normal
+        snap_pc(1),     // normal
+        snap_pc(90000), // panic -> abort handler (massive forward jump)
+        snap_pc(90001), // inside abort handler
     ];
 
     let source_locs: Vec<(u64, &str, u32)> = vec![
@@ -1572,17 +1732,20 @@ fn test_error_path_panic_abort() {
     ];
 
     let events = record_and_parse_events(&snapshots, &source_locs, "panic.rs");
-    if events.is_empty() { return; }
 
-    // The panic handler should be recorded as a function call (large forward jump).
-    assert!(
-        has_function_named(&events, "fn_at_pc_90000"),
-        "panic handler should appear as a function call"
+    // Function table: outer "main" + the synthesised panic-handler frame.
+    let func_names: Vec<&str> = function_events(&events)
+        .iter()
+        .map(|f| f.name.as_str())
+        .collect();
+    assert_eq!(func_names, vec!["main", "fn_at_pc_90000"]);
+
+    // Path table: user source + panicking-runtime source, in registration order.
+    let paths: Vec<&Path> = path_events(&events);
+    assert_eq!(
+        paths,
+        vec![Path::new("panic.rs"), Path::new("core/panicking.rs")],
     );
-
-    // Both source files should appear as Path events.
-    assert!(has_path_containing(&events, "panic.rs"));
-    assert!(has_path_containing(&events, "core/panicking.rs"));
 }
 
 // ===========================================================================
@@ -1623,12 +1786,29 @@ fn test_single_instruction_trace() {
     let source_locs: Vec<(u64, &str, u32)> = vec![(0, "single.rs", 1)];
 
     let events = record_and_parse_events(&snapshots, &source_locs, "single.rs");
-    if events.is_empty() { return; }
 
-    assert!(!step_events(&events).is_empty(), "should have Step events");
-    assert!(!call_events(&events).is_empty(), "should have Call events");
-    assert!(!return_events(&events).is_empty(), "should have Return events");
-    assert!(has_int_value(&events, 42), "r0 value 42 should appear"); // r0 value
+    // 1 implicit start step + 1 line-change (line 1) → de-dup with start: 2 steps.
+    let steps = step_events(&events);
+    assert_eq!(steps.len(), 2);
+    let calls = call_events(&events);
+    assert_eq!(calls.len(), 1);
+    let returns = return_events(&events);
+    assert_eq!(returns.len(), 1);
+
+    // Distinct integer values: 0 (zero registers), 1, 2, 3 (r1..r3), 42 (r0).
+    let mut int_values: Vec<i64> = events
+        .iter()
+        .filter_map(|e| match e {
+            TraceLowLevelEvent::Value(FullValueRecord {
+                value: ValueRecord::Int { i, .. },
+                ..
+            }) => Some(*i),
+            _ => None,
+        })
+        .collect();
+    int_values.sort_unstable();
+    int_values.dedup();
+    assert_eq!(int_values, vec![0i64, 1, 2, 3, 42]);
 }
 
 /// Empty trace (no snapshots) still produces valid output files.
@@ -1638,13 +1818,7 @@ fn test_empty_trace() {
     let source_locs: Vec<(u64, &str, u32)> = vec![];
 
     let tmp = tempfile::TempDir::new().unwrap();
-    record_from_snapshots(
-        &snapshots,
-        &source_locs,
-        Path::new("empty.rs"),
-        tmp.path(),
-    )
-    .unwrap();
+    record_from_snapshots(&snapshots, &source_locs, Path::new("empty.rs"), tmp.path()).unwrap();
 
     // Verify .ct output with CTFS magic bytes.
     let ct_files: Vec<_> = std::fs::read_dir(tmp.path())
@@ -1690,7 +1864,7 @@ fn test_cpi_skip_level_return() {
     detector.add_program_range("program_b", 2000..2100);
 
     // primary -> A -> B -> directly back to primary (skip A).
-    detector.process_snapshot(&snap_pc(10));   // primary
+    detector.process_snapshot(&snap_pc(10)); // primary
     detector.process_snapshot(&snap_pc(1010)); // CPI to A
     detector.process_snapshot(&snap_pc(2010)); // CPI to B from A
 
@@ -1710,18 +1884,18 @@ fn test_cpi_repeated_calls() {
     detector.add_program_range("token", 1000..1100);
 
     // Call token program twice.
-    detector.process_snapshot(&snap_pc(5));    // primary
+    detector.process_snapshot(&snap_pc(5)); // primary
     detector.process_snapshot(&snap_pc(1005)); // CPI to token
     assert_eq!(detector.call_depth(), 1);
 
-    detector.process_snapshot(&snap_pc(10));   // return to primary
+    detector.process_snapshot(&snap_pc(10)); // return to primary
     assert_eq!(detector.call_depth(), 0);
 
     detector.process_snapshot(&snap_pc(1010)); // second CPI to token
     assert_eq!(detector.call_depth(), 1);
     assert_eq!(detector.current_program(), "token");
 
-    detector.process_snapshot(&snap_pc(15));   // return to primary
+    detector.process_snapshot(&snap_pc(15)); // return to primary
     assert_eq!(detector.call_depth(), 0);
 }
 
@@ -1738,12 +1912,7 @@ fn test_tracer_trait_syscall_recording() {
         (1, "test.rs".to_string(), 2),
     ];
 
-    let mut tracer = CodeTracerTracer::new(
-        Path::new("test.rs"),
-        tmp.path(),
-        source_locs,
-    )
-    .unwrap();
+    let mut tracer = CodeTracerTracer::new(Path::new("test.rs"), tmp.path(), source_locs).unwrap();
 
     let regs = [0u64; 12];
     tracer.on_syscall("sol_log", &regs);
@@ -1777,12 +1946,8 @@ fn test_replay_snapshots_produces_trace() {
         (2, "replay.rs".to_string(), 3),
     ];
 
-    let mut tracer = CodeTracerTracer::new(
-        Path::new("replay.rs"),
-        tmp.path(),
-        source_locs,
-    )
-    .unwrap();
+    let mut tracer =
+        CodeTracerTracer::new(Path::new("replay.rs"), tmp.path(), source_locs).unwrap();
 
     replay_snapshots(&mut tracer, &snapshots);
     tracer.finish().unwrap();
@@ -1804,7 +1969,22 @@ fn test_replay_snapshots_produces_trace() {
 #[test]
 fn test_noop_tracer_large_trace() {
     let snapshots: Vec<RegisterSnapshot> = (0..10_000)
-        .map(|i| snap_full(i, i * 2, i + 1, i + 2, i + 3, i + 4, i + 5, 0, 0, 0, 0, 0x3000))
+        .map(|i| {
+            snap_full(
+                i,
+                i * 2,
+                i + 1,
+                i + 2,
+                i + 3,
+                i + 4,
+                i + 5,
+                0,
+                0,
+                0,
+                0,
+                0x3000,
+            )
+        })
         .collect();
 
     let mut tracer = NoOpTracer;
@@ -1930,18 +2110,10 @@ fn test_decoded_value_display() {
 #[test]
 fn test_program_registry_first_match() {
     let mut registry = ProgramRegistry::new();
-    registry.add_synthetic_program(
-        "first",
-        0..100,
-        vec![(50, "first.rs".to_string(), 1)],
-    );
+    registry.add_synthetic_program("first", 0..100, vec![(50, "first.rs".to_string(), 1)]);
     // Adding a second program with an overlapping range: should never match
     // since first is checked first.
-    registry.add_synthetic_program(
-        "second",
-        50..150,
-        vec![(50, "second.rs".to_string(), 1)],
-    );
+    registry.add_synthetic_program("second", 50..150, vec![(50, "second.rs".to_string(), 1)]);
 
     // PC=50 falls in both ranges, but "first" is checked first.
     assert_eq!(registry.program_name(50), Some("first"));
@@ -1965,7 +2137,9 @@ fn test_cpi_large_multi_program_trace() {
     registry.add_synthetic_program(
         "primary",
         0..100,
-        (0..10).map(|pc| (pc, "primary.rs".to_string(), pc as u32 + 1)).collect(),
+        (0..10)
+            .map(|pc| (pc, "primary.rs".to_string(), pc as u32 + 1))
+            .collect(),
     );
 
     // CPI to program A: PC 1000..1009
@@ -2017,27 +2191,36 @@ fn test_cpi_large_multi_program_trace() {
         snapshots.push(snap_pc(pc));
     }
 
-    let events =
-        record_cpi_and_parse_events(&snapshots, &registry, &mut detector, "primary.rs");
-    if events.is_empty() { return; }
+    let events = record_cpi_and_parse_events(&snapshots, &registry, &mut detector, "primary.rs");
 
-    // All 4 programs should appear as Path or Function events.
-    assert!(
-        has_path_containing(&events, "primary.rs") || has_function_named(&events, "primary"),
+    // Function table: outer "main" + the 3 CPI targets in invocation order
+    // (program_a → program_b, then primary returns to A and re-enters as
+    // program_c).
+    let func_names: Vec<&str> = function_events(&events)
+        .iter()
+        .map(|f| f.name.as_str())
+        .collect();
+    assert_eq!(
+        func_names,
+        vec!["main", "program_a", "program_b", "program_c"],
     );
-    assert!(has_function_named(&events, "program_a"));
-    assert!(has_function_named(&events, "program_b"));
-    assert!(has_function_named(&events, "program_c"));
 
-    // Multiple Call/Return events.
+    // 4 calls (main + 3 CPIs), 4 matching returns.
     let calls = call_events(&events);
-    assert!(calls.len() >= 4, "expected >= 4 Call events, got {}", calls.len());
-
+    assert_eq!(calls.len(), 4);
     let returns = return_events(&events);
-    assert!(
-        returns.len() >= 3,
-        "expected >= 3 Return events, got {}",
-        returns.len()
+    assert_eq!(returns.len(), 4);
+
+    // Path table contains all 4 source files in registration order.
+    let paths: Vec<&Path> = path_events(&events);
+    assert_eq!(
+        paths,
+        vec![
+            Path::new("primary.rs"),
+            Path::new("a.rs"),
+            Path::new("b.rs"),
+            Path::new("c.rs"),
+        ],
     );
 }
 
@@ -2053,20 +2236,11 @@ fn test_trace_output_valid_json() {
         snap_regs(1, 0, 10, 20, 30),
         snap_regs(2, 30, 0, 0, 0),
     ];
-    let source_locs: Vec<(u64, &str, u32)> = vec![
-        (0, "valid.rs", 1),
-        (1, "valid.rs", 2),
-        (2, "valid.rs", 3),
-    ];
+    let source_locs: Vec<(u64, &str, u32)> =
+        vec![(0, "valid.rs", 1), (1, "valid.rs", 2), (2, "valid.rs", 3)];
 
     let tmp = tempfile::TempDir::new().unwrap();
-    record_from_snapshots(
-        &snapshots,
-        &source_locs,
-        Path::new("valid.rs"),
-        tmp.path(),
-    )
-    .unwrap();
+    record_from_snapshots(&snapshots, &source_locs, Path::new("valid.rs"), tmp.path()).unwrap();
 
     // Verify .ct output with CTFS magic bytes.
     let ct_files: Vec<_> = std::fs::read_dir(tmp.path())
@@ -2104,13 +2278,15 @@ fn test_unmapped_pcs_are_skipped() {
     ];
 
     let events = record_and_parse_events(&snapshots, &source_locs, "mapped.rs");
-    if events.is_empty() { return; }
 
-    // 2 Step events for the mapped PCs, plus the initial start step.
+    // 1 implicit start step (line 1 of source_path) + 2 mapped line-changes
+    // (the snapshots map to lines 1 and 2).  The start emits at line 1,
+    // then snapshot 0 (also line 1) is suppressed by line-dedup, and
+    // snapshot 3 (line 2) emits — but the recorder also re-emits the start
+    // line after the unmapped block, so the final step count is 3:
+    // start@1, then 1, then 2.
     let steps = step_events(&events);
-    assert!(
-        steps.len() >= 2 && steps.len() <= 4,
-        "expected 2-4 Step events for mapped PCs + start, got {}",
-        steps.len()
-    );
+    assert_eq!(steps.len(), 3);
+    let step_lines: Vec<i64> = steps.iter().map(|s| s.line.0).collect();
+    assert_eq!(step_lines, vec![1i64, 1, 2]);
 }
