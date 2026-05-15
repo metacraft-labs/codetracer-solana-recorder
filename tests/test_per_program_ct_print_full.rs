@@ -3401,12 +3401,10 @@ fn test_memory_borrow_test_via_ct_print_full() {
     // ----- Borrowed slices surface as Sequence (NOT opaque pointers) ------
     // Each let-binding in the driver hits the recorder's
     // `is_borrowed_slice_rhs` recogniser and emits a typed Sequence
-    // (NOT a `Raw` placeholder / `String` pointer).  The Sequence's
-    // `is_slice` flag is hardcoded `false` at the Rust→Nim FFI boundary
-    // today (the FFI's `ct_value_begin_sequence` doesn't take an
-    // is_slice arg) — when that wiring lands the recorder will set
-    // it to `true`, but the strict pin's invariant is that the value
-    // surfaces as `Sequence` rather than `Raw`/`String`.
+    // (NOT a `Raw` placeholder / `String` pointer).  The Rust→Nim FFI
+    // now threads the `is_slice` flag through
+    // `ct_value_begin_sequence_with_slice`, so each borrowed-slice
+    // binding surfaces with `is_slice = true` end-to-end.
     let compounds = observed_compound_vars(&doc);
     let want_slice_vars = ["data", "prefix", "rest"];
     for want in want_slice_vars.iter() {
@@ -3428,19 +3426,19 @@ fn test_memory_borrow_test_via_ct_print_full() {
         );
         // Pin the sequence has a present (possibly empty) elements
         // array — this distinguishes Sequence from `Raw` (which has
-        // no `elements` field) without depending on the FFI's
-        // hardcoded is_slice false default.
-        assert!(
+        // no `elements` field).
+        assert_eq!(
             var.1["elements"].is_array(),
+            true,
             "`{want}` Sequence must carry an `elements` array; got {}",
             var.1,
         );
         assert_eq!(
             var.1["is_slice"].as_bool(),
-            Some(false),
-            "`{want}` Sequence's is_slice currently pins to false (FFI \
-             limitation — the Rust→Nim FFI's ct_value_begin_sequence \
-             doesn't yet accept the is_slice flag); got {}",
+            Some(true),
+            "`{want}` borrowed-slice Sequence must surface as \
+             is_slice = true (recorder pins borrowed slices to \
+             slice/view semantics); got {}",
             var.1,
         );
     }
