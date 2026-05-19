@@ -55,8 +55,7 @@ impl DwarfParser {
         // We need the data to live as long as the context, so we leak a copy.
         let owned: &'static [u8] = Vec::leak(elf_data.to_vec());
 
-        let obj = object::File::parse(owned)
-            .map_err(|e| eyre!("failed to parse ELF: {e}"))?;
+        let obj = object::File::parse(owned).map_err(|e| eyre!("failed to parse ELF: {e}"))?;
 
         // Find .text section virtual address.
         let text_vaddr = obj
@@ -106,9 +105,7 @@ impl DwarfParser {
     ///
     /// Uses the formula: `elf_addr = text_vaddr + (sbf_pc * 8)`.
     pub fn find_location(&self, sbf_pc: u64) -> Option<SourceLocation> {
-        let elf_addr = self
-            .text_vaddr
-            .checked_add(sbf_pc.checked_mul(8)?)?;
+        let elf_addr = self.text_vaddr.checked_add(sbf_pc.checked_mul(8)?)?;
         let loc = self.context.find_location(elf_addr).ok()??;
         Some(SourceLocation {
             file: loc.file?.to_string(),
@@ -134,8 +131,7 @@ pub fn find_functions(elf_data: &[u8]) -> Result<Vec<FunctionBoundary>> {
     use object::Object;
 
     let owned: &'static [u8] = Vec::leak(elf_data.to_vec());
-    let obj = object::File::parse(owned)
-        .map_err(|e| eyre!("failed to parse ELF: {e}"))?;
+    let obj = object::File::parse(owned).map_err(|e| eyre!("failed to parse ELF: {e}"))?;
 
     let endian = if obj.is_little_endian() {
         gimli::RunTimeEndian::Little
@@ -161,13 +157,19 @@ pub fn find_functions(elf_data: &[u8]) -> Result<Vec<FunctionBoundary>> {
     let mut functions = Vec::new();
     let mut units = dwarf.units();
 
-    while let Some(unit_header) = units.next().map_err(|e| eyre!("DWARF unit iteration: {e}"))? {
+    while let Some(unit_header) = units
+        .next()
+        .map_err(|e| eyre!("DWARF unit iteration: {e}"))?
+    {
         let unit = dwarf
             .unit(unit_header)
             .map_err(|e| eyre!("failed to parse DWARF unit: {e}"))?;
 
         let mut entries = unit.entries();
-        while let Some((_, entry)) = entries.next_dfs().map_err(|e| eyre!("DIE iteration: {e}"))? {
+        while let Some((_, entry)) = entries
+            .next_dfs()
+            .map_err(|e| eyre!("DIE iteration: {e}"))?
+        {
             if entry.tag() != gimli::DW_TAG_subprogram {
                 continue;
             }
@@ -180,14 +182,16 @@ pub fn find_functions(elf_data: &[u8]) -> Result<Vec<FunctionBoundary>> {
             };
 
             // --- address range --------------------------------------------------
-            let low_pc = match entry.attr_value(gimli::DW_AT_low_pc)
+            let low_pc = match entry
+                .attr_value(gimli::DW_AT_low_pc)
                 .map_err(|e| eyre!("DW_AT_low_pc: {e}"))?
             {
                 Some(gimli::AttributeValue::Addr(addr)) => addr,
                 _ => continue, // no low_pc — declaration or abstract origin
             };
 
-            let high_pc = match entry.attr_value(gimli::DW_AT_high_pc)
+            let high_pc = match entry
+                .attr_value(gimli::DW_AT_high_pc)
                 .map_err(|e| eyre!("DW_AT_high_pc: {e}"))?
             {
                 Some(gimli::AttributeValue::Addr(addr)) => addr,

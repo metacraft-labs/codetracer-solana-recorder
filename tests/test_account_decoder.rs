@@ -4,8 +4,8 @@ use codetracer_solana_recorder::account_decoder::{
     AnchorIdl, BorshDecoder, DecodedField, DecodedValue, TypeIds, decoded_to_value_record,
 };
 use codetracer_trace_types::ValueRecord;
-use codetracer_trace_writer_nim::{TraceEventsFileFormat, create_trace_writer};
 use codetracer_trace_writer_nim::trace_writer::TraceWriter;
+use codetracer_trace_writer_nim::{TraceEventsFileFormat, create_trace_writer};
 
 // ---------------------------------------------------------------------------
 // Borsh decoding tests
@@ -176,15 +176,13 @@ fn test_decoded_to_value_record() {
     // Create a trace writer to register types.
     let mut writer = create_trace_writer("test", &[], TraceEventsFileFormat::Ctfs);
 
-    // We need to call start before registering types.
+    // We need to call start before registering types.  Legacy
+    // metadata/paths sidecar begin calls were no-ops on the Nim side and
+    // were retired with the v3 CTFS rollout (follow-up #254 phase 2).
     let tmp = tempfile::tempdir().unwrap();
     let events_path = tmp.path().join("trace.json");
-    let meta_path = tmp.path().join("trace_metadata.json");
-    let paths_path = tmp.path().join("trace_paths.json");
 
     TraceWriter::begin_writing_trace_events(&mut *writer, &events_path).unwrap();
-    TraceWriter::begin_writing_trace_metadata(&mut *writer, &meta_path).unwrap();
-    TraceWriter::begin_writing_trace_paths(&mut *writer, &paths_path).unwrap();
 
     TraceWriter::start(
         &mut *writer,
@@ -696,12 +694,12 @@ fn test_realistic_large_values() {
     let data = borsh_serialize_account(
         anchor_discriminator("Vault"),
         &[
-            BorshField::U64(u64::MAX),          // max supply at u64::MAX
-            BorshField::U64(0),                  // zero balance
-            BorshField::U16(250),                // 2.5% fee in basis points
-            BorshField::U8(1),                   // version 1
-            BorshField::U8(255),                 // nonce at u8::MAX
-            BorshField::I64(-1_700_000_000),     // negative Unix timestamp (testing i64)
+            BorshField::U64(u64::MAX),       // max supply at u64::MAX
+            BorshField::U64(0),              // zero balance
+            BorshField::U16(250),            // 2.5% fee in basis points
+            BorshField::U8(1),               // version 1
+            BorshField::U8(255),             // nonce at u8::MAX
+            BorshField::I64(-1_700_000_000), // negative Unix timestamp (testing i64)
         ],
     );
 
@@ -775,7 +773,11 @@ fn test_realistic_empty_account() {
     let data = borsh_serialize_account(anchor_discriminator("Marker"), &[]);
 
     let fields = idl.decode_account("Marker", &data).unwrap();
-    assert_eq!(fields.len(), 0, "empty account should decode to zero fields");
+    assert_eq!(
+        fields.len(),
+        0,
+        "empty account should decode to zero fields"
+    );
 }
 
 // ---------------------------------------------------------------------------

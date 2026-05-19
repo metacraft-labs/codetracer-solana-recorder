@@ -122,8 +122,8 @@ fn test_real_elf_dwarf_source_mapping_pipeline() {
         .map(|(i, (pc, _file, _line))| {
             let mut regs = [0u64; 11];
             regs[0] = (i as u64) * 100 + 42; // r0 = return value
-            regs[1] = (i as u64) * 10;        // r1
-            regs[2] = (i as u64) + 1;         // r2
+            regs[1] = (i as u64) * 10; // r1
+            regs[2] = (i as u64) + 1; // r2
             (*pc, regs)
         })
         .collect();
@@ -147,14 +147,19 @@ fn test_real_elf_dwarf_source_mapping_pipeline() {
 
     // Verify .ct output.
     let ct_files: Vec<_> = std::fs::read_dir(tmp.path())
-        .unwrap().filter_map(|e| e.ok()).map(|e| e.path())
-        .filter(|p| p.extension().map_or(false, |ext| ext == "ct")).collect();
+        .unwrap()
+        .filter_map(|e| e.ok())
+        .map(|e| e.path())
+        .filter(|p| p.extension().map_or(false, |ext| ext == "ct"))
+        .collect();
     assert!(!ct_files.is_empty(), "expected .ct file");
     let ct_content = std::fs::read(&ct_files[0]).unwrap();
     assert!(ct_content.len() >= 5 && ct_content[..5] == [0xC0, 0xDE, 0x72, 0xAC, 0xE2]);
     // CTFS: event-level checks deferred.
     let events: Vec<TraceLowLevelEvent> = vec![];
-    if events.is_empty() { return; }
+    if events.is_empty() {
+        return;
+    }
 
     // --- Verify Step events ---
     let step_events: Vec<_> = events
@@ -241,9 +246,10 @@ fn test_real_elf_dwarf_source_mapping_pipeline() {
         &int_values[..std::cmp::min(20, int_values.len())]
     );
 
-    // --- Verify 3-file output ---
-    assert!(tmp.path().join("trace_metadata.json").exists());
-    assert!(tmp.path().join("trace_paths.json").exists());
+    // Legacy 3-file output (trace_metadata.json + trace_paths.json
+    // sidecars) was retired with the v3 CTFS rollout (follow-up #254
+    // phase 2); program / paths metadata now lives in `meta.dat`
+    // inside the `.ct` container.
 }
 
 // ===========================================================================
@@ -261,10 +267,7 @@ fn test_real_elf_function_boundaries_in_trace() {
 
     // Find function boundaries from DWARF.
     let functions = find_functions(&elf_data).expect("find_functions should succeed");
-    assert!(
-        functions.len() >= 2,
-        "need at least 2 functions from DWARF"
-    );
+    assert!(functions.len() >= 2, "need at least 2 functions from DWARF");
 
     // Pick two functions with non-overlapping address ranges.
     let func_a = &functions[0];
@@ -288,11 +291,11 @@ fn test_real_elf_function_boundaries_in_trace() {
     // Build register snapshots: start in func_a, jump to func_b (simulating
     // a call), then jump back (simulating a return).
     let entries = vec![
-        (pc_a, [0u64; 11]),         // In function A
-        (pc_a + 1, [10u64; 11]),    // Still in A (sequential)
-        (pc_b, [20u64; 11]),        // Jump to function B (call)
-        (pc_b + 1, [30u64; 11]),    // In function B
-        (pc_a + 2, [40u64; 11]),    // Back in function A (return)
+        (pc_a, [0u64; 11]),      // In function A
+        (pc_a + 1, [10u64; 11]), // Still in A (sequential)
+        (pc_b, [20u64; 11]),     // Jump to function B (call)
+        (pc_b + 1, [30u64; 11]), // In function B
+        (pc_a + 2, [40u64; 11]), // Back in function A (return)
     ];
 
     let regs_data = build_regs_data(&entries);
@@ -313,15 +316,19 @@ fn test_real_elf_function_boundaries_in_trace() {
     // Parse trace output.
     // Verify .ct output and skip event checks.
     let ct_files2: Vec<_> = std::fs::read_dir(tmp.path())
-        .unwrap().filter_map(|e| e.ok()).map(|e| e.path())
-        .filter(|p| p.extension().map_or(false, |ext| ext == "ct")).collect();
+        .unwrap()
+        .filter_map(|e| e.ok())
+        .map(|e| e.path())
+        .filter(|p| p.extension().map_or(false, |ext| ext == "ct"))
+        .collect();
     assert!(!ct_files2.is_empty(), "expected .ct file");
     // CTFS: event-level checks deferred.
     let content = String::new();
     let events: Vec<TraceLowLevelEvent> = vec![];
-    if events.is_empty() { return; }
-    let events: Vec<TraceLowLevelEvent> =
-        serde_json::from_str(&content).expect("valid JSON");
+    if events.is_empty() {
+        return;
+    }
+    let events: Vec<TraceLowLevelEvent> = serde_json::from_str(&content).expect("valid JSON");
 
     // Count event types.
     let call_count = events
@@ -393,16 +400,20 @@ fn test_dwarf_line_fidelity_per_location() {
         assert!(result.is_ok(), "recording should succeed for PC {pc}");
 
         // Verify .ct output and skip event checks.
-    let ct_files2: Vec<_> = std::fs::read_dir(tmp.path())
-        .unwrap().filter_map(|e| e.ok()).map(|e| e.path())
-        .filter(|p| p.extension().map_or(false, |ext| ext == "ct")).collect();
-    assert!(!ct_files2.is_empty(), "expected .ct file");
-    // CTFS: event-level checks deferred.
-    let content = String::new();
-    let events: Vec<TraceLowLevelEvent> = vec![];
-    if events.is_empty() { return; }
-        let events: Vec<TraceLowLevelEvent> =
-            serde_json::from_str(&content).expect("valid JSON");
+        let ct_files2: Vec<_> = std::fs::read_dir(tmp.path())
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .map(|e| e.path())
+            .filter(|p| p.extension().map_or(false, |ext| ext == "ct"))
+            .collect();
+        assert!(!ct_files2.is_empty(), "expected .ct file");
+        // CTFS: event-level checks deferred.
+        let content = String::new();
+        let events: Vec<TraceLowLevelEvent> = vec![];
+        if events.is_empty() {
+            return;
+        }
+        let events: Vec<TraceLowLevelEvent> = serde_json::from_str(&content).expect("valid JSON");
 
         let step_events: Vec<_> = events
             .iter()
@@ -458,7 +469,7 @@ fn test_register_trace_roundtrip_with_dwarf() {
         .map(|(i, (pc, _, _))| {
             let mut regs = [0u64; 11];
             regs[0] = i as u64 * 7 + 1; // r0
-            regs[1] = i as u64 * 13;    // r1
+            regs[1] = i as u64 * 13; // r1
             (*pc, regs)
         })
         .collect();
@@ -499,15 +510,19 @@ fn test_register_trace_roundtrip_with_dwarf() {
 
     // Verify .ct output and skip event checks.
     let ct_files2: Vec<_> = std::fs::read_dir(tmp.path())
-        .unwrap().filter_map(|e| e.ok()).map(|e| e.path())
-        .filter(|p| p.extension().map_or(false, |ext| ext == "ct")).collect();
+        .unwrap()
+        .filter_map(|e| e.ok())
+        .map(|e| e.path())
+        .filter(|p| p.extension().map_or(false, |ext| ext == "ct"))
+        .collect();
     assert!(!ct_files2.is_empty(), "expected .ct file");
     // CTFS: event-level checks deferred.
     let content = String::new();
     let events: Vec<TraceLowLevelEvent> = vec![];
-    if events.is_empty() { return; }
-    let events: Vec<TraceLowLevelEvent> =
-        serde_json::from_str(&content).expect("valid JSON");
+    if events.is_empty() {
+        return;
+    }
+    let events: Vec<TraceLowLevelEvent> = serde_json::from_str(&content).expect("valid JSON");
 
     // Count steps -- should be at least as many as distinct source locations.
     let step_count = events

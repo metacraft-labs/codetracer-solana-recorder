@@ -4,7 +4,9 @@
 //! that PC-to-source-line resolution works correctly, complementing the
 //! synthetic data tests in other test files.
 
-use codetracer_solana_recorder::dwarf::{DwarfParser, FunctionBoundary, SourceLocation, find_functions};
+use codetracer_solana_recorder::dwarf::{
+    DwarfParser, FunctionBoundary, SourceLocation, find_functions,
+};
 
 // ---------------------------------------------------------------------------
 // Tests: error handling
@@ -128,7 +130,9 @@ fn test_dwarf_parser_multiple_locations() {
     for sbf_pc in 0..200_000u64 {
         if let Some(loc) = parser.find_location(sbf_pc) {
             // Only collect distinct locations (different file or line).
-            if loc.file != last_file || locations.last().map(|l: &SourceLocation| l.line) != Some(loc.line) {
+            if loc.file != last_file
+                || locations.last().map(|l: &SourceLocation| l.line) != Some(loc.line)
+            {
                 last_file = loc.file.clone();
                 locations.push(loc);
                 if locations.len() >= 10 {
@@ -175,7 +179,16 @@ fn test_dwarf_parser_address_formula_no_panic() {
     // Various PC values should not panic, including edge cases.
     // The overflow-safe formula uses checked arithmetic, so even extreme
     // values return None instead of panicking.
-    for &pc in &[0, 1, 100, 1_000, 10_000, 100_000, u64::MAX / 8 - 1, u64::MAX] {
+    for &pc in &[
+        0,
+        1,
+        100,
+        1_000,
+        10_000,
+        100_000,
+        u64::MAX / 8 - 1,
+        u64::MAX,
+    ] {
         let _result = parser.find_location(pc);
     }
 }
@@ -317,7 +330,8 @@ fn test_find_functions_on_real_binary() {
     let binary_path = env!("CARGO_BIN_EXE_codetracer-solana-recorder");
     let elf_data = std::fs::read(binary_path).expect("should be able to read the test binary");
 
-    let functions = find_functions(&elf_data).expect("find_functions should succeed on a real binary");
+    let functions =
+        find_functions(&elf_data).expect("find_functions should succeed on a real binary");
 
     assert!(
         !functions.is_empty(),
@@ -349,7 +363,11 @@ fn test_find_functions_contains_main() {
     assert!(
         has_main,
         "should find a 'main' function boundary; found: {:?}",
-        functions.iter().map(|f| &f.name).take(20).collect::<Vec<_>>()
+        functions
+            .iter()
+            .map(|f| &f.name)
+            .take(20)
+            .collect::<Vec<_>>()
     );
 }
 
@@ -401,7 +419,8 @@ fn test_find_functions_address_lookup() {
         mid_addr
     );
     assert_eq!(
-        found.unwrap().name, func.name,
+        found.unwrap().name,
+        func.name,
         "address should resolve to the expected function"
     );
 }
@@ -459,7 +478,10 @@ fn test_function_boundary_equality_and_clone() {
         start_addr: 0x2000,
         end_addr: 0x2080,
     };
-    assert_ne!(fb1, fb3, "different FunctionBoundary values should not be equal");
+    assert_ne!(
+        fb1, fb3,
+        "different FunctionBoundary values should not be equal"
+    );
 }
 
 /// FunctionBoundary debug formatting includes all fields.
@@ -471,6 +493,12 @@ fn test_function_boundary_debug() {
         end_addr: 0x4100,
     };
     let debug = format!("{:?}", fb);
-    assert!(debug.contains("my_func"), "debug should contain function name");
-    assert!(debug.contains("4000") || debug.contains("16384"), "debug should contain start_addr");
+    assert!(
+        debug.contains("my_func"),
+        "debug should contain function name"
+    );
+    assert!(
+        debug.contains("4000") || debug.contains("16384"),
+        "debug should contain start_addr"
+    );
 }

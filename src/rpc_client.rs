@@ -165,30 +165,20 @@ fn send_rpc_request(rpc_url: &str, body: &RpcRequest<'_>) -> Result<RpcResponse>
         .context("failed to deserialize JSON-RPC response")?;
 
     if let Some(err) = &rpc_resp.error {
-        bail!(
-            "RPC error (code {}): {}",
-            err.code,
-            err.message
-        );
+        bail!("RPC error (code {}): {}", err.code, err.message);
     }
 
     Ok(rpc_resp)
 }
 
 /// Parse a `getTransaction` JSON-RPC result into [`TransactionData`].
-pub fn parse_transaction_response(
-    signature: &str,
-    resp: &RpcResponse,
-) -> Result<TransactionData> {
+pub fn parse_transaction_response(signature: &str, resp: &RpcResponse) -> Result<TransactionData> {
     let result = resp
         .result
         .as_ref()
         .ok_or_else(|| eyre!("getTransaction returned null for signature {signature}"))?;
 
-    let slot = result
-        .get("slot")
-        .and_then(|v| v.as_u64())
-        .unwrap_or(0);
+    let slot = result.get("slot").and_then(|v| v.as_u64()).unwrap_or(0);
 
     // Extract account keys from the transaction message.
     let message = result
@@ -225,7 +215,11 @@ pub fn parse_transaction_response(
             let account_indices: Vec<u8> = ix
                 .get("accounts")
                 .and_then(|a| a.as_array())
-                .map(|arr| arr.iter().filter_map(|v| v.as_u64().map(|n| n as u8)).collect())
+                .map(|arr| {
+                    arr.iter()
+                        .filter_map(|v| v.as_u64().map(|n| n as u8))
+                        .collect()
+                })
                 .unwrap_or_default();
             let data = ix
                 .get("data")
@@ -269,10 +263,7 @@ pub fn parse_account_response(pubkey: &str, resp: &RpcResponse) -> Result<Accoun
         bail!("account {pubkey} not found (value is null)");
     }
 
-    let lamports = value
-        .get("lamports")
-        .and_then(|v| v.as_u64())
-        .unwrap_or(0);
+    let lamports = value.get("lamports").and_then(|v| v.as_u64()).unwrap_or(0);
 
     let owner = value
         .get("owner")

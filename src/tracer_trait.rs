@@ -17,7 +17,7 @@ use codetracer_trace_writer_nim::trace_writer::TraceWriter;
 use codetracer_trace_writer_nim::{TraceEventsFileFormat, create_trace_writer};
 use eyre::{Result, eyre};
 
-use crate::register_trace::{RegisterSnapshot, ROW_SIZE};
+use crate::register_trace::{ROW_SIZE, RegisterSnapshot};
 
 // The recorder is CTFS-only per `Recorder-CLI-Conventions.md` §4 (see
 // `codetracer-specs`).  We pin every `create_trace_writer` call site to
@@ -119,35 +119,23 @@ impl CodeTracerTracer {
         out_dir: &Path,
         source_locations: Vec<(u64, String, u32)>,
     ) -> Result<Self> {
-        std::fs::create_dir_all(out_dir)
-            .map_err(|e| eyre!("cannot create output dir: {e}"))?;
+        std::fs::create_dir_all(out_dir).map_err(|e| eyre!("cannot create output dir: {e}"))?;
 
         let program_name = source_path.to_string_lossy();
         let mut writer = create_trace_writer(&program_name, &[], CTFS_FORMAT);
 
         // CTFS-only writer — events stream lives in `trace.bin`.
         let events_path = out_dir.join("trace.bin");
-        let metadata_path = out_dir.join("trace_metadata.json");
-        let paths_path = out_dir.join("trace_paths.json");
 
         TraceWriter::begin_writing_trace_events(&mut *writer, &events_path)
-            .map_err(|e| eyre!("{e}"))?;
-        TraceWriter::begin_writing_trace_metadata(&mut *writer, &metadata_path)
-            .map_err(|e| eyre!("{e}"))?;
-        TraceWriter::begin_writing_trace_paths(&mut *writer, &paths_path)
             .map_err(|e| eyre!("{e}"))?;
 
         TraceWriter::start(&mut *writer, source_path, Line(1));
 
-        let u64_type_id =
-            TraceWriter::ensure_type_id(&mut *writer, TypeKind::Int, "u64");
+        let u64_type_id = TraceWriter::ensure_type_id(&mut *writer, TypeKind::Int, "u64");
 
-        let main_fn_id = TraceWriter::ensure_function_id(
-            &mut *writer,
-            "main",
-            source_path,
-            Line(1),
-        );
+        let main_fn_id =
+            TraceWriter::ensure_function_id(&mut *writer, "main", source_path, Line(1));
         TraceWriter::register_call(&mut *writer, main_fn_id, vec![]);
 
         let loc_map = source_locations
@@ -170,11 +158,9 @@ impl CodeTracerTracer {
     /// Flush and finalise all trace files. Must be called when done.
     pub fn finish(&mut self) -> Result<()> {
         TraceWriter::register_return(&mut *self.writer, NONE_VALUE);
-        TraceWriter::finish_writing_trace_events(&mut *self.writer)
-            .map_err(|e| eyre!("{e}"))?;
-        TraceWriter::finish_writing_trace_metadata(&mut *self.writer)
-            .map_err(|e| eyre!("{e}"))?;
-        TraceWriter::finish_writing_trace_paths(&mut *self.writer)
+        TraceWriter::finish_writing_trace_events(&mut *self.writer).map_err(|e| eyre!("{e}"))?;
+        self.writer
+            .write_meta_dat("codetracer-solana-recorder")
             .map_err(|e| eyre!("{e}"))?;
         self.writer.close().map_err(|e| eyre!("{e}"))?;
         Ok(())
@@ -215,11 +201,7 @@ impl SbpfTracer for CodeTracerTracer {
 
         // Emit step on line change.
         if self.prev_line != Some(line) {
-            TraceWriter::register_step(
-                &mut *self.writer,
-                &Path::new(&file_str),
-                Line(line as i64),
-            );
+            TraceWriter::register_step(&mut *self.writer, &Path::new(&file_str), Line(line as i64));
             self.prev_line = Some(line);
         }
 
@@ -231,11 +213,7 @@ impl SbpfTracer for CodeTracerTracer {
                     i: registers[r] as i64,
                     type_id: u64_type_id,
                 };
-                TraceWriter::register_variable_with_full_value(
-                    &mut *self.writer,
-                    &name,
-                    value,
-                );
+                TraceWriter::register_variable_with_full_value(&mut *self.writer, &name, value);
             }
         }
 

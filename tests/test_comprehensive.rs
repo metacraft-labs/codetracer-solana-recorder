@@ -1387,13 +1387,8 @@ fn test_decoded_fields_to_struct_record() {
     let tmp = tempfile::TempDir::new().unwrap();
 
     TraceWriter::begin_writing_trace_events(&mut *writer, &tmp.path().join("trace.json")).unwrap();
-    TraceWriter::begin_writing_trace_metadata(
-        &mut *writer,
-        &tmp.path().join("trace_metadata.json"),
-    )
-    .unwrap();
-    TraceWriter::begin_writing_trace_paths(&mut *writer, &tmp.path().join("trace_paths.json"))
-        .unwrap();
+    // Legacy metadata/paths begin calls were no-ops on the Nim side and
+    // were retired with the v3 CTFS rollout (follow-up #254 phase 2).
     TraceWriter::start(&mut *writer, Path::new("test.rs"), Line(1));
 
     let type_ids = TypeIds::register(&mut *writer);

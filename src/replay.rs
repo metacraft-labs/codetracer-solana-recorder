@@ -125,12 +125,7 @@ pub fn replay_transaction(
         .collect();
 
     // 6. Record through the existing pipeline.
-    record_from_snapshots(
-        &snapshots,
-        &source_locs_ref,
-        &program_so,
-        out_dir,
-    )?;
+    record_from_snapshots(&snapshots, &source_locs_ref, &program_so, out_dir)?;
 
     eprintln!("Trace written to {}", out_dir.display());
     Ok(())
@@ -229,11 +224,7 @@ fn build_synthetic_source_locations(tx: &TransactionData) -> Vec<(u64, String, u
                 .get(program_idx)
                 .map(|s| s.as_str())
                 .unwrap_or("unknown_program");
-            (
-                i as u64,
-                format!("{program_id}.rs"),
-                (i + 1) as u32,
-            )
+            (i as u64, format!("{program_id}.rs"), (i + 1) as u32)
         })
         .collect()
 }
