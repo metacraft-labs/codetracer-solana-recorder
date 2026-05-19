@@ -35,10 +35,22 @@ fn snap_with_pc_and_r0(pc: u64, r0: u64) -> RegisterSnapshot {
 fn test_cpi_detector_same_program() {
     let mut detector = CpiDetector::new(0..100);
 
-    assert_eq!(detector.process_snapshot(&snap_with_pc(0)), CpiEvent::SameProgram);
-    assert_eq!(detector.process_snapshot(&snap_with_pc(1)), CpiEvent::SameProgram);
-    assert_eq!(detector.process_snapshot(&snap_with_pc(50)), CpiEvent::SameProgram);
-    assert_eq!(detector.process_snapshot(&snap_with_pc(99)), CpiEvent::SameProgram);
+    assert_eq!(
+        detector.process_snapshot(&snap_with_pc(0)),
+        CpiEvent::SameProgram
+    );
+    assert_eq!(
+        detector.process_snapshot(&snap_with_pc(1)),
+        CpiEvent::SameProgram
+    );
+    assert_eq!(
+        detector.process_snapshot(&snap_with_pc(50)),
+        CpiEvent::SameProgram
+    );
+    assert_eq!(
+        detector.process_snapshot(&snap_with_pc(99)),
+        CpiEvent::SameProgram
+    );
 
     assert_eq!(detector.call_depth(), 0);
     assert!(!detector.is_in_cpi());
@@ -51,7 +63,10 @@ fn test_cpi_detector_call() {
     detector.add_program_range("token_program", 10000..10100);
 
     // Start in primary program.
-    assert_eq!(detector.process_snapshot(&snap_with_pc(5)), CpiEvent::SameProgram);
+    assert_eq!(
+        detector.process_snapshot(&snap_with_pc(5)),
+        CpiEvent::SameProgram
+    );
     assert_eq!(detector.call_depth(), 0);
 
     // Jump to token program.
@@ -99,7 +114,10 @@ fn test_cpi_nested_calls() {
     detector.add_program_range("program_b", 2000..2100);
 
     // Primary program.
-    assert_eq!(detector.process_snapshot(&snap_with_pc(10)), CpiEvent::SameProgram);
+    assert_eq!(
+        detector.process_snapshot(&snap_with_pc(10)),
+        CpiEvent::SameProgram
+    );
     assert_eq!(detector.call_depth(), 0);
 
     // CPI into program A.
@@ -111,7 +129,10 @@ fn test_cpi_nested_calls() {
     assert_eq!(detector.current_program(), "program_a");
 
     // Execute in program A.
-    assert_eq!(detector.process_snapshot(&snap_with_pc(1015)), CpiEvent::SameProgram);
+    assert_eq!(
+        detector.process_snapshot(&snap_with_pc(1015)),
+        CpiEvent::SameProgram
+    );
 
     // CPI from program A into program B.
     assert_eq!(
@@ -122,7 +143,10 @@ fn test_cpi_nested_calls() {
     assert_eq!(detector.current_program(), "program_b");
 
     // Execute in program B.
-    assert_eq!(detector.process_snapshot(&snap_with_pc(2010)), CpiEvent::SameProgram);
+    assert_eq!(
+        detector.process_snapshot(&snap_with_pc(2010)),
+        CpiEvent::SameProgram
+    );
 
     // Return from program B to program A.
     assert_eq!(
@@ -174,7 +198,10 @@ fn test_program_registry_lookup() {
     // Primary program lookups.
     assert_eq!(registry.program_name(0), Some("primary"));
     assert_eq!(registry.program_name(5), Some("primary"));
-    assert_eq!(registry.find_location(5), Some(("primary.rs".to_string(), 10)));
+    assert_eq!(
+        registry.find_location(5),
+        Some(("primary.rs".to_string(), 10))
+    );
 
     // Token program lookups.
     assert_eq!(registry.program_name(10005), Some("token_program"));

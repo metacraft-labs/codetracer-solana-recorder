@@ -2,7 +2,7 @@
 
 use std::path::Path;
 
-use codetracer_solana_recorder::register_trace::{RegisterSnapshot, parse_regs_file, ROW_SIZE};
+use codetracer_solana_recorder::register_trace::{ROW_SIZE, RegisterSnapshot, parse_regs_file};
 use codetracer_solana_recorder::tracer_trait::{
     CodeTracerTracer, NoOpTracer, RegisterTraceTracer, SbpfTracer, replay_snapshots,
 };
@@ -83,12 +83,7 @@ fn test_codetracer_tracer_records_steps() {
     let snapshots = small_snapshots();
     let source_locs = small_source_locations();
 
-    let mut tracer = CodeTracerTracer::new(
-        Path::new("test.rs"),
-        tmp.path(),
-        source_locs,
-    )
-    .unwrap();
+    let mut tracer = CodeTracerTracer::new(Path::new("test.rs"), tmp.path(), source_locs).unwrap();
 
     // Feed steps.
     for snap in &snapshots {
@@ -98,8 +93,11 @@ fn test_codetracer_tracer_records_steps() {
 
     // Verify .ct output with CTFS magic bytes.
     let ct_files: Vec<_> = std::fs::read_dir(tmp.path())
-        .unwrap().filter_map(|e| e.ok()).map(|e| e.path())
-        .filter(|p| p.extension().map_or(false, |ext| ext == "ct")).collect();
+        .unwrap()
+        .filter_map(|e| e.ok())
+        .map(|e| e.path())
+        .filter(|p| p.extension().map_or(false, |ext| ext == "ct"))
+        .collect();
     assert!(!ct_files.is_empty(), "expected .ct file");
     let ct_content = std::fs::read(&ct_files[0]).unwrap();
     assert!(ct_content.len() >= 5);
@@ -112,12 +110,7 @@ fn test_codetracer_tracer_records_syscalls() {
     let tmp = tempfile::TempDir::new().unwrap();
     let source_locs = small_source_locations();
 
-    let mut tracer = CodeTracerTracer::new(
-        Path::new("test.rs"),
-        tmp.path(),
-        source_locs,
-    )
-    .unwrap();
+    let mut tracer = CodeTracerTracer::new(Path::new("test.rs"), tmp.path(), source_locs).unwrap();
 
     let regs = [0u64; 12];
     tracer.on_syscall("sol_log", &regs);

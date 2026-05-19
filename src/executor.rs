@@ -74,7 +74,9 @@ pub fn execute_with_tracing(elf_data: &[u8], compute_budget: u64) -> Result<Vec<
     // Create a minimal loader. For programs that reference Solana syscalls,
     // ELF loading may fail with unresolved symbols. That's expected — those
     // programs need the full Solana runtime (Mollusk/LiteSVM) instead.
-    let loader = Arc::new(BuiltinProgram::<RecorderContext>::new_loader(config.clone()));
+    let loader = Arc::new(BuiltinProgram::<RecorderContext>::new_loader(
+        config.clone(),
+    ));
 
     // Load and verify the ELF executable.
     let executable = Executable::<RecorderContext>::load(elf_data, loader.clone())
@@ -104,8 +106,7 @@ pub fn execute_with_tracing(elf_data: &[u8], compute_budget: u64) -> Result<Vec<
     let mut vm = EbpfVm::new(loader, sbpf_version, &mut context, stack_size);
 
     let mut mode = ExecutionMode::Interpreted;
-    let mut call_frames =
-        vec![solana_sbpf::vm::CallFrame::default(); config.max_call_depth];
+    let mut call_frames = vec![solana_sbpf::vm::CallFrame::default(); config.max_call_depth];
     let (_insn_count, result) = vm.execute_program(&executable, &mut mode, &mut call_frames);
 
     eprintln!("Execution result: {:?}", result);

@@ -421,7 +421,11 @@ pub fn decoded_to_value_record(field: &DecodedField, type_ids: &TypeIds) -> Valu
     decoded_value_to_record(&field.value, &field.type_name, type_ids)
 }
 
-fn decoded_value_to_record(value: &DecodedValue, _type_hint: &str, type_ids: &TypeIds) -> ValueRecord {
+fn decoded_value_to_record(
+    value: &DecodedValue,
+    _type_hint: &str,
+    type_ids: &TypeIds,
+) -> ValueRecord {
     match value {
         DecodedValue::U8(v) => ValueRecord::Int {
             i: *v as i64,

@@ -135,7 +135,10 @@ fn help_succeeds_and_mentions_name() {
 
 #[test]
 fn version_succeeds_and_contains_version() {
-    let output = cargo_bin().arg("--version").output().expect("failed to run");
+    let output = cargo_bin()
+        .arg("--version")
+        .output()
+        .expect("failed to run");
     assert!(output.status.success());
     let stdout = String::from_utf8_lossy(&output.stdout);
     assert!(
@@ -182,7 +185,9 @@ fn record_rejects_invalid_elf() {
     let stderr = String::from_utf8_lossy(&output.stderr);
     // The error should specifically mention the ELF magic number validation.
     assert!(
-        stderr.contains("ELF magic") || stderr.contains("invalid ELF") || stderr.contains("\\x7fELF"),
+        stderr.contains("ELF magic")
+            || stderr.contains("invalid ELF")
+            || stderr.contains("\\x7fELF"),
         "error should mention ELF magic number validation, got: {stderr}"
     );
 }
@@ -552,9 +557,7 @@ fn test_recorded_trace_via_ct_print_json() {
     ];
     for (name, value) in expected {
         assert!(
-            observed_vars
-                .iter()
-                .any(|(n, v)| n == name && v == value),
+            observed_vars.iter().any(|(n, v)| n == name && v == value),
             "expected step variable `{name}` = {value} in --full output; \
              observed = {observed_vars:?}"
         );

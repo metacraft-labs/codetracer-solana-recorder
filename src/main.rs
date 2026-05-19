@@ -209,10 +209,7 @@ fn main() -> Result<()> {
         Commands::Record(args) => record(args),
         Commands::Replay(args) => replay(args),
         Commands::Version => {
-            println!(
-                "codetracer-solana-recorder {}",
-                env!("CARGO_PKG_VERSION")
-            );
+            println!("codetracer-solana-recorder {}", env!("CARGO_PKG_VERSION"));
             Ok(())
         }
     }
@@ -275,10 +272,7 @@ fn record(args: RecordArgs) -> Result<()> {
             .with_context(|| format!("failed to read ELF file: {}", elf_for_dwarf.display()))?;
 
         codetracer_solana_recorder::recorder::record_from_traces(
-            &regs_data,
-            &elf_data,
-            &elf_path,
-            &out_dir,
+            &regs_data, &elf_data, &elf_path, &out_dir,
         )?;
 
         eprintln!("Trace written to {}", out_dir.display());
@@ -293,8 +287,7 @@ fn record(args: RecordArgs) -> Result<()> {
         .with_context(|| format!("failed to read ELF file: {}", elf_path.display()))?;
 
     let regs_data = codetracer_solana_recorder::executor::execute_with_tracing(
-        &elf_data,
-        1_000_000, // 1M compute units
+        &elf_data, 1_000_000, // 1M compute units
     )
     .with_context(|| "SBF VM execution failed")?;
 
@@ -305,10 +298,7 @@ fn record(args: RecordArgs) -> Result<()> {
 
     // Use the existing record_from_traces pipeline.
     codetracer_solana_recorder::recorder::record_from_traces(
-        &regs_data,
-        &elf_data,
-        &elf_path,
-        &out_dir,
+        &regs_data, &elf_data, &elf_path, &out_dir,
     )?;
 
     eprintln!("Trace written to {}", out_dir.display());

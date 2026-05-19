@@ -3,10 +3,10 @@
 //! These tests use static JSON fixtures rather than a live RPC endpoint,
 //! exercising the parsing and extraction logic in isolation.
 
+use codetracer_solana_recorder::replay::{extract_all_accounts, extract_program_ids};
 use codetracer_solana_recorder::rpc_client::{
     parse_account_response, parse_transaction_response, rpc_error_response, rpc_response_from_value,
 };
-use codetracer_solana_recorder::replay::{extract_all_accounts, extract_program_ids};
 
 // ---------------------------------------------------------------------------
 // JSON fixtures

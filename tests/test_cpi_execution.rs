@@ -96,7 +96,8 @@ fn partition_functions_for_cpi(
     assert!(
         range_b.start >= range_a.end,
         "ranges should not overlap: A={:?}, B={:?}",
-        range_a, range_b
+        range_a,
+        range_b
     );
 
     // Find source locations within each range.
@@ -228,7 +229,13 @@ fn test_nested_cpi_with_real_boundaries() {
 
     // Compute total PC span.
     let min_pc = (functions[0].start_addr.saturating_sub(text_vaddr)) / 8;
-    let max_pc = (functions.last().unwrap().end_addr.saturating_sub(text_vaddr)) / 8 + 1;
+    let max_pc = (functions
+        .last()
+        .unwrap()
+        .end_addr
+        .saturating_sub(text_vaddr))
+        / 8
+        + 1;
     let span = max_pc - min_pc;
 
     // Divide into 3 equal ranges.
@@ -275,7 +282,9 @@ fn test_nested_cpi_with_real_boundaries() {
     let return_pc_b = pcs[1] + 1;
     assert_eq!(
         detector.process_snapshot(&snap(return_pc_b, 150)),
-        CpiEvent::CpiReturn { return_pc: return_pc_b }
+        CpiEvent::CpiReturn {
+            return_pc: return_pc_b
+        }
     );
     assert_eq!(detector.call_depth(), 1);
     assert_eq!(detector.current_program(), "program_b");
@@ -284,7 +293,9 @@ fn test_nested_cpi_with_real_boundaries() {
     let return_pc_primary = pcs[0] + 1;
     assert_eq!(
         detector.process_snapshot(&snap(return_pc_primary, 50)),
-        CpiEvent::CpiReturn { return_pc: return_pc_primary }
+        CpiEvent::CpiReturn {
+            return_pc: return_pc_primary
+        }
     );
     assert_eq!(detector.call_depth(), 0);
     assert_eq!(detector.current_program(), "primary");
@@ -314,24 +325,16 @@ fn test_record_with_cpi_using_real_boundaries() {
 
     // Set up ProgramRegistry with synthetic source locations derived from DWARF.
     let mut registry = ProgramRegistry::new();
-    registry.add_synthetic_program(
-        "primary",
-        range_a.clone(),
-        locs_a.clone(),
-    );
-    registry.add_synthetic_program(
-        "token_program",
-        range_b.clone(),
-        locs_b.clone(),
-    );
+    registry.add_synthetic_program("primary", range_a.clone(), locs_a.clone());
+    registry.add_synthetic_program("token_program", range_b.clone(), locs_b.clone());
 
     // Build snapshot sequence: primary -> CPI to token_program -> return to primary
     let snapshots = vec![
-        snap_r0_r1(locs_a[0].0, 0, 100),     // In primary
-        snap_r0_r1(locs_a[1].0, 0, 200),     // Still in primary
-        snap_r0_r1(locs_b[0].0, 50, 300),    // CPI call to token_program
-        snap_r0_r1(locs_b[1].0, 60, 400),    // Inside token_program
-        snap_r0_r1(locs_a[0].0, 0, 500),     // CPI return to primary
+        snap_r0_r1(locs_a[0].0, 0, 100),  // In primary
+        snap_r0_r1(locs_a[1].0, 0, 200),  // Still in primary
+        snap_r0_r1(locs_b[0].0, 50, 300), // CPI call to token_program
+        snap_r0_r1(locs_b[1].0, 60, 400), // Inside token_program
+        snap_r0_r1(locs_a[0].0, 0, 500),  // CPI return to primary
     ];
 
     let mut detector = CpiDetector::new(range_a.clone());
@@ -389,7 +392,13 @@ fn test_cpi_call_depth_accuracy_with_real_ranges() {
 
     // Compute total PC span and divide into 3 equal ranges.
     let min_pc = (functions[0].start_addr.saturating_sub(text_vaddr)) / 8;
-    let max_pc = (functions.last().unwrap().end_addr.saturating_sub(text_vaddr)) / 8 + 1;
+    let max_pc = (functions
+        .last()
+        .unwrap()
+        .end_addr
+        .saturating_sub(text_vaddr))
+        / 8
+        + 1;
     let span = max_pc - min_pc;
 
     let range_primary = min_pc..min_pc + span / 3;
@@ -456,9 +465,9 @@ fn test_cpi_trace_event_ordering() {
 
     // Sequence: primary step -> CPI call -> callee step -> CPI return -> primary step
     let snapshots = vec![
-        snap(locs_a[0].0, 0),    // primary step
-        snap(locs_b[0].0, 100),  // CPI call + callee step
-        snap(locs_a[1].0, 0),    // CPI return + primary step
+        snap(locs_a[0].0, 0),   // primary step
+        snap(locs_b[0].0, 100), // CPI call + callee step
+        snap(locs_a[1].0, 0),   // CPI return + primary step
     ];
 
     let mut detector = CpiDetector::new(range_a.clone());
