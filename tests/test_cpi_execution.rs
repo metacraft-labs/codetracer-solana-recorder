@@ -4,16 +4,24 @@
 //! These tests verify that the CPI detection pipeline works correctly when
 //! programs are backed by real ELF/DWARF data rather than synthetic source
 //! locations. They simulate cross-program invocations by treating different
-//! address ranges of the recorder's own binary as separate "programs", each
-//! with real DWARF source mapping.
+//! address ranges of a real ELF binary as separate "programs", each with
+//! real DWARF source mapping.
 //!
 //! This validates:
 //! - CpiDetector correctly identifies CPI call/return boundaries
 //! - ProgramRegistry resolves source locations from real DWARF for each program
 //! - record_with_cpi produces nested Call/Return events at CPI boundaries
 //! - Source file paths from DWARF appear correctly in the trace output
+//!
+//! The ELF/DWARF source is the committed `test-programs/cpi_fixture.elf`
+//! fixture (a small statically-linked binary with debug info and six named
+//! functions).  Earlier revisions instead read the recorder's *own*
+//! executable as the stand-in ELF, which only works on platforms where that
+//! executable is itself ELF-formatted: on Windows the recorder binary is a
+//! PE and carries no embedded DWARF, so `find_functions` returned nothing.
+//! A committed ELF fixture makes the tests platform-independent.
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use codetracer_solana_recorder::cpi::{CpiDetector, CpiEvent};
 use codetracer_solana_recorder::dwarf::{DwarfParser, find_functions};
@@ -26,10 +34,22 @@ use codetracer_trace_types::TraceLowLevelEvent;
 // Helpers
 // ---------------------------------------------------------------------------
 
-/// Load the recorder's own binary as ELF data.
+/// Load the committed ELF/DWARF fixture used as the CPI test program.
+///
+/// `test-programs/cpi_fixture.elf` is a small statically-linked ELF64
+/// executable built with full debug info; its DWARF describes six named
+/// functions, enough for `partition_functions_for_cpi` to split into two
+/// non-overlapping "programs".
 fn load_recorder_elf() -> Vec<u8> {
-    let binary_path = env!("CARGO_BIN_EXE_codetracer-solana-recorder");
-    std::fs::read(binary_path).expect("should be able to read the test binary")
+    let fixture = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("test-programs")
+        .join("cpi_fixture.elf");
+    std::fs::read(&fixture).unwrap_or_else(|e| {
+        panic!(
+            "should be able to read the CPI ELF fixture at {}: {e}",
+            fixture.display()
+        )
+    })
 }
 
 /// Build a register snapshot with a given PC and r0 value.

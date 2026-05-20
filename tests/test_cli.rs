@@ -39,10 +39,13 @@ fn cargo_bin() -> Command {
 /// JSON.  This is the same workflow that `Recorder-CLI-Conventions.md`
 /// §4 prescribes for downstream tools / golden snapshots.
 fn ct_print_path() -> PathBuf {
+    // `EXE_SUFFIX` is "" on Unix and ".exe" on Windows -- the Nim build
+    // emits `ct-print.exe` there, so an extensionless path would fail the
+    // `.exists()` checks even though `Command::new` would still resolve it.
     PathBuf::from(env!("CARGO_MANIFEST_DIR"))
         .join("..")
         .join("codetracer-trace-format-nim")
-        .join("ct-print")
+        .join(format!("ct-print{}", std::env::consts::EXE_SUFFIX))
 }
 
 /// Build a synthetic `.regs` binary blob simulating a 7-instruction program.
@@ -103,6 +106,43 @@ fn build_synthetic_regs() -> Vec<u8> {
         }
     }
     data
+}
+
+/// Write a minimal, structurally-valid SBF ELF64 file to `path`.
+///
+/// The recorder's `record` subcommand gates its input on the `\x7fELF`
+/// magic bytes and then parses the file as an object via the `object`
+/// crate.  Tests that exercise the CLI's `--regs` path (where the ELF is
+/// used only for optional DWARF resolution) need *some* file that clears
+/// both checks but does not depend on a built SBF program.
+///
+/// Previously these tests passed the recorder's own executable as the
+/// stand-in ELF — which only works on platforms where that executable is
+/// itself ELF-formatted (Linux).  On Windows the recorder binary is a PE,
+/// so the `\x7fELF` gate rejected it.  This helper instead emits a real
+/// 64-byte ELF64 header (little-endian, `e_machine = EM_BPF`) with no
+/// sections or segments: `object::File::parse` accepts a header-only ELF,
+/// and the recorder's `.text`/DWARF lookups fall back to their absent
+/// defaults — exactly the "DWARF may not resolve, that is fine" contract
+/// the `--regs` path already documents.
+fn write_minimal_sbf_elf(path: &Path) {
+    let mut elf = [0u8; 64];
+    // e_ident
+    elf[0..4].copy_from_slice(b"\x7fELF");
+    elf[4] = 2; // EI_CLASS = ELFCLASS64
+    elf[5] = 1; // EI_DATA  = ELFDATA2LSB (little-endian)
+    elf[6] = 1; // EI_VERSION = EV_CURRENT
+    // e_type = ET_DYN (2) — SBF programs are shared objects
+    elf[16..18].copy_from_slice(&2u16.to_le_bytes());
+    // e_machine = EM_BPF (247)
+    elf[18..20].copy_from_slice(&247u16.to_le_bytes());
+    // e_version = EV_CURRENT (1)
+    elf[20..24].copy_from_slice(&1u32.to_le_bytes());
+    // e_ehsize = 64
+    elf[52..54].copy_from_slice(&64u16.to_le_bytes());
+    // e_phentsize / e_shentsize left as 0 with zero counts — a valid
+    // header-only ELF that `object` parses without sections/segments.
+    std::fs::write(path, elf).expect("write minimal SBF ELF fixture");
 }
 
 /// Source locations matching the synthetic 7-step program (file `solana_fixture.rs`).
@@ -572,19 +612,24 @@ fn test_recorded_trace_via_ct_print_json() {
 /// for `--out-dir`.  Convention: `Recorder-CLI-Conventions.md` §5.
 ///
 /// We drive the `--regs <path>` branch (synthetic register trace +
-/// recorder's own binary as the ELF for DWARF) so the test does not
-/// depend on a built SBF program — see the
-/// `record_rejects_missing_regs_file` smoke test for the same shape.
+/// minimal ELF for DWARF) so the test does not depend on a built SBF
+/// program — see the `record_rejects_missing_regs_file` smoke test for
+/// the same shape.
 #[test]
 fn test_env_out_dir_used_when_flag_omitted() {
     let tmp_dir = tempfile::tempdir().expect("tempdir");
     let env_out_dir = tmp_dir.path().join("via-env");
 
-    // Pre-built recorder binary doubles as a valid (non-SBF) ELF so the
-    // `\x7fELF` magic-byte gate in `main.rs` passes and the `--regs` path
-    // is taken.  DWARF resolution may not find SBF-mapped lines for this
-    // ELF — that is fine; the recorder still produces a `.ct` bundle.
-    let elf_path = env!("CARGO_BIN_EXE_codetracer-solana-recorder");
+    // A minimal header-only ELF clears the `\x7fELF` magic-byte gate in
+    // `main.rs` so the `--regs` path is taken.  DWARF resolution finds no
+    // SBF-mapped lines for this header-only ELF — that is fine; the
+    // recorder still produces a `.ct` bundle.  (A real SBF program is not
+    // used here so the test does not depend on a built `.so`; an ELF
+    // *fixture* rather than the recorder's own binary keeps the test
+    // platform-independent — the recorder executable is a PE on Windows.)
+    let elf_file = tmp_dir.path().join("dwarf_stub.so");
+    write_minimal_sbf_elf(&elf_file);
+    let elf_path = &elf_file;
 
     // Synthetic .regs file (3 snapshots).
     let regs_path = tmp_dir.path().join("trace.regs");
@@ -644,11 +689,16 @@ fn test_env_disabled_skips_recording() {
     let tmp_dir = tempfile::tempdir().expect("tempdir");
     let out_dir = tmp_dir.path().join("should-stay-empty");
 
-    let elf_path = env!("CARGO_BIN_EXE_codetracer-solana-recorder");
+    // A minimal header-only ELF clears the `\x7fELF` magic-byte gate so
+    // the recorder reaches the disabled-mode pass-through.  An ELF
+    // *fixture* (rather than the recorder's own binary) keeps the test
+    // platform-independent — the recorder executable is a PE on Windows.
+    let elf_file = tmp_dir.path().join("program.so");
+    write_minimal_sbf_elf(&elf_file);
 
     let output = Command::new(env!("CARGO_BIN_EXE_codetracer-solana-recorder"))
         .args(["record"])
-        .arg(elf_path)
+        .arg(&elf_file)
         .args(["--out-dir"])
         .arg(&out_dir)
         .env("CODETRACER_SOLANA_RECORDER_DISABLED", "1")

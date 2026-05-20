@@ -22,10 +22,13 @@ use codetracer_trace_types::{
 // Compound `ValueRecord` variants (`Sequence` / `Tuple` / `Struct` / ...)
 // are intentionally skipped because nothing in these tests asserts on them.
 fn parse_events_from_ct(ct_path: &Path) -> Vec<TraceLowLevelEvent> {
+    // `EXE_SUFFIX` is "" on Unix and ".exe" on Windows -- the Nim build
+    // emits `ct-print.exe` there, so an extensionless path would fail the
+    // `.exists()` check even though `Command::new` would still resolve it.
     let ct_print = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
         .join("..")
         .join("codetracer-trace-format-nim")
-        .join("ct-print");
+        .join(format!("ct-print{}", std::env::consts::EXE_SUFFIX));
     assert!(
         ct_print.exists(),
         "ct-print binary not found at {}; tests require the \

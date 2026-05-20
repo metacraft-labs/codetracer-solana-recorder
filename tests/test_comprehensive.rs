@@ -93,10 +93,13 @@ fn encode_regs(snapshots: &[RegisterSnapshot]) -> Vec<u8> {
 // skipped because nothing here keys off them — the per-program tests in
 // `test_per_program_ct_print_full.rs` already pin those.
 fn parse_events_from_ct(ct_path: &Path) -> Vec<TraceLowLevelEvent> {
+    // `EXE_SUFFIX` is "" on Unix and ".exe" on Windows -- the Nim build
+    // emits `ct-print.exe` there, so an extensionless path would fail the
+    // `.exists()` check even though `Command::new` would still resolve it.
     let ct_print = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
         .join("..")
         .join("codetracer-trace-format-nim")
-        .join("ct-print");
+        .join(format!("ct-print{}", std::env::consts::EXE_SUFFIX));
     assert!(
         ct_print.exists(),
         "ct-print binary not found at {}; tests require the \
