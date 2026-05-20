@@ -61,10 +61,13 @@ use codetracer_solana_recorder::register_trace::RegisterSnapshot;
 
 /// Path to the `ct-print` binary shipped with `codetracer-trace-format-nim`.
 fn ct_print_path() -> PathBuf {
+    // `EXE_SUFFIX` is "" on Unix and ".exe" on Windows -- the Nim build
+    // emits `ct-print.exe` there, so an extensionless path would fail the
+    // `.exists()` checks even though `Command::new` would still resolve it.
     PathBuf::from(env!("CARGO_MANIFEST_DIR"))
         .join("..")
         .join("codetracer-trace-format-nim")
-        .join("ct-print")
+        .join(format!("ct-print{}", std::env::consts::EXE_SUFFIX))
 }
 
 /// Skip-helper: returns `Some(path)` to ct-print or logs a clear

@@ -2,19 +2,25 @@
 //!
 //! These tests bridge the gap between purely synthetic tests (which use fake
 //! source locations) and a full SBF VM execution (which requires
-//! cargo-build-sbf). They use the recorder's own debug binary as a real ELF
-//! with DWARF debug info, construct register snapshots whose PCs map to real
-//! source locations resolved from that DWARF data, then run the full recording
-//! pipeline and verify that the output trace contains correct Step events with
-//! proper source file paths and line numbers.
+//! cargo-build-sbf). They use a committed real ELF with DWARF debug info,
+//! construct register snapshots whose PCs map to real source locations
+//! resolved from that DWARF data, then run the full recording pipeline and
+//! verify that the output trace contains correct Step events with proper
+//! source file paths and line numbers.
 //!
 //! This validates:
 //! - DwarfParser correctly resolves PCs to source locations
 //! - record_from_traces feeds those locations into the trace writer
 //! - The output JSON contains Step events matching the DWARF-resolved lines
 //! - Register values appear as variables in the trace
+//!
+//! The ELF/DWARF source is the committed `test-programs/cpi_fixture.elf`
+//! fixture.  Earlier revisions read the recorder's *own* executable, which
+//! only works where that executable is itself ELF-formatted: on Windows the
+//! recorder binary is a PE with no embedded DWARF.  A committed ELF fixture
+//! makes the tests platform-independent.
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use codetracer_solana_recorder::dwarf::{DwarfParser, find_functions};
 use codetracer_solana_recorder::recorder::record_from_traces;
@@ -25,10 +31,19 @@ use codetracer_trace_types::TraceLowLevelEvent;
 // Helpers
 // ---------------------------------------------------------------------------
 
-/// Load the recorder's own binary as ELF data.
+/// Load the committed ELF/DWARF test fixture.
+///
+/// `test-programs/cpi_fixture.elf` is a small statically-linked ELF64 built
+/// with full debug info; its DWARF describes many named functions with
+/// line-table rows referencing the fixture's `.rs` source.  It stands in
+/// for "a real debug binary" so these tests do not depend on the recorder's
+/// own executable being an ELF.
 fn load_recorder_elf() -> Vec<u8> {
-    let binary_path = env!("CARGO_BIN_EXE_codetracer-solana-recorder");
-    std::fs::read(binary_path).expect("should be able to read the test binary")
+    let path = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("test-programs")
+        .join("cpi_fixture.elf");
+    std::fs::read(&path)
+        .unwrap_or_else(|e| panic!("should be able to read ELF fixture {}: {e}", path.display()))
 }
 
 /// Build a .regs binary blob from a list of (pc, register_values) pairs.

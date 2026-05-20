@@ -1,12 +1,38 @@
 //! Tests for DWARF debug info parsing (`dwarf.rs`).
 //!
-//! These tests exercise the DwarfParser against real ELF files to verify
+//! These tests exercise the DwarfParser against a real ELF file to verify
 //! that PC-to-source-line resolution works correctly, complementing the
 //! synthetic data tests in other test files.
+//!
+//! The "real ELF" is the committed `test-programs/cpi_fixture.elf` fixture
+//! (a small statically-linked binary built with full debug info, defining
+//! many named functions including `main`).  Earlier revisions read the
+//! recorder's *own* executable instead -- which only works where that
+//! executable is itself ELF-formatted: on Windows the recorder binary is a
+//! PE and carries no embedded DWARF, so `DwarfParser`/`find_functions` had
+//! nothing to parse.  A committed ELF fixture makes the tests
+//! platform-independent.
+
+use std::path::PathBuf;
 
 use codetracer_solana_recorder::dwarf::{
     DwarfParser, FunctionBoundary, SourceLocation, find_functions,
 };
+
+/// Read the committed ELF/DWARF test fixture.
+///
+/// `test-programs/cpi_fixture.elf` is a small statically-linked ELF64 built
+/// with full debug info; its DWARF describes many named functions (one of
+/// them `main`) with line-table rows referencing the fixture's `.rs`
+/// source.  It stands in for "a real debug binary" so these tests do not
+/// depend on the recorder's own executable being an ELF.
+fn fixture_elf() -> Vec<u8> {
+    let path = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("test-programs")
+        .join("cpi_fixture.elf");
+    std::fs::read(&path)
+        .unwrap_or_else(|e| panic!("should be able to read ELF fixture {}: {e}", path.display()))
+}
 
 // ---------------------------------------------------------------------------
 // Tests: error handling
@@ -62,8 +88,7 @@ fn test_dwarf_parser_rejects_random_bytes() {
 #[test]
 fn test_dwarf_parser_on_real_binary() {
     // Use the recorder's own test binary as a real ELF with DWARF.
-    let binary_path = env!("CARGO_BIN_EXE_codetracer-solana-recorder");
-    let elf_data = std::fs::read(binary_path).expect("should be able to read the test binary");
+    let elf_data = fixture_elf();
 
     let parser = DwarfParser::new(&elf_data).expect("real binary should parse successfully");
 
@@ -79,8 +104,7 @@ fn test_dwarf_parser_on_real_binary() {
 /// resolve to source locations with valid file paths and line numbers.
 #[test]
 fn test_dwarf_parser_resolves_source_locations() {
-    let binary_path = env!("CARGO_BIN_EXE_codetracer-solana-recorder");
-    let elf_data = std::fs::read(binary_path).expect("should be able to read the test binary");
+    let elf_data = fixture_elf();
 
     let parser = DwarfParser::new(&elf_data).expect("real binary should parse successfully");
 
@@ -118,8 +142,7 @@ fn test_dwarf_parser_resolves_source_locations() {
 /// Verify that multiple distinct source locations can be resolved from the binary.
 #[test]
 fn test_dwarf_parser_multiple_locations() {
-    let binary_path = env!("CARGO_BIN_EXE_codetracer-solana-recorder");
-    let elf_data = std::fs::read(binary_path).expect("should be able to read the test binary");
+    let elf_data = fixture_elf();
 
     let parser = DwarfParser::new(&elf_data).expect("real binary should parse successfully");
 
@@ -168,8 +191,7 @@ fn test_dwarf_parser_multiple_locations() {
 /// don't cause panics.
 #[test]
 fn test_dwarf_parser_address_formula_no_panic() {
-    let binary_path = env!("CARGO_BIN_EXE_codetracer-solana-recorder");
-    let elf_data = std::fs::read(binary_path).expect("should be able to read the test binary");
+    let elf_data = fixture_elf();
 
     let parser = DwarfParser::new(&elf_data).expect("real binary should parse successfully");
 
@@ -196,8 +218,7 @@ fn test_dwarf_parser_address_formula_no_panic() {
 /// Out-of-range PCs should return None gracefully.
 #[test]
 fn test_dwarf_parser_out_of_range_pc() {
-    let binary_path = env!("CARGO_BIN_EXE_codetracer-solana-recorder");
-    let elf_data = std::fs::read(binary_path).expect("should be able to read the test binary");
+    let elf_data = fixture_elf();
 
     let parser = DwarfParser::new(&elf_data).expect("real binary should parse successfully");
 
@@ -273,8 +294,7 @@ fn test_dwarf_integration_with_recorder() {
     use codetracer_solana_recorder::recorder::record_from_traces;
     use codetracer_solana_recorder::register_trace::ROW_SIZE;
 
-    let binary_path = env!("CARGO_BIN_EXE_codetracer-solana-recorder");
-    let elf_data = std::fs::read(binary_path).expect("should be able to read the test binary");
+    let elf_data = fixture_elf();
 
     // Create a small synthetic register trace (3 instructions).
     let mut regs_data = Vec::new();
@@ -327,8 +347,7 @@ fn test_dwarf_integration_with_recorder() {
 /// entries with low_pc/high_pc ranges.
 #[test]
 fn test_find_functions_on_real_binary() {
-    let binary_path = env!("CARGO_BIN_EXE_codetracer-solana-recorder");
-    let elf_data = std::fs::read(binary_path).expect("should be able to read the test binary");
+    let elf_data = fixture_elf();
 
     let functions =
         find_functions(&elf_data).expect("find_functions should succeed on a real binary");
@@ -354,8 +373,7 @@ fn test_find_functions_on_real_binary() {
 /// The "main" function (or equivalent entry point) should appear in the list.
 #[test]
 fn test_find_functions_contains_main() {
-    let binary_path = env!("CARGO_BIN_EXE_codetracer-solana-recorder");
-    let elf_data = std::fs::read(binary_path).expect("should be able to read the test binary");
+    let elf_data = fixture_elf();
 
     let functions = find_functions(&elf_data).expect("find_functions should succeed");
 
@@ -375,8 +393,7 @@ fn test_find_functions_contains_main() {
 /// reasonably sized ranges.
 #[test]
 fn test_find_functions_multiple_distinct() {
-    let binary_path = env!("CARGO_BIN_EXE_codetracer-solana-recorder");
-    let elf_data = std::fs::read(binary_path).expect("should be able to read the test binary");
+    let elf_data = fixture_elf();
 
     let functions = find_functions(&elf_data).expect("find_functions should succeed");
 
@@ -401,8 +418,7 @@ fn test_find_functions_multiple_distinct() {
 /// which function it belongs to, enabling Call/Return event generation.
 #[test]
 fn test_find_functions_address_lookup() {
-    let binary_path = env!("CARGO_BIN_EXE_codetracer-solana-recorder");
-    let elf_data = std::fs::read(binary_path).expect("should be able to read the test binary");
+    let elf_data = fixture_elf();
 
     let functions = find_functions(&elf_data).expect("find_functions should succeed");
 
@@ -437,8 +453,7 @@ fn test_find_functions_rejects_non_elf() {
 /// don't produce false matches).
 #[test]
 fn test_find_functions_all_have_valid_ranges() {
-    let binary_path = env!("CARGO_BIN_EXE_codetracer-solana-recorder");
-    let elf_data = std::fs::read(binary_path).expect("should be able to read the test binary");
+    let elf_data = fixture_elf();
 
     let functions = find_functions(&elf_data).expect("find_functions should succeed");
 
