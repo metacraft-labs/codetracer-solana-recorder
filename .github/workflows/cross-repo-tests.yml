@@ -35,7 +35,7 @@ on:
 # NIX_CONFIG is set globally so both direnv and direct nix develop pick it up.
 env:
   NIX_CONFIG: |
-    access-tokens = github.com=${{ secrets.GH_READ_METACRAFT_PRIVATE_REPOS }}
+    access-tokens = github.com=${{ steps.app-token.outputs.token }}
     accept-flake-config = true
 
 jobs:
@@ -43,6 +43,14 @@ jobs:
     runs-on: [self-hosted, nixos]
 
     steps:
+      - name: Generate CI token
+        id: app-token
+        uses: actions/create-github-app-token@v1
+        with:
+          app-id: ${{ secrets.CI_TOKEN_PROVIDER_APP_ID }}
+          private-key: ${{ secrets.CI_TOKEN_PROVIDER_PRIVATE_KEY }}
+          owner: metacraft-labs
+
       - name: Checkout
         uses: actions/checkout@v4
 
@@ -53,7 +61,7 @@ jobs:
           cachix-cache: ''
           trusted-public-keys: ''
           substituters: ''
-          gh-token: ${{ secrets.GH_READ_METACRAFT_PRIVATE_REPOS }}
+          gh-token: ${{ steps.app-token.outputs.token }}
 
       - name: Install just
         uses: extractions/setup-just@v2
@@ -112,7 +120,7 @@ jobs:
 
       - name: Clone codetracer
         env:
-          GH_TOKEN: ${{ secrets.GH_READ_METACRAFT_PRIVATE_REPOS }}
+          GH_TOKEN: ${{ steps.app-token.outputs.token }}
         run: |
           CT_REF="${{ steps.resolve-refs.outputs.codetracer_ref }}"
           DEST="$GITHUB_WORKSPACE/../codetracer"
@@ -159,7 +167,7 @@ jobs:
 
       - name: Clone codetracer-vscode-extension
         env:
-          GH_TOKEN: ${{ secrets.GH_READ_METACRAFT_PRIVATE_REPOS }}
+          GH_TOKEN: ${{ steps.app-token.outputs.token }}
         run: |
           EXT_REF="${{ steps.resolve-refs.outputs.vscode_extension_ref }}"
           EXT_BRANCH="${{ steps.resolve-refs.outputs.vscode_extension_branch }}"
@@ -175,7 +183,7 @@ jobs:
 
       - name: Clone nix-blockchain-development
         env:
-          GH_TOKEN: ${{ secrets.GH_READ_METACRAFT_PRIVATE_REPOS }}
+          GH_TOKEN: ${{ steps.app-token.outputs.token }}
         run: |
           DEST="$GITHUB_WORKSPACE/../nix-blockchain-development"
           rm -rf "$DEST"
