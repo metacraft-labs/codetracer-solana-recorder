@@ -3645,7 +3645,7 @@ fn test_spl_token_transfer_test_via_ct_print_full() {
     // the CPI Call event — those are the recorder-observable
     // invariants for this fixture.
 
-// ----- amount surfaces as a u64 typed local in the driver --------------
+    // ----- amount surfaces as a u64 typed local in the driver --------------
     // Line 78 — `let amount: u64 = 1_000;` — drives the recorder's
     // existing register-let-binding env so r1 carries the value.  The
     // strict pin asserts r1 carries 1_000 on every visited snapshot
