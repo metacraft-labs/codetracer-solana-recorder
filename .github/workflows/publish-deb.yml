@@ -20,6 +20,8 @@ name: publish-deb
 #   R2_CODETRACER_BUCKET_NAME
 
 on:
+  push:
+    tags: ['v*']
   workflow_dispatch:
     inputs:
       version:
