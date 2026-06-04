@@ -1,0 +1,101 @@
+name: publish-aur
+
+# Publishes codetracer-solana-recorder to the Arch User Repository
+# (AUR) by pushing the generated PKGBUILD + .SRCINFO to the
+# `aur.archlinux.org:codetracer-solana-recorder` repo over SSH and
+# signing the commit with the CodeTracer GPG key.
+#
+# This workflow reuses the same secrets the codetracer main repo's
+# AUR push uses (per M11 spec — secret reuse is the design):
+#   CODETRACER_AUR_GPG_PRIVATE_KEY        GPG key for the commit signature
+#   CODETRACER_AUR_GPG_PRIVATE_KEY_PASS   GPG key passphrase
+#   CODETRACER_AUR_SSH_PRIVATE_KEY        SSH key authorised on AUR
+
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: 'Recorder semver that was released'
+        required: true
+        default: '0.1.0'
+
+jobs:
+  push-aur:
+    runs-on: ubuntu-latest
+    name: aur.archlinux.org push
+    environment: aur
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Compute source-tarball sha256
+        id: hashes
+        env:
+          VERSION: ${{ inputs.version }}
+        run: |
+          set -euo pipefail
+          url="https://github.com/metacraft-labs/codetracer-solana-recorder/archive/refs/tags/v${VERSION}.tar.gz"
+          sha=$(curl -fsSL "$url" | sha256sum | awk '{print $1}')
+          echo "source_sha=$sha" >> "$GITHUB_OUTPUT"
+
+      - name: Rewrite PKGBUILD + .SRCINFO with real version + sha
+        env:
+          VERSION: ${{ inputs.version }}
+          SOURCE_SHA: ${{ steps.hashes.outputs.source_sha }}
+        run: |
+          set -euo pipefail
+          sed -i "s/^pkgver=.*/pkgver=${VERSION}/" packaging/aur/PKGBUILD
+          sed -i "s/REPLACE_AT_PUBLISH_TIME_source/${SOURCE_SHA}/" \
+            packaging/aur/PKGBUILD
+          sed -i "s/^\\tpkgver = .*/\\tpkgver = ${VERSION}/" \
+            packaging/aur/.SRCINFO
+          sed -i "s/REPLACE_AT_PUBLISH_TIME_source/${SOURCE_SHA}/" \
+            packaging/aur/.SRCINFO
+
+      - name: Import GPG key for signing
+        uses: crazy-max/ghaction-import-gpg@v6
+        with:
+          gpg_private_key: ${{ secrets.CODETRACER_AUR_GPG_PRIVATE_KEY }}
+          passphrase:      ${{ secrets.CODETRACER_AUR_GPG_PRIVATE_KEY_PASS }}
+          git_config_global: true
+          git_user_signingkey: true
+          git_commit_gpgsign: true
+
+      - name: Push to AUR
+        env:
+          AUR_SSH_KEY: ${{ secrets.CODETRACER_AUR_SSH_PRIVATE_KEY }}
+          VERSION: ${{ inputs.version }}
+        run: |
+          set -euo pipefail
+          if [[ -z "$AUR_SSH_KEY" ]]; then
+            echo "::warning::CODETRACER_AUR_SSH_PRIVATE_KEY not set; emitting PKGBUILD as artifact instead."
+            exit 0
+          fi
+          mkdir -p ~/.ssh
+          echo "$AUR_SSH_KEY" > ~/.ssh/aur
+          chmod 600 ~/.ssh/aur
+          cat > ~/.ssh/config <<EOF
+          Host aur.archlinux.org
+            User aur
+            IdentityFile ~/.ssh/aur
+            IdentitiesOnly yes
+            StrictHostKeyChecking accept-new
+          EOF
+          git clone ssh://aur@aur.archlinux.org/codetracer-solana-recorder.git /tmp/aur
+          cp packaging/aur/PKGBUILD  /tmp/aur/PKGBUILD
+          cp packaging/aur/.SRCINFO  /tmp/aur/.SRCINFO
+          cd /tmp/aur
+          git add PKGBUILD .SRCINFO
+          git -c user.email=ci@metacraft-labs.com -c user.name='M11 CI' \
+            commit -S -m "codetracer-solana-recorder ${VERSION}-1" || \
+            echo "::warning::Nothing to commit (PKGBUILD identical)"
+          git push origin master
+
+      - name: Upload PKGBUILD artifact (fallback)
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: PKGBUILD-codetracer-solana-recorder
+          path: |
+            packaging/aur/PKGBUILD
+            packaging/aur/.SRCINFO
+          if-no-files-found: error

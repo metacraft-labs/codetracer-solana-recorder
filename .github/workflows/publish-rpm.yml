@@ -1,0 +1,140 @@
+name: publish-rpm
+
+# Builds codetracer-solana-recorder as a .rpm package, signs it with
+# the CodeTracer GPG key, and uploads it to rpm.codetracer.com
+# (Cloudflare R2 bucket).
+#
+# Uses the org-level rpm-bucket secrets configured on
+# metacraft-labs (accessible to every org repo). There is one
+# CodeTracer-wide R2 bucket for rpm hosting and these secrets
+# point at it. Note the asymmetry vs deb: the access-key secret is
+# CODETRACER_RPM_ACCESS_KEY (no _BUCKET_ infix), while the bucket
+# id / url / token all carry the CODETRACER_RPM_BUCKET_ prefix.
+#
+# Required secrets (org-level on metacraft-labs):
+#   CODETRACER_RPM_BUCKET_ACCESS_KEY_ID
+#   CODETRACER_RPM_ACCESS_KEY              (note: no _BUCKET_)
+#   CODETRACER_RPM_BUCKET_S3_URL
+#   CODETRACER_RPM_BUCKET_TOKEN            (R2/S3 token, if needed)
+#   CODETRACER_AUR_GPG_PRIVATE_KEY         (re-used: same GPG key)
+#   CODETRACER_AUR_GPG_PRIVATE_KEY_PASS
+# Required variables:
+#   R2_CODETRACER_BUCKET_NAME
+
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: 'Recorder semver to publish'
+        required: true
+        default: '0.1.0'
+      arch:
+        description: 'Target architecture (x86_64 / aarch64)'
+        required: true
+        default: 'x86_64'
+        type: choice
+        options:
+          - x86_64
+          - aarch64
+      dry_run:
+        description: 'Build the .rpm but skip the upload'
+        required: false
+        type: boolean
+        default: false
+
+jobs:
+  build-and-publish-rpm:
+    runs-on: ubuntu-latest
+    name: rpm / ${{ inputs.arch }}
+    environment: rpm
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: |
+            x86_64-unknown-linux-gnu
+            aarch64-unknown-linux-gnu
+
+      - name: Install rpmbuild + cross-compile deps
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y rpm xz-utils gnupg
+          if [[ "${{ inputs.arch }}" == "aarch64" ]]; then
+            sudo apt-get install -y gcc-aarch64-linux-gnu
+          fi
+
+      - name: Build recorder binary
+        run: |
+          set -euo pipefail
+          if [[ "${{ inputs.arch }}" == "aarch64" ]]; then
+            export CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER=aarch64-linux-gnu-gcc
+            cargo build --release --locked \
+              --target aarch64-unknown-linux-gnu \
+              --bin codetracer-solana-recorder
+            echo "binary=$(pwd)/target/aarch64-unknown-linux-gnu/release/codetracer-solana-recorder" >> "$GITHUB_ENV"
+          else
+            cargo build --release --locked \
+              --bin codetracer-solana-recorder
+            echo "binary=$(pwd)/target/release/codetracer-solana-recorder" >> "$GITHUB_ENV"
+          fi
+
+      - name: Build .rpm
+        run: |
+          mkdir -p out
+          bash packaging/rpm/build.sh \
+            packaging/rpm \
+            "${{ env.binary }}" \
+            out \
+            codetracer-solana-recorder \
+            "${{ inputs.version }}" \
+            codetracer-solana-recorder \
+            "${{ inputs.arch }}"
+
+      - name: Import GPG key
+        if: ${{ inputs.dry_run == false }}
+        uses: crazy-max/ghaction-import-gpg@v6
+        with:
+          gpg_private_key: ${{ secrets.CODETRACER_AUR_GPG_PRIVATE_KEY }}
+          passphrase:      ${{ secrets.CODETRACER_AUR_GPG_PRIVATE_KEY_PASS }}
+
+      - name: Sign .rpm
+        if: ${{ inputs.dry_run == false }}
+        run: |
+          set -euo pipefail
+          rpm=$(find out -name "*.rpm" -type f | head -n1)
+          gpg --armor --detach-sign "$rpm"
+
+      - name: Upload .rpm to rpm.codetracer.com (R2)
+        if: ${{ inputs.dry_run == false }}
+        env:
+          AWS_ACCESS_KEY_ID:     ${{ secrets.CODETRACER_RPM_BUCKET_ACCESS_KEY_ID }}
+          AWS_SECRET_ACCESS_KEY: ${{ secrets.CODETRACER_RPM_ACCESS_KEY }}
+          AWS_SESSION_TOKEN:     ${{ secrets.CODETRACER_RPM_BUCKET_TOKEN }}
+        run: |
+          set -euo pipefail
+          if [[ -z "$AWS_ACCESS_KEY_ID" ]]; then
+            echo "::error::CODETRACER_RPM_BUCKET_ACCESS_KEY_ID secret missing; cannot upload."
+            exit 1
+          fi
+          python3 -m pip install --user awscli
+          export PATH="$HOME/.local/bin:$PATH"
+          rpm=$(find out -name "*.rpm" -type f | head -n1)
+          asc="$rpm.asc"
+          bucket_name="${{ vars.R2_CODETRACER_BUCKET_NAME }}"
+          endpoint="${{ secrets.CODETRACER_RPM_BUCKET_S3_URL }}"
+          dest="s3://$bucket_name/rpm/codetracer-solana-recorder/$(basename "$rpm")"
+          aws --endpoint-url="$endpoint" \
+            s3 cp "$rpm" "$dest" --checksum-algorithm CRC32
+          aws --endpoint-url="$endpoint" \
+            s3 cp "$asc" "$dest.asc" --checksum-algorithm CRC32
+          echo "Published $dest"
+
+      - name: Upload .rpm artifact
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: codetracer-solana-recorder-${{ inputs.version }}-${{ inputs.arch }}.rpm
+          path: out/*.rpm
+          if-no-files-found: error

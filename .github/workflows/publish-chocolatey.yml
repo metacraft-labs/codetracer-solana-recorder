@@ -1,0 +1,96 @@
+name: publish-chocolatey
+
+# Builds the codetracer-solana-recorder Chocolatey package (.nupkg)
+# with a fresh sha256 pulled from the GitHub release, then pushes
+# it to the Chocolatey Community Repository via `choco push`.
+#
+# This is the M11 per-recorder analogue of the launcher's
+# publish-chocolatey.yml.
+#
+# Required secrets:
+#   CHOCOLATEY_API_KEY   Same org-level secret the launcher's
+#                        publish-chocolatey.yml uses.
+
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: 'Recorder semver that was released to GitHub'
+        required: true
+        default: '0.1.0'
+      dry_run:
+        description: 'Build the .nupkg but skip the push'
+        required: false
+        type: boolean
+        default: false
+
+jobs:
+  build-and-publish:
+    runs-on: windows-latest
+    name: build + push codetracer-solana-recorder.<version>.nupkg
+    environment: chocolatey
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Fetch sha256 for the windows-x86_64 zip
+        id: hash
+        shell: pwsh
+        env:
+          VERSION: ${{ inputs.version }}
+        run: |
+          $url = "https://github.com/metacraft-labs/codetracer-solana-recorder/releases/download/v$Env:VERSION/codetracer-solana-recorder-$Env:VERSION-windows-x86_64.zip"
+          $tmp = New-TemporaryFile
+          Invoke-WebRequest -Uri $url -OutFile $tmp
+          $sha = (Get-FileHash -Path $tmp -Algorithm SHA256).Hash.ToLower()
+          "windows-x86_64=$sha" | Out-File -FilePath $Env:GITHUB_OUTPUT -Append -Encoding ascii
+
+      - name: Rewrite NuSpec + install script
+        shell: pwsh
+        env:
+          VERSION: ${{ inputs.version }}
+          SHA_WINDOWS_X86_64: ${{ steps.hash.outputs.windows-x86_64 }}
+        run: |
+          $nuspec = 'packaging/chocolatey/codetracer-solana-recorder.nuspec'
+          (Get-Content $nuspec) `
+            -replace '<version>[^<]*</version>', "<version>$Env:VERSION</version>" `
+            -replace 'releases/tag/v[0-9.]+', "releases/tag/v$Env:VERSION" |
+            Set-Content $nuspec
+          $install = 'packaging/chocolatey/tools/chocolateyInstall.ps1'
+          (Get-Content $install) `
+            -replace 'releases/download/v[0-9.]+', "releases/download/v$Env:VERSION" `
+            -replace 'codetracer-solana-recorder-[0-9.]+-windows-x86_64.zip', "codetracer-solana-recorder-$Env:VERSION-windows-x86_64.zip" `
+            -replace 'REPLACE_AT_PUBLISH_TIME_windows_x86_64', $Env:SHA_WINDOWS_X86_64 |
+            Set-Content $install
+          Write-Host '--- rewritten nuspec ---'
+          Get-Content $nuspec
+          Write-Host '--- rewritten install ---'
+          Get-Content $install
+
+      - name: choco pack
+        shell: pwsh
+        run: |
+          cd packaging/chocolatey
+          choco pack codetracer-solana-recorder.nuspec --out ../../
+
+      - name: choco push
+        if: ${{ ! inputs.dry_run }}
+        shell: pwsh
+        env:
+          API_KEY: ${{ secrets.CHOCOLATEY_API_KEY }}
+          VERSION: ${{ inputs.version }}
+        run: |
+          if (-not $Env:API_KEY) {
+            Write-Warning 'CHOCOLATEY_API_KEY not set; skipping push.'
+            exit 0
+          }
+          choco push "codetracer-solana-recorder.$Env:VERSION.nupkg" `
+            --source https://push.chocolatey.org/ `
+            --api-key $Env:API_KEY
+
+      - name: Upload .nupkg artifact
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: codetracer-solana-recorder-nupkg
+          path: codetracer-solana-recorder.*.nupkg
+          if-no-files-found: error
