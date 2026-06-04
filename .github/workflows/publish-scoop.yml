@@ -1,0 +1,91 @@
+name: publish-scoop
+
+# Refreshes the codetracer-solana-recorder Scoop manifest with a
+# fresh sha256 pulled from the recorder's GitHub release and pushes
+# a branch to the metacraft-labs/scoop-codetracer bucket repo
+# (a human merges the resulting PR).
+#
+# This is the M11 per-recorder analogue of the launcher's
+# publish-scoop.yml. Both emit manifests into the same bucket repo.
+#
+# Required secrets:
+#   SCOOP_BUCKET_DEPLOY_KEY   SSH deploy key (write) on
+#                             metacraft-labs/scoop-codetracer
+#                             (shared org bucket; same key the
+#                             launcher's workflow uses).
+
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: 'Recorder semver that was released to GitHub'
+        required: true
+        default: '0.1.0'
+
+jobs:
+  refresh-manifest:
+    runs-on: ubuntu-latest
+    name: refresh codetracer-solana-recorder.json
+    environment: scoop
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Fetch sha256 for the windows-x86_64 zip
+        id: hash
+        env:
+          VERSION: ${{ inputs.version }}
+        run: |
+          set -euo pipefail
+          url="https://github.com/metacraft-labs/codetracer-solana-recorder/releases/download/v${VERSION}/codetracer-solana-recorder-${VERSION}-windows-x86_64.zip"
+          sha=$(curl -fsSL "$url" | sha256sum | awk '{print $1}')
+          echo "windows-x86_64=$sha" >> "$GITHUB_OUTPUT"
+
+      - name: Rewrite manifest
+        env:
+          VERSION: ${{ inputs.version }}
+          SHA_WINDOWS_X86_64: ${{ steps.hash.outputs.windows-x86_64 }}
+        run: |
+          set -euo pipefail
+          f=packaging/scoop/codetracer-solana-recorder.json
+          sed -i "s/\"version\": \".*\"/\"version\": \"${VERSION}\"/" "$f"
+          sed -i "s|releases/download/v[0-9.]*|releases/download/v${VERSION}|g" "$f"
+          sed -i "s|codetracer-solana-recorder-[0-9.]*-windows-x86_64.zip|codetracer-solana-recorder-${VERSION}-windows-x86_64.zip|g" "$f"
+          sed -i "s/REPLACE_AT_PUBLISH_TIME_windows_x86_64/${SHA_WINDOWS_X86_64}/" "$f"
+          echo "--- regenerated $f ---"
+          cat "$f"
+
+      - name: Push branch to scoop bucket repo
+        env:
+          DEPLOY_KEY: ${{ secrets.SCOOP_BUCKET_DEPLOY_KEY }}
+          VERSION: ${{ inputs.version }}
+        run: |
+          if [[ -z "$DEPLOY_KEY" ]]; then
+            echo "::warning::SCOOP_BUCKET_DEPLOY_KEY not set; emitting manifest as artifact instead."
+            mkdir -p /tmp/manifest
+            cp packaging/scoop/codetracer-solana-recorder.json /tmp/manifest/
+            exit 0
+          fi
+          mkdir -p ~/.ssh
+          echo "$DEPLOY_KEY" > ~/.ssh/id_ed25519
+          chmod 600 ~/.ssh/id_ed25519
+          ssh-keyscan github.com >> ~/.ssh/known_hosts
+          git clone git@github.com:metacraft-labs/scoop-codetracer.git /tmp/bucket
+          mkdir -p /tmp/bucket/bucket
+          cp packaging/scoop/codetracer-solana-recorder.json \
+            /tmp/bucket/bucket/codetracer-solana-recorder.json
+          cd /tmp/bucket
+          branch="bump/codetracer-solana-recorder-${VERSION}"
+          git checkout -B "$branch"
+          git add bucket/codetracer-solana-recorder.json
+          git -c user.email=ci@metacraft-labs.com -c user.name='M11 CI' \
+            commit -m "codetracer-solana-recorder: ${VERSION}"
+          git push -u origin "$branch"
+          echo "Pushed $branch — open PR at https://github.com/metacraft-labs/scoop-codetracer/pulls"
+
+      - name: Upload manifest artifact (fallback)
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: codetracer-solana-recorder.json
+          path: packaging/scoop/codetracer-solana-recorder.json
+          if-no-files-found: error

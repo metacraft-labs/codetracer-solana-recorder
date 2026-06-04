@@ -1,0 +1,56 @@
+# Per-recorder packaging metadata for codetracer-solana-recorder.
+#
+# M12 mass fan-out artifact — generated from the M11 templates
+# in codetracer-launcher/packaging/recorder-templates/ by
+# scripts/m12_fanout.py. To regenerate the channel outputs
+# under packaging/{homebrew,nix,aur,deb,rpm,scoop,chocolatey}/
+# after bumping a field below:
+#
+#   python ../codetracer-launcher/packaging/recorder-templates/generate.py \
+#     --metadata packaging/recorder-metadata.yml \
+#     --out packaging
+#
+# and commit the regenerated files.
+
+recorder:
+  name: codetracer-solana-recorder
+  binary-name: codetracer-solana-recorder
+  description: CodeTracer recorder for Solana programs (Rust/SBF)
+  homepage: https://github.com/metacraft-labs/codetracer-solana-recorder
+  repo: metacraft-labs/codetracer-solana-recorder
+  version: 0.1.0
+  license: "Apache-2.0"
+
+build:
+  # The cargo binary target (matches `[[bin]] name = ...` in
+  # Cargo.toml when the recorder ships a Rust top-level crate;
+  # for the Nim ct_cli and the Go wasm recorder this is the
+  # binary the build pipeline produces).
+  cargo-bin-target: codetracer-solana-recorder
+  # The flake target that produces the recorder. M11's nix
+  # template falls back to `rustPlatform.buildRustPackage`
+  # from the Cargo.lock pin when the recorder's flake only
+  # exposes devShells.
+  nix-flake-target: ".#default"
+
+dependencies:
+  # Debian + Ubuntu runtime deps. libzstd1 is required by the
+  # Nim codetracer-trace-writer FFI the recorder links against
+  # (omitted for recorders that don't embed the writer).
+  deb:
+    - libc6
+    - libzstd1
+  # RPM runtime deps.
+  rpm:
+    - glibc
+    - libzstd
+  # AUR runtime deps.
+  aur:
+    - glibc
+    - zstd
+  # Nix derivation buildInputs.
+  nix:
+    - zstd
+  # Homebrew runtime deps.
+  homebrew:
+    - zstd

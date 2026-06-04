@@ -1,0 +1,12 @@
+Package: codetracer-solana-recorder
+Version: 0.1.0
+Section: devel
+Priority: optional
+Architecture: amd64
+Maintainer: Metacraft Labs <ci@metacraft-labs.com>
+Depends: libc6, libzstd1
+Homepage: https://github.com/metacraft-labs/codetracer-solana-recorder
+Description: CodeTracer recorder for Solana programs (Rust/SBF)
+ codetracer-solana-recorder is part of the CodeTracer record/replay debugging
+ suite. Install the launcher (codetracer) alongside this package for
+ a full record/replay workflow.

@@ -1,0 +1,98 @@
+name: publish-homebrew
+
+# Regenerates the Homebrew formula for codetracer-solana-recorder with
+# fresh sha256 hashes pulled from the recorder's GitHub release and
+# pushes a branch to the metacraft-labs/homebrew-codetracer tap repo
+# (a human merges the resulting PR).
+#
+# This is the M11 per-recorder analogue of the launcher's
+# publish-homebrew.yml. Both emit formulas into the same tap repo.
+#
+# Required secrets:
+#   HOMEBREW_TAP_DEPLOY_KEY  SSH deploy key (write) on
+#                            metacraft-labs/homebrew-codetracer
+#                            (shared org tap; same key the
+#                            launcher's M9 workflow uses).
+
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: 'Recorder semver that was released to GitHub'
+        required: true
+        default: '0.1.0'
+
+jobs:
+  refresh-formula:
+    runs-on: ubuntu-latest
+    name: refresh codetracer-solana-recorder.rb
+    environment: homebrew
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Fetch sha256 for each platform binary
+        id: hashes
+        env:
+          VERSION: ${{ inputs.version }}
+        run: |
+          set -euo pipefail
+          base="https://github.com/metacraft-labs/codetracer-solana-recorder/releases/download/v${VERSION}"
+          for target in linux-x86_64 linux-aarch64 darwin-x86_64 darwin-aarch64; do
+            url="$base/codetracer-solana-recorder-$target"
+            sha=$(curl -fsSL "$url" | sha256sum | awk '{print $1}')
+            echo "$target=$sha" >> "$GITHUB_OUTPUT"
+          done
+
+      - name: Rewrite formula
+        env:
+          VERSION: ${{ inputs.version }}
+          SHA_LINUX_X86_64:   ${{ steps.hashes.outputs.linux-x86_64 }}
+          SHA_LINUX_AARCH64:  ${{ steps.hashes.outputs.linux-aarch64 }}
+          SHA_DARWIN_X86_64:  ${{ steps.hashes.outputs.darwin-x86_64 }}
+          SHA_DARWIN_AARCH64: ${{ steps.hashes.outputs.darwin-aarch64 }}
+        run: |
+          set -euo pipefail
+          f=packaging/homebrew/codetracer-solana-recorder.rb
+          sed -i "s/^  version \".*\"/  version \"${VERSION}\"/" "$f"
+          sed -i "s|releases/download/v[0-9.]*|releases/download/v${VERSION}|g" "$f"
+          sed -i "s/REPLACE_AT_PUBLISH_TIME_linux_x86_64/${SHA_LINUX_X86_64}/"     "$f"
+          sed -i "s/REPLACE_AT_PUBLISH_TIME_linux_aarch64/${SHA_LINUX_AARCH64}/"   "$f"
+          sed -i "s/REPLACE_AT_PUBLISH_TIME_darwin_x86_64/${SHA_DARWIN_X86_64}/"   "$f"
+          sed -i "s/REPLACE_AT_PUBLISH_TIME_darwin_aarch64/${SHA_DARWIN_AARCH64}/" "$f"
+          echo "--- regenerated $f ---"
+          cat "$f"
+
+      - name: Push branch to homebrew tap repo
+        env:
+          DEPLOY_KEY: ${{ secrets.HOMEBREW_TAP_DEPLOY_KEY }}
+          VERSION: ${{ inputs.version }}
+        run: |
+          if [[ -z "$DEPLOY_KEY" ]]; then
+            echo "::warning::HOMEBREW_TAP_DEPLOY_KEY not set; emitting formula as artifact instead."
+            mkdir -p /tmp/formula
+            cp packaging/homebrew/codetracer-solana-recorder.rb /tmp/formula/
+            exit 0
+          fi
+          mkdir -p ~/.ssh
+          echo "$DEPLOY_KEY" > ~/.ssh/id_ed25519
+          chmod 600 ~/.ssh/id_ed25519
+          ssh-keyscan github.com >> ~/.ssh/known_hosts
+          git clone git@github.com:metacraft-labs/homebrew-codetracer.git /tmp/tap
+          cp packaging/homebrew/codetracer-solana-recorder.rb \
+            /tmp/tap/Formula/codetracer-solana-recorder.rb
+          cd /tmp/tap
+          branch="bump/codetracer-solana-recorder-${VERSION}"
+          git checkout -B "$branch"
+          git add Formula/codetracer-solana-recorder.rb
+          git -c user.email=ci@metacraft-labs.com -c user.name='M11 CI' \
+            commit -m "codetracer-solana-recorder: ${VERSION}"
+          git push -u origin "$branch"
+          echo "Pushed $branch — open PR at https://github.com/metacraft-labs/homebrew-codetracer/pulls"
+
+      - name: Upload formula artifact (fallback)
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: codetracer-solana-recorder.rb
+          path: packaging/homebrew/codetracer-solana-recorder.rb
+          if-no-files-found: error

@@ -1,0 +1,23 @@
+{
+  "version": "0.1.0",
+  "description": "CodeTracer recorder for Solana programs (Rust/SBF)",
+  "homepage": "https://github.com/metacraft-labs/codetracer-solana-recorder",
+  "license": "Apache-2.0",
+  "architecture": {
+    "64bit": {
+      "url": "https://github.com/metacraft-labs/codetracer-solana-recorder/releases/download/v0.1.0/codetracer-solana-recorder-0.1.0-windows-x86_64.zip",
+      "hash": "REPLACE_AT_PUBLISH_TIME_windows_x86_64"
+    }
+  },
+  "bin": "codetracer-solana-recorder.exe",
+  "checkver": {
+    "github": "https://github.com/metacraft-labs/codetracer-solana-recorder"
+  },
+  "autoupdate": {
+    "architecture": {
+      "64bit": {
+        "url": "https://github.com/metacraft-labs/codetracer-solana-recorder/releases/download/v$version/codetracer-solana-recorder-$version-windows-x86_64.zip"
+      }
+    }
+  }
+}

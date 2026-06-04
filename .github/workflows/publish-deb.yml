@@ -1,0 +1,141 @@
+name: publish-deb
+
+# Builds codetracer-solana-recorder as a .deb package, signs it with
+# the CodeTracer GPG key, and uploads it to deb.codetracer.com
+# (Cloudflare R2 bucket).
+#
+# Uses the org-level deb-bucket secrets configured on
+# metacraft-labs (accessible to every org repo). There is one
+# CodeTracer-wide R2 bucket for deb hosting and these secrets
+# point at it.
+#
+# Required secrets (org-level on metacraft-labs):
+#   CODETRACER_DEB_BUCKET_ACCESS_KEY_ID
+#   CODETRACER_DEB_BUCKET_ACCESS_KEY
+#   CODETRACER_DEB_BUCKET_S3_URL
+#   CODETRACER_DEB_BUCKET_TOKEN           (R2/S3 token, if needed)
+#   CODETRACER_AUR_GPG_PRIVATE_KEY        (re-used: same GPG key)
+#   CODETRACER_AUR_GPG_PRIVATE_KEY_PASS
+# Required variables:
+#   R2_CODETRACER_BUCKET_NAME
+
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: 'Recorder semver to publish'
+        required: true
+        default: '0.1.0'
+      arch:
+        description: 'Target architecture (amd64 / arm64)'
+        required: true
+        default: 'amd64'
+        type: choice
+        options:
+          - amd64
+          - arm64
+      dry_run:
+        description: 'Build the .deb but skip the upload'
+        required: false
+        type: boolean
+        default: false
+
+jobs:
+  build-and-publish-deb:
+    runs-on: ubuntu-latest
+    name: deb / ${{ inputs.arch }}
+    environment: deb
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: |
+            x86_64-unknown-linux-gnu
+            aarch64-unknown-linux-gnu
+
+      - name: Install dpkg-dev + cross-compile deps
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y dpkg-dev xz-utils gnupg
+          if [[ "${{ inputs.arch }}" == "arm64" ]]; then
+            sudo apt-get install -y gcc-aarch64-linux-gnu
+          fi
+
+      - name: Build recorder binary
+        run: |
+          set -euo pipefail
+          if [[ "${{ inputs.arch }}" == "arm64" ]]; then
+            export CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER=aarch64-linux-gnu-gcc
+            cargo build --release --locked \
+              --target aarch64-unknown-linux-gnu \
+              --bin codetracer-solana-recorder
+            echo "binary=target/aarch64-unknown-linux-gnu/release/codetracer-solana-recorder" >> "$GITHUB_ENV"
+          else
+            cargo build --release --locked \
+              --bin codetracer-solana-recorder
+            echo "binary=target/release/codetracer-solana-recorder" >> "$GITHUB_ENV"
+          fi
+
+      - name: Build .deb
+        run: |
+          mkdir -p out
+          bash packaging/deb/build.sh \
+            packaging/deb \
+            "${{ env.binary }}" \
+            out \
+            codetracer-solana-recorder \
+            "${{ inputs.version }}" \
+            codetracer-solana-recorder \
+            "${{ inputs.arch }}"
+
+      - name: Import GPG key
+        if: ${{ inputs.dry_run == false }}
+        uses: crazy-max/ghaction-import-gpg@v6
+        with:
+          gpg_private_key: ${{ secrets.CODETRACER_AUR_GPG_PRIVATE_KEY }}
+          passphrase:      ${{ secrets.CODETRACER_AUR_GPG_PRIVATE_KEY_PASS }}
+
+      - name: Sign .deb
+        if: ${{ inputs.dry_run == false }}
+        run: |
+          set -euo pipefail
+          deb="out/codetracer-solana-recorder_${{ inputs.version }}_${{ inputs.arch }}.deb"
+          gpg --armor --detach-sign "$deb"
+
+      - name: Upload .deb to deb.codetracer.com (R2)
+        if: ${{ inputs.dry_run == false }}
+        env:
+          AWS_ACCESS_KEY_ID:     ${{ secrets.CODETRACER_DEB_BUCKET_ACCESS_KEY_ID }}
+          AWS_SECRET_ACCESS_KEY: ${{ secrets.CODETRACER_DEB_BUCKET_ACCESS_KEY }}
+          AWS_SESSION_TOKEN:     ${{ secrets.CODETRACER_DEB_BUCKET_TOKEN }}
+        run: |
+          set -euo pipefail
+          if [[ -z "$AWS_ACCESS_KEY_ID" ]]; then
+            echo "::error::CODETRACER_DEB_BUCKET_ACCESS_KEY_ID secret missing; cannot upload."
+            exit 1
+          fi
+          # AWS CLI from pip stays small; matches the approach the
+          # codetracer main repo uses inside its Nix dev shell.
+          python3 -m pip install --user awscli
+          export PATH="$HOME/.local/bin:$PATH"
+          deb="out/codetracer-solana-recorder_${{ inputs.version }}_${{ inputs.arch }}.deb"
+          asc="$deb.asc"
+          bucket_name="${{ vars.R2_CODETRACER_BUCKET_NAME }}"
+          endpoint="${{ secrets.CODETRACER_DEB_BUCKET_S3_URL }}"
+          # Path under the deb.codetracer.com namespace.
+          dest="s3://$bucket_name/deb/codetracer-solana-recorder/$(basename "$deb")"
+          aws --endpoint-url="$endpoint" \
+            s3 cp "$deb" "$dest" --checksum-algorithm CRC32
+          aws --endpoint-url="$endpoint" \
+            s3 cp "$asc" "$dest.asc" --checksum-algorithm CRC32
+          echo "Published $dest"
+
+      - name: Upload .deb artifact
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: codetracer-solana-recorder-${{ inputs.version }}-${{ inputs.arch }}.deb
+          path: out/*.deb
+          if-no-files-found: error
