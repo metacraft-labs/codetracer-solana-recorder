@@ -12,6 +12,8 @@ name: publish-aur
 #   CODETRACER_AUR_SSH_PRIVATE_KEY        SSH key authorised on AUR
 
 on:
+  push:
+    tags: ['v*']
   workflow_dispatch:
     inputs:
       version:
