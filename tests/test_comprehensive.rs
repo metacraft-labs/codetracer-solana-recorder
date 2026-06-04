@@ -8,22 +8,22 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 
 use codetracer_solana_recorder::account_decoder::{
-    decoded_fields_to_struct_record, AnchorIdl, BorshDecoder, DecodedField, DecodedValue, IdlType,
-    TypeIds,
+    AnchorIdl, BorshDecoder, DecodedField, DecodedValue, IdlType, TypeIds,
+    decoded_fields_to_struct_record,
 };
 use codetracer_solana_recorder::cpi::{CpiDetector, CpiEvent};
 use codetracer_solana_recorder::multi_program::ProgramRegistry;
 use codetracer_solana_recorder::recorder::{record_from_snapshots, record_with_cpi};
-use codetracer_solana_recorder::register_trace::{parse_regs_file, RegisterSnapshot, ROW_SIZE};
+use codetracer_solana_recorder::register_trace::{ROW_SIZE, RegisterSnapshot, parse_regs_file};
 use codetracer_solana_recorder::tracer_trait::{
-    replay_snapshots, CodeTracerTracer, NoOpTracer, SbpfTracer,
+    CodeTracerTracer, NoOpTracer, SbpfTracer, replay_snapshots,
 };
 use codetracer_trace_types::{
     CallRecord, FullValueRecord, FunctionId, FunctionRecord, Line, PathId, ReturnRecord,
     StepRecord, TraceLowLevelEvent, TypeId, ValueRecord, VariableId,
 };
 use codetracer_trace_writer_nim::trace_writer::TraceWriter;
-use codetracer_trace_writer_nim::{create_trace_writer, TraceEventsFileFormat};
+use codetracer_trace_writer_nim::{TraceEventsFileFormat, create_trace_writer};
 
 // ===========================================================================
 // Helpers
@@ -396,7 +396,9 @@ fn test_memory_access_register_patterns() {
     let var_names: Vec<&str> = variable_name_events(&events);
     assert_eq!(
         var_names,
-        vec!["r0", "r1", "r2", "r3", "r4", "r5", "r6", "r7", "r8", "r9", "r10"],
+        vec![
+            "r0", "r1", "r2", "r3", "r4", "r5", "r6", "r7", "r8", "r9", "r10"
+        ],
     );
 
     // Distinct integer values: 0 (zero registers), the 4 SBF region addresses,
@@ -496,7 +498,9 @@ fn test_syscall_register_patterns() {
     let var_names: Vec<&str> = variable_name_events(&events);
     assert_eq!(
         var_names,
-        vec!["r0", "r1", "r2", "r3", "r4", "r5", "r6", "r7", "r8", "r9", "r10"],
+        vec![
+            "r0", "r1", "r2", "r3", "r4", "r5", "r6", "r7", "r8", "r9", "r10"
+        ],
     );
 
     let mut int_values: Vec<i64> = events
@@ -1129,7 +1133,7 @@ fn test_account_decode_nested_struct_flat() {
     data.extend_from_slice(&[0xBB; 8]); // discriminator
     data.extend_from_slice(&[0x42; 32]); // owner pubkey (all 0x42)
     data.extend_from_slice(&500u64.to_le_bytes()); // capacity = 500
-                                                   // meta_name = "MyVault"
+    // meta_name = "MyVault"
     let name = "MyVault";
     data.extend_from_slice(&(name.len() as u32).to_le_bytes());
     data.extend_from_slice(name.as_bytes());
@@ -1188,7 +1192,7 @@ fn test_account_decode_vec_of_u64() {
 
     let mut data = Vec::new();
     data.extend_from_slice(&[0xCC; 8]); // discriminator
-                                        // scores: Vec<u64> with 3 elements [10, 20, 30]
+    // scores: Vec<u64> with 3 elements [10, 20, 30]
     data.extend_from_slice(&3u32.to_le_bytes()); // vec length
     data.extend_from_slice(&10u64.to_le_bytes());
     data.extend_from_slice(&20u64.to_le_bytes());
@@ -1468,7 +1472,9 @@ fn test_variable_tracking_function_params() {
     let var_names: Vec<&str> = variable_name_events(&events);
     assert_eq!(
         var_names,
-        vec!["r0", "r1", "r2", "r3", "r4", "r5", "r6", "r7", "r8", "r9", "r10"],
+        vec![
+            "r0", "r1", "r2", "r3", "r4", "r5", "r6", "r7", "r8", "r9", "r10"
+        ],
     );
 
     // Distinct integer values: zero registers, the 5 params (1000..=5000),
@@ -1504,7 +1510,9 @@ fn test_variable_tracking_locals() {
     let var_names: Vec<&str> = variable_name_events(&events);
     assert_eq!(
         var_names,
-        vec!["r0", "r1", "r2", "r3", "r4", "r5", "r6", "r7", "r8", "r9", "r10"],
+        vec![
+            "r0", "r1", "r2", "r3", "r4", "r5", "r6", "r7", "r8", "r9", "r10"
+        ],
     );
 
     // Distinct integer values: zero registers + the two snapshots' r6..r10
@@ -1544,7 +1552,9 @@ fn test_variable_tracking_return_value() {
     let var_names: Vec<&str> = variable_name_events(&events);
     assert_eq!(
         var_names,
-        vec!["r0", "r1", "r2", "r3", "r4", "r5", "r6", "r7", "r8", "r9", "r10"],
+        vec![
+            "r0", "r1", "r2", "r3", "r4", "r5", "r6", "r7", "r8", "r9", "r10"
+        ],
     );
 
     // Distinct integer values: 0 (zero registers), 10 (r1), 20 (r2),
@@ -1585,7 +1595,9 @@ fn test_variable_tracking_stack_pointer() {
     let var_names: Vec<&str> = variable_name_events(&events);
     assert_eq!(
         var_names,
-        vec!["r0", "r1", "r2", "r3", "r4", "r5", "r6", "r7", "r8", "r9", "r10"],
+        vec![
+            "r0", "r1", "r2", "r3", "r4", "r5", "r6", "r7", "r8", "r9", "r10"
+        ],
     );
 
     // Distinct integer values: 0 (zero registers), and the two distinct
@@ -1656,7 +1668,9 @@ fn test_error_path_missing_signature() {
     let var_names: Vec<&str> = variable_name_events(&events);
     assert_eq!(
         var_names,
-        vec!["r0", "r1", "r2", "r3", "r4", "r5", "r6", "r7", "r8", "r9", "r10"],
+        vec![
+            "r0", "r1", "r2", "r3", "r4", "r5", "r6", "r7", "r8", "r9", "r10"
+        ],
     );
 
     // Distinct integer values: zero registers + the error code 2 in r0.

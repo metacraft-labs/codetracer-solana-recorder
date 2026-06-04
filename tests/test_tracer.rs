@@ -7,7 +7,7 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 
 use codetracer_solana_recorder::recorder::record_from_snapshots;
-use codetracer_solana_recorder::register_trace::{parse_regs_file, RegisterSnapshot, ROW_SIZE};
+use codetracer_solana_recorder::register_trace::{ROW_SIZE, RegisterSnapshot, parse_regs_file};
 use codetracer_trace_types::{
     CallRecord, FullValueRecord, FunctionId, FunctionRecord, Line, PathId, ReturnRecord,
     StepRecord, TraceLowLevelEvent, TypeId, ValueRecord, VariableId,
@@ -285,7 +285,9 @@ fn test_sbpf_variable_extraction() {
         .collect();
     assert_eq!(
         var_names,
-        vec!["r0", "r1", "r2", "r3", "r4", "r5", "r6", "r7", "r8", "r9", "r10"],
+        vec![
+            "r0", "r1", "r2", "r3", "r4", "r5", "r6", "r7", "r8", "r9", "r10"
+        ],
     );
 
     // Integer values across every Value event, deduplicated and sorted —
