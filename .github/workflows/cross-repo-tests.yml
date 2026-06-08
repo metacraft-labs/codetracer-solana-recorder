@@ -161,7 +161,7 @@ jobs:
           set +e
           git config --get-regexp '^submodule\..*\.url$' | cut -d. -f2 | while read -r mod; do
             echo "Updating submodule: $mod"
-            git submodule update --depth 1 -- "$mod" 2>&1
+            git submodule update --init --recursive --depth 1 -- "$mod" 2>&1
             rc=$?
             if [ $rc -ne 0 ]; then
               echo "::warning::submodule $mod failed to update (rc=$rc, non-fatal)"
