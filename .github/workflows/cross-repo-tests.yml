@@ -234,7 +234,15 @@ jobs:
           # fetches the noir source from origin and computes the
           # correct hash itself.  Documented as CI-stabilization §4.
           SUBST_OVERRIDE="--option accept-flake-config false --option substituters https://cache.nixos.org"
-          nix build $SUBST_OVERRIDE -L ".?submodules=1#codetracer" $OVERRIDE -o result-ct
+          # The runner's per-user fetcher cache
+          # (~/.cache/nix/fetcher-cache-v2.sqlite) holds a stale
+          # narinfo for the noir git+https input that contradicts the
+          # lockfile.  ``--refresh`` forces nix to re-resolve every
+          # flake input from origin even when the local cache has an
+          # entry, so the cached narHash gets replaced by what
+          # upstream currently serves.
+          REFRESH="--refresh"
+          nix build $SUBST_OVERRIDE $REFRESH -L ".?submodules=1#codetracer" $OVERRIDE -o result-ct
           nix build $SUBST_OVERRIDE -L ".?submodules=1#db-backend" $OVERRIDE -o result-db
           # Merge both outputs into a single bin directory so the extension
           # can find both ct and db-backend via a single runnablePath.
