@@ -13,9 +13,9 @@ name: Cross-Repo Integration Tests
 
 on:
   pull_request:
-    branches: [main]
+    branches: [main, dev, stable]
   push:
-    branches: [main]
+    branches: [main, dev, stable]
 
   workflow_dispatch:
     inputs:
@@ -31,13 +31,6 @@ on:
   repository_dispatch:
     types: [cross-repo-test]
 
-# Nix needs access-tokens to fetch private flake inputs (e.g. mcl-blockchain).
-# NIX_CONFIG is set globally so both direnv and direct nix develop pick it up.
-env:
-  NIX_CONFIG: |
-    access-tokens = github.com=${{ steps.app-token.outputs.token }}
-    accept-flake-config = true
-
 jobs:
   wdio-integration:
     runs-on: [self-hosted, nixos]
@@ -50,6 +43,22 @@ jobs:
           app-id: ${{ secrets.CI_TOKEN_PROVIDER_APP_ID }}
           private-key: ${{ secrets.CI_TOKEN_PROVIDER_PRIVATE_KEY }}
           owner: metacraft-labs
+
+      - name: Configure NIX_CONFIG with access-tokens
+        # The original top-level ``env: NIX_CONFIG`` block referenced
+        # ``steps.app-token.outputs.token`` -- but the ``steps`` context
+        # is unavailable at workflow level (the new GitHub Actions
+        # validator rejects the file before any job starts).  Set
+        # ``NIX_CONFIG`` via ``$GITHUB_ENV`` from a step that runs
+        # AFTER ``app-token`` so subsequent ``nix develop`` invocations
+        # can still fetch private flake inputs.
+        run: |
+          {
+            echo 'NIX_CONFIG<<NIX_EOF'
+            echo "access-tokens = github.com=${{ steps.app-token.outputs.token }}"
+            echo 'accept-flake-config = true'
+            echo 'NIX_EOF'
+          } >> "$GITHUB_ENV"
 
       - name: Checkout
         uses: actions/checkout@v4
