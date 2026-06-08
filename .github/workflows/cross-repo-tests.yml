@@ -225,8 +225,17 @@ jobs:
         run: |
           cd "$GITHUB_WORKSPACE/../codetracer"
           OVERRIDE="--override-input codetracer-trace-format path:./libs/codetracer-trace-format"
-          nix build -L ".?submodules=1#codetracer" $OVERRIDE -o result-ct
-          nix build -L ".?submodules=1#db-backend" $OVERRIDE -o result-db
+          # ``metacraft-labs-codetracer.cachix.org`` serves a stale
+          # narinfo for the noir flake input keyed under a NAR-hash
+          # that no longer matches the lockfile, so the build aborts
+          # with ``NAR hash mismatch in input git+https://...noir...``.
+          # Force-skip every non-default substituter (``cache.nixos.org``
+          # alone is plenty for the standard nixpkgs paths) so nix
+          # fetches the noir source from origin and computes the
+          # correct hash itself.  Documented as CI-stabilization §4.
+          SUBST_OVERRIDE="--option accept-flake-config false --option substituters https://cache.nixos.org"
+          nix build $SUBST_OVERRIDE -L ".?submodules=1#codetracer" $OVERRIDE -o result-ct
+          nix build $SUBST_OVERRIDE -L ".?submodules=1#db-backend" $OVERRIDE -o result-db
           # Merge both outputs into a single bin directory so the extension
           # can find both ct and db-backend via a single runnablePath.
           mkdir -p combined-bin
