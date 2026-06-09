@@ -26,6 +26,10 @@ needless_range_loop = "allow"
 # shape — wrapping them in a struct for the lint's benefit would obscure
 # the semantic mapping.
 too_many_arguments = "allow"
+# CPI execution tests return a partitioned set of PC ranges + per-range
+# location lists as a 5-tuple; factoring into a named struct would just
+# add noise around a one-shot test fixture.
+type_complexity = "allow"
 
 [dependencies]
 # CodeTracer trace format
