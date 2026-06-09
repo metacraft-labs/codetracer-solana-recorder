@@ -36,6 +36,20 @@
           inputsFrom = [ mcl-blockchain.devShells.${system}.solana ];
           packages = [
             pkgs.zstd # required by libcodetracer_trace_writer (Nim FFI)
+            # Declare the toolchain explicitly so CI's dev shell
+            # mirrors local dev exactly.  Cached mcl-blockchain
+            # devShells on cachix sometimes drop nim/nimble from
+            # PATH on resolution; declaring them here keeps the
+            # contract visible in flake.nix.
+            pkgs.nim
+            pkgs.nimble
+            pkgs.just
+            pkgs.capnproto
+            pkgs.rustc
+            pkgs.cargo
+            pkgs.rustfmt
+            pkgs.clippy
+            pkgs.pkg-config
           ];
         };
       }

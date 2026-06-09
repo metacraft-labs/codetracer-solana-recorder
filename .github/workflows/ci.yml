@@ -1,5 +1,9 @@
 name: CI
 
+# Re-plays the project's deterministic dev env on the runner.
+# See:
+#   https://github.com/metacraft-labs/metacraft-dev-guidelines/blob/latest/policies/ci-shared-dev-env.md
+
 on:
   push:
     branches: [main, dev, stable]
@@ -7,12 +11,13 @@ on:
     branches: [main, dev, stable]
 
 jobs:
-  build:
+  lint-and-test:
+    name: Lint and test
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
 
-      - name: Clone codetracer-trace-format (Cargo path dependency)
+      - name: Clone codetracer-trace-format sibling
         run: |
           PINS=".github/sibling-pins"
           TF_REF="main"
@@ -30,32 +35,49 @@ jobs:
             git -C "${GITHUB_WORKSPACE}/../codetracer-trace-format" checkout "${TF_REF}"
           fi
 
-      - name: Install Nim
-        uses: jiro4989/setup-nim-action@v2
-        with:
-          nim-version: "2.2.x"
-          repo-token: ${{ secrets.GITHUB_TOKEN }}
-
-      - name: Build Nim trace writer library + ct-print
-        # tests/test_comprehensive.rs shells out to ../codetracer-trace-format-nim/ct-print
-        # for golden assertions, so build both the FFI static lib (for
-        # cargo build) and the ct-print binary (for cargo test).
+      - name: Clone codetracer-trace-format-nim sibling
         run: |
+          rm -rf "${GITHUB_WORKSPACE}/../codetracer-trace-format-nim"
           git clone --depth 1 \
             "https://github.com/metacraft-labs/codetracer-trace-format-nim.git" \
             "${GITHUB_WORKSPACE}/../codetracer-trace-format-nim"
-          cd "${GITHUB_WORKSPACE}/../codetracer-trace-format-nim"
-          nimble install -y stew results
-          nim c --app:staticlib --mm:arc --noMain -d:release -p:src \
-            -o:libcodetracer_trace_writer.a src/codetracer_trace_writer_ffi.nim
-          nim c -d:release -p:src -o:ct-print src/codetracer_ct_print.nim
+
+      - name: Setup dev env
+        uses: metacraft-labs/metacraft-github-actions/setup-dev-env@main
+        with:
+          env-flavor: nix
+          gh-token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Build Nim trace writer library + ct-print
+        # solana's tests/test_comprehensive.rs shells out to
+        # ../codetracer-trace-format-nim/ct-print for golden
+        # CTFS-decode assertions; build both the FFI static lib
+        # AND the ct-print binary via the dev shell.
+        # TODO: replace with `direnv exec ../codetracer-trace-format-nim
+        # just build-trace-writer-lib build-ct-print` once the
+        # sibling repo ships those targets -- per
+        # cross-repo-builds.md.
+        run: |
+          dev-exec bash -c '
+            set -euo pipefail
+            cd "${GITHUB_WORKSPACE}/../codetracer-trace-format-nim"
+            nimble install -y stew results
+            nim c --app:staticlib --mm:arc --noMain -d:release -p:src \
+              -o:libcodetracer_trace_writer.a src/codetracer_trace_writer_ffi.nim
+            nim c -d:release -p:src -o:ct-print src/codetracer_ct_print.nim
+          '
           echo "CODETRACER_NIM_LIB_DIR=${GITHUB_WORKSPACE}/../codetracer-trace-format-nim" >> "$GITHUB_ENV"
 
-      - uses: dtolnay/rust-toolchain@stable
-      - uses: Swatinem/rust-cache@v2
-      - name: Install capnproto
-        run: sudo apt-get update && sudo apt-get install -y capnproto
-      - name: Build
-        run: cargo build --all-targets
+      - name: Lint
+        run: dev-exec just lint
+
       - name: Test
-        run: cargo test --all-targets
+        run: dev-exec just test
+
+      - name: Upload test logs on failure
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: test-logs
+          path: target/
+          retention-days: 7
