@@ -50,6 +50,17 @@
             pkgs.rustfmt
             pkgs.clippy
             pkgs.pkg-config
+            # Solana SBF toolchain.  The mcl-blockchain ``solana``
+            # devShell exposes ``cargo-build-sbf`` via its own
+            # ``packages = [...]`` list; ``inputsFrom`` only propagates
+            # ``nativeBuildInputs`` / ``buildInputs`` from the source
+            # shell -- it does NOT propagate ``packages``.  Declaring
+            # the SBF tool explicitly here keeps it on PATH for both
+            # ``cargo test`` (recorder unit tests build SBF programs)
+            # and the cross-repo ``prepare-solana-fixture.sh`` step
+            # in codetracer-vscode-extension (which shells into this
+            # devShell via ``nix develop -c sh``).
+            mcl-blockchain.packages.${system}.cargo-build-sbf
           ];
         };
       }
