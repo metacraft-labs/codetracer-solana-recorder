@@ -3438,9 +3438,8 @@ fn test_memory_borrow_test_via_ct_print_full() {
         // Pin the sequence has a present (possibly empty) elements
         // array — this distinguishes Sequence from `Raw` (which has
         // no `elements` field).
-        assert_eq!(
+        assert!(
             var.1["elements"].is_array(),
-            true,
             "`{want}` Sequence must carry an `elements` array; got {}",
             var.1,
         );
