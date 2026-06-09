@@ -36,7 +36,10 @@ jobs:
           nim-version: "2.2.x"
           repo-token: ${{ secrets.GITHUB_TOKEN }}
 
-      - name: Build Nim trace writer library
+      - name: Build Nim trace writer library + ct-print
+        # tests/test_comprehensive.rs shells out to ../codetracer-trace-format-nim/ct-print
+        # for golden assertions, so build both the FFI static lib (for
+        # cargo build) and the ct-print binary (for cargo test).
         run: |
           git clone --depth 1 \
             "https://github.com/metacraft-labs/codetracer-trace-format-nim.git" \
@@ -45,6 +48,7 @@ jobs:
           nimble install -y stew results
           nim c --app:staticlib --mm:arc --noMain -d:release -p:src \
             -o:libcodetracer_trace_writer.a src/codetracer_trace_writer_ffi.nim
+          nim c -d:release -p:src -o:ct-print src/codetracer_ct_print.nim
           echo "CODETRACER_NIM_LIB_DIR=${GITHUB_WORKSPACE}/../codetracer-trace-format-nim" >> "$GITHUB_ENV"
 
       - uses: dtolnay/rust-toolchain@stable
