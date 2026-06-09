@@ -223,20 +223,18 @@ fn extract_subprogram_name<R: gimli::Reader>(
     unit: &gimli::Unit<R>,
 ) -> Option<String> {
     // Try DW_AT_name first.
-    if let Ok(Some(attr)) = entry.attr(gimli::DW_AT_name) {
-        if let Ok(s) = dwarf.attr_string(unit, attr.value()) {
-            if let Ok(name) = s.to_string() {
-                return Some(name.to_string());
-            }
-        }
+    if let Ok(Some(attr)) = entry.attr(gimli::DW_AT_name)
+        && let Ok(s) = dwarf.attr_string(unit, attr.value())
+        && let Ok(name) = s.to_string()
+    {
+        return Some(name.to_string());
     }
     // Fall back to DW_AT_linkage_name.
-    if let Ok(Some(attr)) = entry.attr(gimli::DW_AT_linkage_name) {
-        if let Ok(s) = dwarf.attr_string(unit, attr.value()) {
-            if let Ok(name) = s.to_string() {
-                return Some(name.to_string());
-            }
-        }
+    if let Ok(Some(attr)) = entry.attr(gimli::DW_AT_linkage_name)
+        && let Ok(s) = dwarf.attr_string(unit, attr.value())
+        && let Ok(name) = s.to_string()
+    {
+        return Some(name.to_string());
     }
     None
 }
