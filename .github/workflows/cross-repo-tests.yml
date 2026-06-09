@@ -213,16 +213,16 @@ jobs:
         # needs the sibling on disk at the same level as the
         # recorder.
         run: |
-          PINS="/.github/sibling-pins"
+          PINS="$GITHUB_WORKSPACE/.github/sibling-pins"
           TF_REF="main"
-          if [ -f "" ]; then
-            PIN_REF="" || true
-            [ -n "" ] && TF_REF=""
+          if [ -f "$PINS" ]; then
+            PIN_REF="$(grep '^codetracer-trace-format ' "$PINS" | cut -d' ' -f2)" || true
+            [ -n "$PIN_REF" ] && TF_REF="$PIN_REF"
           fi
-          DEST="/../codetracer-trace-format"
-          rm -rf ""
-          git clone "https://x-access-token:${GH_TOKEN}@github.com/metacraft-labs/codetracer-trace-format.git" ""
-          git -C "" checkout ""
+          DEST="$GITHUB_WORKSPACE/../codetracer-trace-format"
+          rm -rf "$DEST"
+          git clone "https://x-access-token:${GH_TOKEN}@github.com/metacraft-labs/codetracer-trace-format.git" "$DEST"
+          git -C "$DEST" checkout "$TF_REF"
 
       - name: Clone codetracer-trace-format into codetracer/libs (CI override)
         env:
