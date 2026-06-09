@@ -165,7 +165,7 @@ fn test_real_elf_dwarf_source_mapping_pipeline() {
         .unwrap()
         .filter_map(|e| e.ok())
         .map(|e| e.path())
-        .filter(|p| p.extension().map_or(false, |ext| ext == "ct"))
+        .filter(|p| p.extension().is_some_and(|ext| ext == "ct"))
         .collect();
     assert!(!ct_files.is_empty(), "expected .ct file");
     let ct_content = std::fs::read(&ct_files[0]).unwrap();
@@ -334,7 +334,7 @@ fn test_real_elf_function_boundaries_in_trace() {
         .unwrap()
         .filter_map(|e| e.ok())
         .map(|e| e.path())
-        .filter(|p| p.extension().map_or(false, |ext| ext == "ct"))
+        .filter(|p| p.extension().is_some_and(|ext| ext == "ct"))
         .collect();
     assert!(!ct_files2.is_empty(), "expected .ct file");
     // CTFS: event-level checks deferred.
@@ -419,7 +419,7 @@ fn test_dwarf_line_fidelity_per_location() {
             .unwrap()
             .filter_map(|e| e.ok())
             .map(|e| e.path())
-            .filter(|p| p.extension().map_or(false, |ext| ext == "ct"))
+            .filter(|p| p.extension().is_some_and(|ext| ext == "ct"))
             .collect();
         assert!(!ct_files2.is_empty(), "expected .ct file");
         // CTFS: event-level checks deferred.
@@ -528,7 +528,7 @@ fn test_register_trace_roundtrip_with_dwarf() {
         .unwrap()
         .filter_map(|e| e.ok())
         .map(|e| e.path())
-        .filter(|p| p.extension().map_or(false, |ext| ext == "ct"))
+        .filter(|p| p.extension().is_some_and(|ext| ext == "ct"))
         .collect();
     assert!(!ct_files2.is_empty(), "expected .ct file");
     // CTFS: event-level checks deferred.

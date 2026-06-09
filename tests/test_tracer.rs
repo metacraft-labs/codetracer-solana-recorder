@@ -120,7 +120,7 @@ fn read_ct_events(dir: &Path) -> Vec<TraceLowLevelEvent> {
         .unwrap()
         .filter_map(|e| e.ok())
         .map(|e| e.path())
-        .filter(|p| p.extension().map_or(false, |ext| ext == "ct"))
+        .filter(|p| p.extension().is_some_and(|ext| ext == "ct"))
         .collect();
     assert_eq!(ct_files.len(), 1, "expected exactly one .ct file");
     parse_events_from_ct(&ct_files[0])
@@ -322,7 +322,7 @@ fn test_solana_trace_3file_output() {
         .unwrap()
         .filter_map(|e| e.ok())
         .map(|e| e.path())
-        .filter(|p| p.extension().map_or(false, |ext| ext == "ct"))
+        .filter(|p| p.extension().is_some_and(|ext| ext == "ct"))
         .collect();
     assert!(!ct_files.is_empty(), "expected .ct file");
     let ct_content = std::fs::read(&ct_files[0]).unwrap();
