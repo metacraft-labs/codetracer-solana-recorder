@@ -249,7 +249,7 @@ fn test_sbpf_source_mapping() {
         assert_eq!(snap.pc(), expected_pc);
         assert_eq!(expected_file, "test.rs");
         // Lines go from 5 to 11.
-        assert!(expected_line >= 5 && expected_line <= 11);
+        assert!((5..=11).contains(&expected_line));
     }
 
     // Verify the mapping is sequential.
