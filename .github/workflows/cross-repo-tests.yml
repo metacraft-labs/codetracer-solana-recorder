@@ -201,6 +201,29 @@ jobs:
             "$DEST"
 
 
+      - name: Clone codetracer-trace-format as recorder Cargo sibling
+        env:
+          GH_TOKEN: ${{ steps.app-token.outputs.token }}
+        # The recorder's Cargo.toml declares
+        # `codetracer_trace_types` / `codetracer_trace_writer_nim` as
+        # path deps at `../codetracer-trace-format/...`.  Any step
+        # that runs `cargo` against this checkout (the fixture-
+        # recording step shells out to the recorder's nix shell
+        # via `recorder_exec`, which cargo-builds the recorder)
+        # needs the sibling on disk at the same level as the
+        # recorder.
+        run: |
+          PINS="/.github/sibling-pins"
+          TF_REF="main"
+          if [ -f "" ]; then
+            PIN_REF="" || true
+            [ -n "" ] && TF_REF=""
+          fi
+          DEST="/../codetracer-trace-format"
+          rm -rf ""
+          git clone "https://x-access-token:${GH_TOKEN}@github.com/metacraft-labs/codetracer-trace-format.git" ""
+          git -C "" checkout ""
+
       - name: Clone codetracer-trace-format into codetracer/libs (CI override)
         env:
           GH_TOKEN: ${{ steps.app-token.outputs.token }}
