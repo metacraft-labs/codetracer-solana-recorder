@@ -619,8 +619,8 @@ impl VarEnv {
         if self.names.contains_key(name) {
             return;
         }
-        for r in 1..=10usize {
-            if curr.reg(r) != prev[r] {
+        for (r, prev_val) in prev.iter().enumerate().skip(1).take(10) {
+            if curr.reg(r) != *prev_val {
                 self.names.insert(name.to_string(), r);
                 return;
             }
@@ -629,10 +629,12 @@ impl VarEnv {
 
     /// Resolve a free-form arg expression to an integer at the given
     /// snapshot.  Today we recognise:
-    ///   * a bare identifier present in `self.names` → `snap.reg(r{n})`,
-    ///   * an integer literal → its value,
-    ///   * `&NAME` / `*NAME` / `mut NAME` ref/deref forms that strip to
-    ///     a recognised identifier.
+    ///
+    /// * a bare identifier present in `self.names` → `snap.reg(r{n})`,
+    /// * an integer literal → its value,
+    /// * `&NAME` / `*NAME` / `mut NAME` ref/deref forms that strip to
+    ///   a recognised identifier.
+    ///
     /// Returns `None` for anything else so the caller can leave the
     /// placeholder literal.
     fn resolve(&self, expr: &str, snap: &RegisterSnapshot) -> Option<i64> {
@@ -982,13 +984,13 @@ fn decode_value_literal(
     }
     // Pubkey calls — both `Pubkey::default()` and
     // `Pubkey::new_from_array([..])` decode as base58 / shape placeholders.
-    if s.starts_with("Pubkey::") {
-        if let Some(text) = pubkey_call_to_string(s) {
-            return Some(ValueRecord::String {
-                text,
-                type_id: type_ids.string,
-            });
-        }
+    if s.starts_with("Pubkey::")
+        && let Some(text) = pubkey_call_to_string(s)
+    {
+        return Some(ValueRecord::String {
+            text,
+            type_id: type_ids.string,
+        });
     }
     // String literal.
     if let Some(text) = parse_string_literal(s) {
@@ -1992,10 +1994,10 @@ pub fn record_from_snapshots_into_writer(
             // `let NAME = ...` binding visible on this step before
             // synthesising events — placeholder substitution downstream
             // looks up named args via the env.
-            if let Some(env) = env_stack.last_mut() {
-                if let Some(name) = extract_let_lhs(strip_line_for_match(model.line(line))) {
-                    env.record_let(name, &prev_regs, snap);
-                }
+            if let Some(env) = env_stack.last_mut()
+                && let Some(name) = extract_let_lhs(strip_line_for_match(model.line(line)))
+            {
+                env.record_let(name, &prev_regs, snap);
             }
 
             // Synthesise side-effecting / typed-value events the SBF
@@ -2308,10 +2310,10 @@ pub fn record_with_cpi(
             // Update the active frame's variable→register env from any
             // `let NAME = ...` binding visible on this step before
             // synthesising events.
-            if let Some(env) = env_stack.last_mut() {
-                if let Some(name) = extract_let_lhs(strip_line_for_match(model.line(line))) {
-                    env.record_let(name, &prev_regs, snap);
-                }
+            if let Some(env) = env_stack.last_mut()
+                && let Some(name) = extract_let_lhs(strip_line_for_match(model.line(line)))
+            {
+                env.record_let(name, &prev_regs, snap);
             }
 
             // Synthesise side-effecting / typed-value events.
