@@ -92,7 +92,7 @@ pub fn execute_with_tracing(elf_data: &[u8], compute_budget: u64) -> Result<Vec<
     let heap_size = 32 * 1024; // 32 KB heap
     let mut heap = vec![0u8; heap_size];
 
-    let sbpf_version = executable.get_sbpf_version().clone();
+    let sbpf_version = executable.get_sbpf_version();
     let regions = vec![
         MemoryRegion::new_writable(&mut stack, ebpf::MM_STACK_START),
         MemoryRegion::new_writable(&mut heap, ebpf::MM_HEAP_START),
