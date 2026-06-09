@@ -21,6 +21,11 @@ manual_abs_diff = "allow"
 manual_is_multiple_of = "allow"
 needless_borrow = "allow"
 needless_range_loop = "allow"
+# SBPF/x86 helpers and test fixture constructors take a whole register
+# file (12+ args) as positional parameters because that's the natural
+# shape — wrapping them in a struct for the lint's benefit would obscure
+# the semantic mapping.
+too_many_arguments = "allow"
 
 [dependencies]
 # CodeTracer trace format
