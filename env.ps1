@@ -52,4 +52,56 @@ if ($env:WINDOWS_DIY_CL_EXE -and (Test-Path $env:WINDOWS_DIY_CL_EXE)) {
     }
 }
 
+# --- 3. Solana SBF toolchain -------------------------------------------------
+# The recorder's tests and the cross-repo prepare-solana-fixture.sh script
+# both invoke ``cargo build-sbf`` to produce the SBF ELF objects whose DWARF
+# the recorder consumes.  ``cargo-build-sbf`` is installed by the official
+# Solana platform-tools release; on Nix it comes from the ``mcl-blockchain``
+# flake's ``cargo-build-sbf`` package, but on Windows DIY there's no Nix to
+# do that for us.
+#
+# Provisioning order:
+#   1. Pre-set ``CARGO_BUILD_SBF`` / ``SOLANA_PLATFORM_TOOLS_DIR`` (user
+#      override).
+#   2. Canonical Solana CLI install path.  ``solana-install`` drops
+#      ``cargo-build-sbf`` under
+#      ``%LOCALAPPDATA%\solana\install\active_release\bin`` (mirror of the
+#      POSIX ``~/.local/share/solana/install/active_release/bin``).
+#   3. Opt-out: ``WINDOWS_DIY_SKIP_SOLANA_SBF=1`` -- same shape as the other
+#      ``WINDOWS_DIY_SKIP_*`` knobs above so satellite repos can opt out.
+#
+# When nothing resolves, emit a single WARNING and continue -- the rest of
+# the env still loads.  Tests that DO need ``cargo build-sbf`` will then
+# fail with a clear "not found" error from the recorder itself.
+if (-not $env:WINDOWS_DIY_SKIP_SOLANA_SBF) {
+    $sbfBin = $null
+    if ($env:CARGO_BUILD_SBF -and (Test-Path $env:CARGO_BUILD_SBF)) {
+        $sbfBin = $env:CARGO_BUILD_SBF
+    }
+    elseif ($env:SOLANA_PLATFORM_TOOLS_DIR -and (Test-Path (Join-Path $env:SOLANA_PLATFORM_TOOLS_DIR "cargo-build-sbf.exe"))) {
+        $sbfBin = Join-Path $env:SOLANA_PLATFORM_TOOLS_DIR "cargo-build-sbf.exe"
+    }
+    else {
+        $candidates = @(
+            (Join-Path $env:LOCALAPPDATA "solana\install\active_release\bin\cargo-build-sbf.exe"),
+            (Join-Path $env:USERPROFILE  ".local\share\solana\install\active_release\bin\cargo-build-sbf.exe")
+        )
+        foreach ($candidate in $candidates) {
+            if (Test-Path $candidate) { $sbfBin = $candidate; break }
+        }
+    }
+
+    if ($sbfBin) {
+        $sbfDir = Split-Path -Parent $sbfBin
+        if ($env:Path -notlike "*$sbfDir*") {
+            $env:Path = "$sbfDir;$($env:Path)"
+        }
+        $env:CARGO_BUILD_SBF = $sbfBin
+        Write-Host "Solana SBF toolchain: $sbfBin"
+    }
+    else {
+        Write-Warning "Solana SBF toolchain not found. Install via the official Solana installer (see https://docs.anza.xyz/cli/install) or set CARGO_BUILD_SBF / SOLANA_PLATFORM_TOOLS_DIR. Tests that build SBF programs will fail until this is provisioned."
+    }
+}
+
 Write-Host "codetracer-solana-recorder dev environment ready."
