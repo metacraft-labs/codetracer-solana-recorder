@@ -224,6 +224,27 @@ jobs:
           git clone "https://x-access-token:${GH_TOKEN}@github.com/metacraft-labs/codetracer-trace-format.git" "$DEST"
           git -C "$DEST" checkout "$TF_REF"
 
+      - name: Clone codetracer-trace-format-nim as recorder sibling
+        env:
+          GH_TOKEN: ${{ steps.app-token.outputs.token }}
+        # codetracer_trace_writer_nim's build.rs reads the FFI
+        # entry point at
+        # `../codetracer-trace-format-nim/src/codetracer_trace_writer_ffi.nim`.
+        # The fixture-recording step's recorder_exec cargo-builds
+        # the recorder, which compiles codetracer_trace_writer_nim,
+        # which panics without this sibling on disk.
+        run: |
+          PINS="$GITHUB_WORKSPACE/.github/sibling-pins"
+          TFN_REF="main"
+          if [ -f "$PINS" ]; then
+            PIN_REF="$(grep '^codetracer-trace-format-nim ' "$PINS" | cut -d' ' -f2)" || true
+            [ -n "$PIN_REF" ] && TFN_REF="$PIN_REF"
+          fi
+          DEST="$GITHUB_WORKSPACE/../codetracer-trace-format-nim"
+          rm -rf "$DEST"
+          git clone "https://x-access-token:${GH_TOKEN}@github.com/metacraft-labs/codetracer-trace-format-nim.git" "$DEST"
+          git -C "$DEST" checkout "$TFN_REF" 2>/dev/null || true
+
       - name: Clone codetracer-trace-format into codetracer/libs (CI override)
         env:
           GH_TOKEN: ${{ steps.app-token.outputs.token }}
