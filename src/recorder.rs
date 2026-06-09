@@ -597,10 +597,11 @@ impl VarEnv {
                 .trim_start_matches('_')
                 .trim_start_matches('&');
             // Skip names that aren't simple identifiers (e.g. tuple-pattern params).
-            if !name.is_empty() && name.chars().all(|c| c.is_ascii_alphanumeric() || c == '_') {
-                if idx <= 10 {
-                    self.names.insert(name.to_string(), idx);
-                }
+            if !name.is_empty()
+                && name.chars().all(|c| c.is_ascii_alphanumeric() || c == '_')
+                && idx <= 10
+            {
+                self.names.insert(name.to_string(), idx);
             }
             idx += 1;
         }
