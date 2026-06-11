@@ -1,3 +1,4 @@
 /target
+/test-programs/target
 .env
 .direnv
