@@ -1,0 +1,26 @@
+[package]
+name = "test_programs"
+version = "0.1.0"
+edition = "2021"
+publish = false
+description = "Solana test programs compiled to SBF for the codetracer-solana-recorder's fixture-recording tests"
+
+# The fixture-recording path (codetracer-vscode-extension/scripts/
+# prepare-solana-fixture.sh) does ``cd test-programs && cargo build-sbf``
+# which compiles this crate against the Solana program SDK for the
+# ``sbpf-solana-solana`` target.  The resulting ``target/deploy/
+# test_programs.so`` is then fed into the recorder.
+#
+# This is a standalone crate; the parent ``codetracer-solana-recorder``
+# Cargo.toml is a ``[package]`` (not a workspace), so this directory
+# is intentionally not picked up by a top-level ``cargo build``.  Host-
+# side unit tests against the non-SBF branch live under ``cargo test``
+# from this directory.
+[lib]
+crate-type = ["cdylib", "lib"]
+
+[dependencies]
+solana-program = "2"
+
+[features]
+no-entrypoint = []
