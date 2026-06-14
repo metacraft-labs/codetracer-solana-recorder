@@ -32,3 +32,17 @@ solana-program = "2"
 
 [features]
 no-entrypoint = []
+
+# cargo-build-sbf compiles SBF programs against ``[profile.release]`` by
+# default; the upstream LimeChain ``sbpf-coverage`` documentation
+# (https://github.com/LimeChain/sbpf-coverage) is the canonical
+# reference for what's needed to keep DWARF in the .so so PC → source
+# mapping survives.  Without these the strip phase plus optimisations
+# leave the ELF with an empty ``.debug_info`` -- the recorder then
+# can't resolve any source location and the WDIO smoke test never
+# sees ``process_instruction`` / ``sum_val`` in the trace.
+[profile.release]
+debug = true
+lto = "off"
+opt-level = 0
+strip = "none"
