@@ -38,7 +38,7 @@
 //! degrade to empty and the recorder behaves exactly as before.
 
 use std::collections::HashMap;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use codetracer_trace_types::{EventLogKind, Line, NONE_VALUE, TypeId, TypeKind, ValueRecord};
 use codetracer_trace_writer_nim::trace_writer::TraceWriter;
@@ -96,7 +96,66 @@ pub fn record_from_traces(
         .map(|(pc, f, l)| (*pc, f.as_str(), *l))
         .collect();
 
-    record_from_snapshots(&snapshots, &source_locs_ref, source_path, out_dir)
+    // Derive the trace's "source file" from DWARF: the file that contains
+    // the first PC seen in execution.  Without this, the caller's
+    // ``source_path`` (which the recorder treats as the program identifier
+    // and writes into the trace via ``TraceWriter::start``) is the ELF
+    // ``.so`` path -- the DAP server then asks VS Code to open the ``.so``
+    // as a source file and the smoke test's ``opens
+    // solana_flow_test.rs in the editor`` assertion times out after 120s
+    // (observed against cross-repo runs at d92244b and earlier).  Resolve
+    // the .rs path from the first valid source location, fall back to the
+    // ELF path only if DWARF resolution turned up empty.
+    // Prefer the .rs source file from DWARF, falling back to:
+    //   1. A sibling .rs file next to the .so (looks for <out_dir
+    //      grandparent>/src/*.rs -- the layout produced by
+    //      cargo-build-sbf for a single-source crate).
+    //   2. The original ELF path (last resort, may not open in VS
+    //      Code as a source tab).
+    //
+    // The fallback exists because cargo-build-sbf release builds (the
+    // only profile sBPF supports) currently emit an empty .debug_info
+    // section in the .so even when ``--debug`` is set -- so the
+    // primary DWARF→source map will be empty in practice.  Without
+    // the fallback the recorder would write the .so as the trace's
+    // source path and the DAP server would tell VS Code to open the
+    // ELF as text, hanging the smoke test's ``opens
+    // solana_flow_test.rs in the editor`` assertion at the 120s
+    // timeout.
+    let trace_source_path: PathBuf = if let Some((_, f, _)) = source_locations.first() {
+        PathBuf::from(f)
+    } else if let Some(rs) = sibling_rs_source(source_path) {
+        rs
+    } else {
+        source_path.to_path_buf()
+    };
+
+    record_from_snapshots(&snapshots, &source_locs_ref, &trace_source_path, out_dir)
+}
+
+/// Look for a sibling ``.rs`` source file next to the given ELF path.
+///
+/// cargo-build-sbf places the linked ELF at
+/// ``test-programs/target/deploy/test_programs.so`` and the lib source
+/// at ``test-programs/src/<name>.rs``.  Resolve from the ELF up to the
+/// crate root (two ``..`` from ``target/deploy``) and look for a single
+/// ``.rs`` file under ``src/``.  Returns ``None`` if the layout differs
+/// or more than one candidate is present (ambiguous -- safer to leave
+/// the caller's fallback in place).
+fn sibling_rs_source(elf_path: &Path) -> Option<PathBuf> {
+    let crate_root = elf_path.parent()?.parent()?.parent()?;
+    let src_dir = crate_root.join("src");
+    let mut entries: Vec<PathBuf> = std::fs::read_dir(&src_dir)
+        .ok()?
+        .filter_map(|e| e.ok())
+        .map(|e| e.path())
+        .filter(|p| p.extension().and_then(|s| s.to_str()) == Some("rs"))
+        .collect();
+    if entries.len() == 1 {
+        Some(entries.pop().unwrap())
+    } else {
+        None
+    }
 }
 
 /// Record a Solana program execution from pre-parsed register snapshots
