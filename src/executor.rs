@@ -86,16 +86,36 @@ pub fn execute_with_tracing(elf_data: &[u8], compute_budget: u64) -> Result<Vec<
         .verify::<solana_sbpf::verifier::RequisiteVerifier>()
         .map_err(|e| eyre!("ELF verification failed: {:?}", e))?;
 
-    // Set up stack and heap memory regions.
+    // Set up stack, heap, and input memory regions.
     let stack_size = config.stack_size();
     let mut stack = vec![0u8; stack_size];
     let heap_size = 32 * 1024; // 32 KB heap
     let mut heap = vec![0u8; heap_size];
 
+    // Solana SBF programs compiled via ``entrypoint!`` expect ``r1`` to
+    // point at a serialized input region (per the BPFLoader ABI):
+    //
+    //   | num_accounts: u64 (LE)        |
+    //   | (account_metas + data...)     |
+    //   | instruction_data_len: u64 (LE)|
+    //   | instruction_data (bytes)      |
+    //   | program_id: 32 bytes          |
+    //
+    // Without that, the entrypoint's first ``LD`` from ``[r1+0]`` hits
+    // an ``AccessViolation(Load, 0, 8, "unknown")`` at address 0 and
+    // execution aborts after ~7 instructions (observed against
+    // ``test_programs.so`` in the cross-repo smoke test).  Provide a
+    // minimal valid input -- zero accounts, zero instruction data,
+    // all-zero program id, total 48 bytes -- so the entrypoint
+    // deserialises cleanly and reaches the body of
+    // ``process_instruction``.
+    let mut input = vec![0u8; 48]; // num=0, data_len=0, program_id=32 zero bytes
+
     let sbpf_version = executable.get_sbpf_version();
     let regions = vec![
         MemoryRegion::new_writable(&mut stack, ebpf::MM_STACK_START),
         MemoryRegion::new_writable(&mut heap, ebpf::MM_HEAP_START),
+        MemoryRegion::new_writable(&mut input, ebpf::MM_INPUT_START),
     ];
 
     let mut context = RecorderContext::new(compute_budget, &config);
@@ -104,6 +124,8 @@ pub fn execute_with_tracing(elf_data: &[u8], compute_budget: u64) -> Result<Vec<
 
     // Create and execute the VM.
     let mut vm = EbpfVm::new(loader, sbpf_version, &mut context, stack_size);
+    // Point r1 at the input region per Solana entrypoint ABI.
+    vm.registers[1] = ebpf::MM_INPUT_START;
 
     let mut mode = ExecutionMode::Interpreted;
     let mut call_frames = vec![solana_sbpf::vm::CallFrame::default(); config.max_call_depth];
