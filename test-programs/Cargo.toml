@@ -16,7 +16,15 @@ description = "Solana test programs compiled to SBF for the codetracer-solana-re
 # is intentionally not picked up by a top-level ``cargo build``.  Host-
 # side unit tests against the non-SBF branch live under ``cargo test``
 # from this directory.
+# The lib source is named ``solana_flow_test.rs`` (not the cargo-default
+# ``lib.rs``) so the DWARF debug-info inside ``test_programs.so``
+# references ``solana_flow_test.rs``.  The vscode-extension's WDIO
+# smoke test (``test/wdio/specs/smoke/solana.e2e.ts``) expects an
+# editor tab with that basename to open when the trace loads -- with
+# the cargo-default name, the DAP server pointed at ``lib.rs`` and the
+# tab never matched ``solana_flow_test.rs``.
 [lib]
+path = "src/solana_flow_test.rs"
 crate-type = ["cdylib", "lib"]
 
 [dependencies]
