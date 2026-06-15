@@ -159,7 +159,20 @@ pub fn execute_with_tracing(elf_data: &[u8], compute_budget: u64) -> Result<Vec<
     let mut input = vec![0u8; 48]; // num=0, data_len=0, program_id=32 zero bytes
 
     let sbpf_version = executable.get_sbpf_version();
+    // The program's read-only data (constants, string literals etc.)
+    // is mapped at ``MM_PROGRAM_START``.  The on-chain Solana runtime
+    // adds ``executable.get_ro_region()`` to the memory map for this
+    // very reason; without it, the first ``LDXDW`` that reads a
+    // ``rodata`` constant (e.g. the format string of
+    // ``msg!("result: {}", ..)``, lowered to a ``lddw r1, <const>``
+    // followed by ``ldxdw r2, [r1+0]``) aborts the VM with
+    // ``AccessViolation(Load, 0x100000000+offset, 8, "program")``.
+    // Observed against cross-repo run 27556688038: execution reached
+    // 574 register snapshots, then halted on
+    // ``AccessViolation(Load, 4295012184, 8, "program")``
+    // (4295012184 = 0x1_0000_0018 = ``MM_PROGRAM_START + 0x18``).
     let regions = vec![
+        executable.get_ro_region(),
         MemoryRegion::new_writable(&mut stack, ebpf::MM_STACK_START),
         MemoryRegion::new_writable(&mut heap, ebpf::MM_HEAP_START),
         MemoryRegion::new_writable(&mut input, ebpf::MM_INPUT_START),
