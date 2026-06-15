@@ -2597,10 +2597,7 @@ mod source_path_tests {
         let elf = elf_dir.join("test_programs.so");
         std::fs::write(&elf, b"").unwrap();
 
-        let resolved = resolve_source_against_elf_crate(
-            Path::new("src/solana_flow_test.rs"),
-            &elf,
-        );
+        let resolved = resolve_source_against_elf_crate(Path::new("src/solana_flow_test.rs"), &elf);
         assert_eq!(
             resolved,
             crate_root.join("src/solana_flow_test.rs"),
@@ -2609,10 +2606,7 @@ mod source_path_tests {
 
         // Unknown relative paths fall through to the input so the caller's
         // empty-model fallback still kicks in.
-        let unresolved = resolve_source_against_elf_crate(
-            Path::new("src/does_not_exist.rs"),
-            &elf,
-        );
+        let unresolved = resolve_source_against_elf_crate(Path::new("src/does_not_exist.rs"), &elf);
         assert_eq!(unresolved, PathBuf::from("src/does_not_exist.rs"));
 
         std::fs::remove_dir_all(&tmp).ok();
