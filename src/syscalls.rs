@@ -204,7 +204,7 @@ declare_builtin_function!(
     ) -> Result<u64, Box<dyn std::error::Error>> {
         ctx.syscall_state().push("abort", String::new());
         Err(Box::new(EbpfError::SyscallError(Box::new(
-            std::io::Error::new(std::io::ErrorKind::Other, "program called abort()"),
+            std::io::Error::other("program called abort()"),
         ))))
     }
 );
@@ -231,10 +231,7 @@ declare_builtin_function!(
             format!("{file}:{line}:{column}"),
         );
         Err(Box::new(EbpfError::SyscallError(Box::new(
-            std::io::Error::new(
-                std::io::ErrorKind::Other,
-                format!("program panicked at {file}:{line}:{column}"),
-            ),
+            std::io::Error::other(format!("program panicked at {file}:{line}:{column}")),
         ))))
     }
 );
