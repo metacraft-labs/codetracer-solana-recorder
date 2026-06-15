@@ -144,15 +144,10 @@ pub fn record_from_traces(
         source_path.to_path_buf()
     };
     eprintln!(
-        "Trace source path selected: {} (source_locations.len()={})",
+        "Trace source path: {} ({} DWARF source locations)",
         trace_source_path.display(),
         source_locations.len(),
     );
-    // First few source locations for diagnosis when the filter
-    // doesn't pick the user's crate.
-    for (i, (_, f, _)) in source_locations.iter().take(10).enumerate() {
-        eprintln!("  source_locations[{}] = {}", i, f);
-    }
 
     record_from_snapshots(&snapshots, &source_locs_ref, &trace_source_path, out_dir)
 }
@@ -180,9 +175,29 @@ pub fn record_from_traces(
 /// Filter both classes out so the trace's primary source path is the
 /// user's crate.
 fn is_third_party_source(path: &str) -> bool {
-    path.contains(".cargo/registry/")
+    if path.contains(".cargo/registry/")
         || path.contains("/rust/library/")
         || path.contains("/rustlib/src/rust/library/")
+    {
+        return true;
+    }
+    // ``cargo-build-sbf`` on CI uses ``--remap-path-prefix`` so the
+    // ``.cargo/registry/...`` paths above arrive as a bare relative
+    // path (observed against CI run 27531347645:
+    // ``source_locations[0] = src/lib.rs``).  We can't tell from a
+    // relative ``src/lib.rs`` alone whether the source is a registry
+    // dep or the user's crate -- but by convention the user's SBF
+    // crate root is named after its program rather than the cargo
+    // default ``lib.rs`` (the test-programs crate's lib was renamed
+    // to ``solana_flow_test.rs`` precisely so the DAP server picks
+    // the user file as the editor tab).  Treat the bare ``lib.rs``
+    // basename as third-party -- a heuristic, but the only one
+    // reliable across local-vs-CI builds with different
+    // ``--remap-path-prefix`` settings.
+    std::path::Path::new(path)
+        .file_name()
+        .and_then(|n| n.to_str())
+        == Some("lib.rs")
 }
 
 fn sibling_rs_source(elf_path: &Path) -> Option<PathBuf> {
@@ -2497,5 +2512,23 @@ mod source_path_tests {
         assert!(!is_third_party_source(
             "/home/user/codetracer-solana-recorder/test-programs/src/solana_flow_test.rs"
         ));
+    }
+
+    #[test]
+    fn bare_lib_rs_is_third_party_after_remap() {
+        // ``cargo-build-sbf`` on CI strips ``$CARGO_HOME/registry/...``
+        // off DWARF paths via ``--remap-path-prefix`` so registry deps
+        // appear as bare relative paths -- match the convention that
+        // user-named lib sources don't keep cargo's default ``lib.rs``
+        // basename.
+        assert!(is_third_party_source("src/lib.rs"));
+    }
+
+    #[test]
+    fn relative_user_crate_source_is_not_third_party() {
+        // The user's lib was renamed away from ``lib.rs`` precisely
+        // for this reason -- a relative ``src/solana_flow_test.rs``
+        // (post-remap) is still recognisable as the user's source.
+        assert!(!is_third_party_source("src/solana_flow_test.rs"));
     }
 }
