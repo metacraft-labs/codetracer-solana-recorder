@@ -143,6 +143,16 @@ pub fn record_from_traces(
     } else {
         source_path.to_path_buf()
     };
+    eprintln!(
+        "Trace source path selected: {} (source_locations.len()={})",
+        trace_source_path.display(),
+        source_locations.len(),
+    );
+    // First few source locations for diagnosis when the filter
+    // doesn't pick the user's crate.
+    for (i, (_, f, _)) in source_locations.iter().take(10).enumerate() {
+        eprintln!("  source_locations[{}] = {}", i, f);
+    }
 
     record_from_snapshots(&snapshots, &source_locs_ref, &trace_source_path, out_dir)
 }
