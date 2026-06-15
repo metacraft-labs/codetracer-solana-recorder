@@ -2611,4 +2611,68 @@ mod source_path_tests {
 
         std::fs::remove_dir_all(&tmp).ok();
     }
+
+    #[test]
+    fn source_model_loads_via_resolver_against_relative_dwarf_path() {
+        // End-to-end regression test for the cross-repo WDIO smoke failure
+        // at run 27532963247: on CI, ``cargo-build-sbf`` produces DWARF
+        // paths relative to the crate root (via ``--remap-path-prefix``).
+        // The recorder must resolve those against the ELF's crate root
+        // before ``SourceModel::load`` reads the file -- otherwise
+        // ``read_to_string`` silently fails (cwd doesn't contain
+        // ``src/<file>``), the model is empty, and every nested call
+        // gets the ``fn_at_pc_<pc>`` synthetic placeholder instead of
+        // the real function name from the source.
+        use super::{SourceModel, resolve_source_against_elf_crate};
+        use std::path::Path;
+
+        let tmp = std::env::temp_dir().join(format!(
+            "ct-solana-model-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let crate_root = tmp.join("test-programs");
+        let src_dir = crate_root.join("src");
+        let elf_dir = crate_root.join("target/sbpf-solana-solana/release");
+        std::fs::create_dir_all(&src_dir).unwrap();
+        std::fs::create_dir_all(&elf_dir).unwrap();
+        std::fs::write(crate_root.join("Cargo.toml"), "[package]\nname = \"x\"\n").unwrap();
+        std::fs::write(
+            src_dir.join("solana_flow_test.rs"),
+            "fn process_instruction(_a: u64) -> u64 {\n    let x = 1;\n    x\n}\n",
+        )
+        .unwrap();
+        let elf = elf_dir.join("test_programs.so");
+        std::fs::write(&elf, b"").unwrap();
+
+        // Mimic the recorder's CI input: source_locations carries a
+        // relative path (the cwd would be the recorder repo root,
+        // where ``src/solana_flow_test.rs`` does NOT exist).
+        let dwarf_relative = Path::new("src/solana_flow_test.rs");
+
+        // Without the resolver, SourceModel::load would return an empty
+        // model because the relative path doesn't resolve against cwd.
+        let unresolved_model = SourceModel::load(dwarf_relative);
+        assert!(
+            unresolved_model.function_at(1).is_none(),
+            "unresolved model must be empty; otherwise this test isn't reproducing the CI scenario"
+        );
+
+        // With the resolver, the model loads the source and surfaces
+        // the real function name -- restoring the call-frame data the
+        // WDIO smoke test polls for.
+        let resolved = resolve_source_against_elf_crate(dwarf_relative, &elf);
+        let model = SourceModel::load(&resolved);
+        assert_eq!(
+            model.function_at(2),
+            Some("process_instruction"),
+            "SourceModel should resolve `process_instruction` from the source on line 2 \
+             after the resolver walks up from the ELF to find the crate root"
+        );
+
+        std::fs::remove_dir_all(&tmp).ok();
+    }
 }

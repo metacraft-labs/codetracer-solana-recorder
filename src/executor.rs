@@ -15,25 +15,56 @@ use solana_sbpf::{
     vm::{Config, ContextObject, EbpfVm, ExecutionMode},
 };
 
-/// Minimal context object for standalone SBF execution.
+use crate::syscalls::{HasSyscallState, SyscallState};
+
+/// Context object for standalone SBF execution.
 ///
-/// Provides a compute budget and memory mapping. Does not implement
-/// Solana runtime features (accounts, syscalls) — suitable for pure
-/// computational programs.
-struct RecorderContext {
+/// Provides:
+///   * A compute budget that decrements on each instruction (used by
+///     ``ContextObject::consume`` / ``get_remaining``).
+///   * The active ``MemoryMapping`` for the running VM -- exposed via
+///     ``active_mapping_ptr`` so the interpreter can resolve virtual
+///     addresses, and via [`crate::syscalls`] handlers so they can
+///     read/write the program's memory.
+///   * The recorder's ``SyscallState`` -- captures each syscall the
+///     program invokes so the trace surface matches the on-chain
+///     ``InvokeContext``.  See [`crate::syscalls`] for the
+///     registered handler set.
+///
+/// The struct is ``pub`` (not ``pub(crate)``) because the
+/// ``declare_builtin_function!`` macro lives in the
+/// ``codetracer_solana_recorder::syscalls`` module and the macro's
+/// generated impl block needs name resolution on the concrete type.
+pub struct RecorderContext {
     remaining: u64,
-    memory_mapping: MemoryMapping,
+    pub memory_mapping: MemoryMapping,
+    syscall_state: SyscallState,
 }
 
 impl RecorderContext {
-    fn new(compute_budget: u64, config: &Config) -> Self {
+    fn new(compute_budget: u64, config: &Config, heap_start: u64, heap_len: u64) -> Self {
         let memory_mapping =
             MemoryMapping::new(vec![], config, solana_sbpf::program::SBPFVersion::Reserved)
                 .expect("empty memory mapping should not fail");
         Self {
             remaining: compute_budget,
             memory_mapping,
+            syscall_state: SyscallState::new(heap_start, heap_len),
         }
+    }
+
+    /// Public constructor used by [`crate::syscalls`] unit tests so
+    /// they can drive the VM through the same setup the executor
+    /// performs without going through ``execute_with_tracing`` (which
+    /// expects an ELF; the syscall tests use assembled SBPF directly).
+    #[doc(hidden)]
+    pub fn new_for_tests(
+        compute_budget: u64,
+        config: &Config,
+        heap_start: u64,
+        heap_len: u64,
+    ) -> Self {
+        Self::new(compute_budget, config, heap_start, heap_len)
     }
 }
 
@@ -48,6 +79,12 @@ impl ContextObject for RecorderContext {
 
     fn active_mapping_ptr(&mut self) -> std::ptr::NonNull<MemoryMapping> {
         std::ptr::NonNull::from(&mut self.memory_mapping)
+    }
+}
+
+impl HasSyscallState for RecorderContext {
+    fn syscall_state(&self) -> &SyscallState {
+        &self.syscall_state
     }
 }
 
@@ -71,12 +108,22 @@ pub fn execute_with_tracing(elf_data: &[u8], compute_budget: u64) -> Result<Vec<
         ..Config::default()
     };
 
-    // Create a minimal loader. For programs that reference Solana syscalls,
-    // ELF loading may fail with unresolved symbols. That's expected — those
-    // programs need the full Solana runtime (Mollusk/LiteSVM) instead.
-    let loader = Arc::new(BuiltinProgram::<RecorderContext>::new_loader(
-        config.clone(),
-    ));
+    // Loader with the recorder's Solana syscall set registered.  See
+    // [`crate::syscalls`] for the canonical list (sol_log_, sol_panic_,
+    // sol_memcpy_, sol_alloc_free_ etc.).  Without these handlers a
+    // program's first ``CALL_IMM <sol_syscall>`` aborts the VM with
+    // ``EbpfError::UnsupportedInstruction`` -- which is what blocked
+    // the cross-repo WDIO smoke test at run 27546133542: the entrypoint
+    // !() macro calls ``msg!("result: {}", ..)`` which lowers to
+    // ``sol_log_``, the unregistered hash aborted the VM before
+    // ``process_instruction``'s ``let sum_val = a + b;`` line ever
+    // executed, and the smoke test's ``finds sum_val in local
+    // variables`` assertion failed because no PC ever mapped to
+    // ``solana_flow_test.rs:27``.
+    let mut loader = BuiltinProgram::<RecorderContext>::new_loader(config.clone());
+    loader = crate::syscalls::register(loader)
+        .map_err(|e| eyre!("failed to register syscalls: {:?}", e))?;
+    let loader = Arc::new(loader);
 
     // Load and verify the ELF executable.
     let executable = Executable::<RecorderContext>::load(elf_data, loader.clone())
@@ -118,7 +165,12 @@ pub fn execute_with_tracing(elf_data: &[u8], compute_budget: u64) -> Result<Vec<
         MemoryRegion::new_writable(&mut input, ebpf::MM_INPUT_START),
     ];
 
-    let mut context = RecorderContext::new(compute_budget, &config);
+    let mut context = RecorderContext::new(
+        compute_budget,
+        &config,
+        ebpf::MM_HEAP_START,
+        heap_size as u64,
+    );
     context.memory_mapping = MemoryMapping::new(regions, &config, sbpf_version)
         .map_err(|e| eyre!("failed to create memory mapping: {:?}", e))?;
 
