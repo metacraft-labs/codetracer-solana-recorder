@@ -143,6 +143,18 @@ pub fn record_from_traces(
     } else {
         source_path.to_path_buf()
     };
+    // ``cargo-build-sbf`` on CI invokes the compiler with
+    // ``--remap-path-prefix`` so DWARF paths for the user's crate
+    // arrive relative to the crate root (e.g. ``src/solana_flow_test.rs``)
+    // rather than absolute.  The recorder runs from a different cwd at
+    // trace time -- ``SourceModel::load`` then reads from cwd, the file
+    // is missing, the model is empty, and every call site degrades to
+    // the ``fn_at_pc_<pc>`` placeholder.  Resolve the relative path
+    // against the ELF's crate root (the nearest ancestor of the .so
+    // that contains ``Cargo.toml``) so the source model gets populated
+    // and the WDIO smoke test's ``finds process_instruction in the
+    // calltrace`` assertion finds the real function name.
+    let trace_source_path = resolve_source_against_elf_crate(&trace_source_path, source_path);
     eprintln!(
         "Trace source path: {} ({} DWARF source locations)",
         trace_source_path.display(),
@@ -198,6 +210,32 @@ fn is_third_party_source(path: &str) -> bool {
         .file_name()
         .and_then(|n| n.to_str())
         == Some("lib.rs")
+}
+
+/// Resolve a (possibly relative) DWARF source path against the ELF's
+/// Cargo crate root.
+///
+/// ``cargo-build-sbf`` on CI passes ``--remap-path-prefix`` to make DWARF
+/// paths relative to the crate root.  At trace time the recorder may run
+/// from a different cwd than the crate root, so a relative path won't
+/// resolve against ``std::fs::read_to_string``.  Walk upwards from the
+/// ELF until we find an ancestor that contains a ``Cargo.toml``; if the
+/// relative path resolves under that ancestor, return the resolved path.
+/// Otherwise return the input unchanged (preserves the legacy absolute-
+/// path / found-locally behaviour for local builds).
+fn resolve_source_against_elf_crate(dwarf_path: &Path, elf_path: &Path) -> PathBuf {
+    if dwarf_path.is_absolute() || dwarf_path.exists() {
+        return dwarf_path.to_path_buf();
+    }
+    for anc in elf_path.ancestors() {
+        if anc.join("Cargo.toml").exists() {
+            let candidate = anc.join(dwarf_path);
+            if candidate.exists() {
+                return candidate;
+            }
+        }
+    }
+    dwarf_path.to_path_buf()
 }
 
 fn sibling_rs_source(elf_path: &Path) -> Option<PathBuf> {
@@ -2530,5 +2568,53 @@ mod source_path_tests {
         // for this reason -- a relative ``src/solana_flow_test.rs``
         // (post-remap) is still recognisable as the user's source.
         assert!(!is_third_party_source("src/solana_flow_test.rs"));
+    }
+
+    #[test]
+    fn relative_dwarf_path_resolves_against_elf_crate_root() {
+        use super::resolve_source_against_elf_crate;
+        use std::path::{Path, PathBuf};
+
+        // Lay out a synthetic SBF crate:
+        //   <tmp>/test-programs/Cargo.toml
+        //   <tmp>/test-programs/src/solana_flow_test.rs
+        //   <tmp>/test-programs/target/sbpf-solana-solana/release/test_programs.so
+        let tmp = std::env::temp_dir().join(format!(
+            "ct-solana-resolve-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let crate_root = tmp.join("test-programs");
+        let src_dir = crate_root.join("src");
+        let elf_dir = crate_root.join("target/sbpf-solana-solana/release");
+        std::fs::create_dir_all(&src_dir).unwrap();
+        std::fs::create_dir_all(&elf_dir).unwrap();
+        std::fs::write(crate_root.join("Cargo.toml"), "[package]\nname = \"x\"\n").unwrap();
+        std::fs::write(src_dir.join("solana_flow_test.rs"), "fn main() {}\n").unwrap();
+        let elf = elf_dir.join("test_programs.so");
+        std::fs::write(&elf, b"").unwrap();
+
+        let resolved = resolve_source_against_elf_crate(
+            Path::new("src/solana_flow_test.rs"),
+            &elf,
+        );
+        assert_eq!(
+            resolved,
+            crate_root.join("src/solana_flow_test.rs"),
+            "relative DWARF path should resolve against the ELF's Cargo crate root"
+        );
+
+        // Unknown relative paths fall through to the input so the caller's
+        // empty-model fallback still kicks in.
+        let unresolved = resolve_source_against_elf_crate(
+            Path::new("src/does_not_exist.rs"),
+            &elf,
+        );
+        assert_eq!(unresolved, PathBuf::from("src/does_not_exist.rs"));
+
+        std::fs::remove_dir_all(&tmp).ok();
     }
 }
