@@ -2453,3 +2453,39 @@ pub fn record_with_cpi(
 
     Ok(())
 }
+
+#[cfg(test)]
+mod source_path_tests {
+    use super::is_third_party_source;
+
+    #[test]
+    fn cargo_registry_is_third_party() {
+        assert!(is_third_party_source(
+            "/home/user/.cargo/registry/src/index.crates.io-xxx/solana-program-entrypoint-2.3.0/src/lib.rs"
+        ));
+    }
+
+    #[test]
+    fn platform_tools_rust_library_is_third_party() {
+        assert!(is_third_party_source(
+            "/home/runner/work/platform-tools/platform-tools/out/rust/library/core/src/cmp.rs"
+        ));
+    }
+
+    #[test]
+    fn rustlib_src_is_third_party() {
+        // ``/.../rustlib/src/rust/library/...`` is the rustup-installed
+        // sysroot layout; treat it like platform-tools' bundled stdlib
+        // so it never wins source-path selection.
+        assert!(is_third_party_source(
+            "/home/user/.rustup/toolchains/x/lib/rustlib/src/rust/library/core/src/option.rs"
+        ));
+    }
+
+    #[test]
+    fn user_crate_source_is_not_third_party() {
+        assert!(!is_third_party_source(
+            "/home/user/codetracer-solana-recorder/test-programs/src/solana_flow_test.rs"
+        ));
+    }
+}
