@@ -122,10 +122,24 @@ pub fn record_from_traces(
     // ELF as text, hanging the smoke test's ``opens
     // solana_flow_test.rs in the editor`` assertion at the 120s
     // timeout.
-    let trace_source_path: PathBuf = if let Some((_, f, _)) = source_locations.first() {
+    // ``source_locations.first()`` would point at the ``entrypoint!``
+    // macro source (under ``.cargo/registry/.../solana-program-
+    // entrypoint-*/src/lib.rs``) because that's the first PC executed
+    // after the trampoline jumps into the user's program -- this
+    // confused VS Code into opening the third-party crate as the
+    // active editor tab and the smoke test waited forever for
+    // ``solana_flow_test.rs``.  Skip stdlib / cargo-registry paths
+    // and prefer the first DWARF location that lives outside both,
+    // i.e. the user's program source.
+    let trace_source_path: PathBuf = if let Some((_, f, _)) = source_locations
+        .iter()
+        .find(|(_, f, _)| !is_third_party_source(f))
+    {
         PathBuf::from(f)
     } else if let Some(rs) = sibling_rs_source(source_path) {
         rs
+    } else if let Some((_, f, _)) = source_locations.first() {
+        PathBuf::from(f)
     } else {
         source_path.to_path_buf()
     };
@@ -142,6 +156,25 @@ pub fn record_from_traces(
 /// ``.rs`` file under ``src/``.  Returns ``None`` if the layout differs
 /// or more than one candidate is present (ambiguous -- safer to leave
 /// the caller's fallback in place).
+/// Identify a DWARF source path that points at a third-party crate or
+/// the bundled rust standard library rather than the user's own source.
+///
+/// SBF programs link in ``solana-program`` (and its ``entrypoint!``
+/// macro source ``solana-program-entrypoint-*/src/lib.rs``) plus the
+/// platform-tools-pinned ``rust/library/{core,alloc,std}/`` source
+/// tree.  Those paths appear in the DWARF debug_info because the
+/// compiler embeds the original source location of every inlined
+/// helper, but VS Code can't usefully open them as the active editor
+/// tab for the smoke test (they live in ``~/.cargo/registry`` or in
+/// a path that exists only on the platform-tools build machine).
+/// Filter both classes out so the trace's primary source path is the
+/// user's crate.
+fn is_third_party_source(path: &str) -> bool {
+    path.contains(".cargo/registry/")
+        || path.contains("/rust/library/")
+        || path.contains("/rustlib/src/rust/library/")
+}
+
 fn sibling_rs_source(elf_path: &Path) -> Option<PathBuf> {
     let crate_root = elf_path.parent()?.parent()?.parent()?;
     let src_dir = crate_root.join("src");
