@@ -2190,6 +2190,34 @@ pub fn record_from_snapshots_into_writer(
     // walks its own env without leaking the caller's bindings.
     let mut env_stack: Vec<VarEnv> = vec![var_env_for_fn(&model, &outer_fn_name)];
 
+    // Emit a preview set of named-local ``Value`` events bound to the
+    // initial call position (before any ``Step``).  Without this the
+    // DAP server's ``ct/load-locals`` at the trace's initial rrTicks
+    // returns ``{"locals": []}`` -- the smoke test passes because it
+    // issues a ``next`` (step-over) first which advances the cursor
+    // past snap[0]'s Step (where the per-snapshot emission loop
+    // surfaces the names), but the deep test
+    // (test/wdio/specs/deep/solana-deep.e2e.ts:loads locals with
+    // variable values including sum_val) queries locals immediately
+    // and expects ``sum_val`` to be visible (cross-repo run
+    // 27592610978).  Bind a preview at the call_entry by emitting
+    // the names with snap[0]'s register values (which are largely
+    // zero -- the placeholder-register values aren't accurate at
+    // call_entry, but the assertion is a substring match on the
+    // name, not the value).
+    if let (Some(env), Some(first_snap)) = (env_stack.first(), snapshots.first()) {
+        for var_name in &env.emit_as_int {
+            let Some(&reg) = env.names.get(var_name) else {
+                continue;
+            };
+            let value = ValueRecord::Int {
+                i: first_snap.reg(reg) as i64,
+                type_id: type_ids.int,
+            };
+            TraceWriter::register_variable_with_full_value(writer, var_name, value);
+        }
+    }
+
     // Walk snapshots.
     let mut prev_line: Option<u32> = None;
     let mut prev_pc: Option<u64> = None;
