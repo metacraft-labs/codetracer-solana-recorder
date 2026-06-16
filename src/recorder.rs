@@ -2177,6 +2177,37 @@ pub fn record_from_snapshots_into_writer(
             TraceWriter::register_variable_with_full_value(writer, &name, value);
         }
 
+        // Surface each named binding tracked in the active frame's env
+        // (function parameters from ``fn (..)`` plus any ``let NAME =
+        // ..`` declarations seen so far) as an additional named local
+        // alongside the raw ``r0..r10`` registers.  Without this the
+        // DAP server's ``ct/load-locals`` query returns only the
+        // unnamed register expressions and the WDIO smoke test's
+        // ``finds sum_val in local variables`` assertion fails --
+        // observed against cross-repo run 27582656096: execution
+        // ran to completion (1277 register snapshots) and the
+        // source model loaded correctly, but the trace contained no
+        // ``sum_val`` variable name because the synthesiser's
+        // ``let``-binding path only fires for *structured* RHS
+        // (struct/array/tuple/enum) and simple ``let sum_val: u64
+        // = a + b;`` slipped through.
+        //
+        // The value is the register's current snapshot, looked up
+        // via the env's ``name -> register`` map.  ``VarEnv``
+        // records this mapping on each ``let NAME = ...`` line by
+        // assigning the binding to the lowest register r{1..=10}
+        // whose value changed at that step -- the canonical sBPF
+        // convention the workspace's hand-written fixtures rely on.
+        if let Some(env) = env_stack.last() {
+            for (var_name, &reg) in &env.names {
+                let value = ValueRecord::Int {
+                    i: snap.reg(reg) as i64,
+                    type_id: type_ids.int,
+                };
+                TraceWriter::register_variable_with_full_value(writer, var_name, value);
+            }
+        }
+
         prev_pc = Some(pc);
         prev_regs = snap.registers;
     }
