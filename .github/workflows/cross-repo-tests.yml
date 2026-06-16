@@ -173,7 +173,15 @@ jobs:
           cd -
           if [ "$CT_REF" != "main" ]; then
             git -C "$DEST" fetch origin "$CT_REF"
-            git -C "$DEST" checkout "$CT_REF"
+            # Use FETCH_HEAD so the checkout works for both SHAs and
+            # branch names.  ``git checkout <branch>`` would fail with
+            # ``pathspec '<branch>' did not match any file(s) known to
+            # git`` because the initial ``--depth 1`` clone above
+            # doesn't track remote branches; ``FETCH_HEAD`` is the
+            # ref that ``git fetch origin <ref>`` always populates.
+            # The vscode-extension clone block (below) already uses
+            # this pattern -- this brings codetracer into line.
+            git -C "$DEST" checkout FETCH_HEAD
           fi
 
       - name: Clone codetracer-vscode-extension
