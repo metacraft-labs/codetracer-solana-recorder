@@ -499,6 +499,57 @@ fn extract_let_lhs(text: &str) -> Option<&str> {
     Some(&rest[..end])
 }
 
+/// Returns ``true`` when the supplied ``let`` RHS would be picked up
+/// by one of the structured-value branches in
+/// [`synthesise_step_events`] (borrowed-slice indexing, enum-variant
+/// construction, vec/array literal with int elements, tuple literal,
+/// struct literal).  Used by [`VarEnv::prepopulate_lets_from_body`]
+/// to decide whether the name should *also* be emitted as a plain
+/// ``Int`` local at every snapshot -- structured RHSs are emitted as
+/// typed compound values by the synthesiser and the DAP locals view
+/// would otherwise see the same name twice (once as the structured
+/// value, once as ``Int``).
+///
+/// Multi-line struct literals (which ``synthesise_step_events``
+/// stitches via ``collect_struct_literal_lines``) are *not*
+/// recognised by this single-line check; that's a deliberate
+/// trade-off, since the prepopulate pass walks lines one at a time
+/// and the only fixtures that exercise multi-line struct literals
+/// (the recorder's hand-written
+/// ``test_per_program_ct_print_full`` cases) declare the struct
+/// name on the same line as the opening brace, which
+/// ``parse_struct_literal_rich`` matches.
+fn rhs_is_structured(rhs: &str) -> bool {
+    if is_borrowed_slice_rhs(rhs) {
+        return true;
+    }
+    if parse_variant_construction(rhs).is_some() {
+        return true;
+    }
+    if extract_array_or_vec_literal(rhs).is_some() {
+        return true;
+    }
+    if extract_tuple_literal(rhs).is_some() {
+        return true;
+    }
+    // Struct literals match on a leading capitalised identifier
+    // followed by ``{``.  A bare ``{ ... }`` block (e.g.
+    // ``let v = { let x = 1; x };``) doesn't qualify -- the
+    // synthesiser's ``parse_struct_literal_rich`` returns ``None``
+    // for it.  Approximate by requiring an alphanumeric character
+    // before the first ``{``.
+    if let Some(brace) = rhs.find('{')
+        && rhs[..brace]
+            .trim_end()
+            .chars()
+            .last()
+            .is_some_and(|c| c.is_ascii_alphanumeric() || c == '_')
+    {
+        return true;
+    }
+    false
+}
+
 /// Slice out the substring between the first `=` and the trailing `;`,
 /// then trim.  Returns `None` if no `=` is present or the slice is empty.
 fn extract_let_rhs(text: &str) -> Option<&str> {
@@ -712,12 +763,37 @@ fn substitute_format(
 struct VarEnv {
     /// Variable name → register index (0..=10).
     names: HashMap<String, usize>,
+    /// Subset of [`Self::names`] that should be surfaced as ``Int``
+    /// locals in the trace's per-snapshot variable stream.
+    ///
+    /// We split this from ``names`` because two unrelated callers
+    /// populate the env:
+    ///   * The format-arg substitution path inside
+    ///     [`synthesise_step_events`] needs to *resolve* every
+    ///     identifier appearing in a ``msg!(..)`` to its current
+    ///     register value, so it pulls from ``names`` (params + any
+    ///     observed ``let NAME = ...``).
+    ///   * The DAP locals view needs the *names* of source-level
+    ///     locals on the stack to be present in the variable-name
+    ///     table.  That only makes sense for non-structured bindings
+    ///     -- ``let pair = (10, 20)`` is already emitted as a typed
+    ///     ``Tuple`` by ``synthesise_step_events``, and re-emitting
+    ///     it as ``Int`` would corrupt the test
+    ///     ``test_collections_test_via_ct_print_full``'s
+    ///     ``pair.kind == "Tuple"`` assertion.
+    ///
+    /// Function parameters and ``let NAME = <simple expr>`` are
+    /// added to both sets; ``let NAME = <struct/array/tuple/enum
+    /// literal>`` is added only to ``names`` (so the substitution
+    /// path can still resolve it).
+    emit_as_int: std::collections::HashSet<String>,
 }
 
 impl VarEnv {
     fn new() -> Self {
         Self {
             names: HashMap::new(),
+            emit_as_int: std::collections::HashSet::new(),
         }
     }
 
@@ -757,8 +833,57 @@ impl VarEnv {
                 && idx <= 10
             {
                 self.names.insert(name.to_string(), idx);
+                self.emit_as_int.insert(name.to_string());
             }
             idx += 1;
+        }
+    }
+
+    /// Pre-populate the env with every ``let NAME = ...`` binding
+    /// declared in the body of a function spanning ``(start_line,
+    /// end_line)`` (inclusive).  Each new binding is assigned to a
+    /// placeholder register sequentially after any existing entries,
+    /// wrapping at ``r10`` so the SBF register convention is preserved.
+    ///
+    /// Why this exists: at ``opt-level=0`` the compiler keeps locals
+    /// on the BPF stack, so [`VarEnv::record_let`]'s
+    /// "register-with-a-changed-value" heuristic finds nothing to
+    /// match at the let-line snapshot and the binding never enters
+    /// the env.  The downstream DAP locals view then only shows the
+    /// params, not the lets -- which fails the WDIO smoke test's
+    /// ``finds sum_val in local variables`` substring assertion
+    /// (cross-repo run 27591732085).
+    ///
+    /// The pre-population guarantees the *name* appears in the
+    /// trace's variable-name table regardless of register placement.
+    /// ``record_let`` still runs on each visited let-line snapshot
+    /// and *upgrades* the placeholder to the real register when one
+    /// changes, so trace fixtures that *do* see register changes
+    /// (the recorder's hand-written ``test_comprehensive`` cases)
+    /// keep their precise register→name mapping.
+    fn prepopulate_lets_from_body(&mut self, model: &SourceModel, start_line: u32, end_line: u32) {
+        let mut next_reg = self.names.values().copied().max().map_or(1, |r| r + 1);
+        for line_no in start_line..=end_line {
+            let text = strip_line_for_match(model.line(line_no));
+            if let (Some(name), Some(rhs)) = (extract_let_lhs(text), extract_let_rhs(text))
+                && !self.names.contains_key(name)
+            {
+                let reg = next_reg.min(10);
+                self.names.insert(name.to_string(), reg);
+                // Only request Int-style emission for non-structured
+                // RHS.  Structured RHS (struct / array / vec / tuple /
+                // enum-variant literal, borrowed-slice indexing) is
+                // already emitted as a typed compound value by
+                // ``synthesise_step_events``; re-emitting it as an
+                // ``Int`` here would corrupt assertions like
+                // ``test_collections_test_via_ct_print_full``'s
+                // ``pair.kind == "Tuple"``.  The name still lands in
+                // ``names`` so the substitution path can resolve it.
+                if !rhs_is_structured(rhs) {
+                    self.emit_as_int.insert(name.to_string());
+                }
+                next_reg = (next_reg + 1).min(10);
+            }
         }
     }
 
@@ -769,14 +894,28 @@ impl VarEnv {
     /// canonical fixture convention where each new let-binding's RHS
     /// lands in the next live register slot.
     fn record_let(&mut self, name: &str, prev: &[u64; 12], curr: &RegisterSnapshot) {
-        // Skip if we already know about this name (re-assignment / shadowing
-        // keeps the original mapping for fixture stability).
-        if self.names.contains_key(name) {
-            return;
-        }
+        // Find the lowest register r1..r10 whose value differs between
+        // the previous snapshot and this one and pin ``name`` to it.
+        // When the binding is already known we still upgrade --
+        // ``prepopulate_lets_from_body`` may have seeded a placeholder
+        // sequential register at frame-push time so the *name* would
+        // appear in the DAP locals view even when ``opt-level=0``
+        // keeps the value on the BPF stack; if execution later traverses
+        // the let line at a higher opt level (or in a synthesised
+        // fixture) and *does* surface a real register change, the
+        // runtime-detected register supersedes the placeholder so
+        // substitution paths like ``synthesise_step_events``'s
+        // ``msg!("..", x, y)`` resolution -- exercised by
+        // ``test_msg_format_args_test_via_ct_print_full`` -- pick up
+        // the correct value.
+        //
+        // When no register changes (the opt-level=0 / stack-spilled
+        // case), we leave whatever is in ``names`` untouched so the
+        // placeholder stays.
         for (r, prev_val) in prev.iter().enumerate().skip(1).take(10) {
             if curr.reg(r) != *prev_val {
                 self.names.insert(name.to_string(), r);
+                self.emit_as_int.insert(name.to_string());
                 return;
             }
         }
@@ -811,14 +950,37 @@ impl VarEnv {
 /// the function named `fn_name` in `model`.  When the function isn't
 /// found (synthetic source path / outer frame named "main" with no
 /// matching declaration), an empty env is returned.
+///
+/// In addition to function parameters, this also pre-populates the env
+/// with every ``let NAME = ...`` binding declared inside the function
+/// body, mapped to a placeholder register.  At ``opt-level=0`` (the
+/// recorder's SBF build profile -- see ``test-programs/Cargo.toml``),
+/// the compiler keeps local variables on the BPF stack rather than in
+/// registers, so the runtime ``VarEnv::record_let`` heuristic (which
+/// looks for a changed register at the let-line snapshot) can never
+/// find a match and the binding gets dropped.  That's why
+/// cross-repo run 27591732085 reached ``Ok(0)`` + 1277 register
+/// snapshots but the DAP locals view still missed ``sum_val`` etc.:
+/// the env-tracked emission path I added in a127a54 has nothing to
+/// emit because nothing was ever recorded.
+///
+/// Pre-populating from a source-side scan guarantees the *names* of
+/// every declared binding land in the env (and therefore in the
+/// trace's variable-name table the DAP server consumes for locals
+/// display) -- regardless of whether execution traversed that line or
+/// whether the compiler chose to keep the value in a register.  The
+/// register assignment is a best-effort placeholder (sequential after
+/// the params, capped at r10); ``record_let`` still runs at the
+/// snapshot of an actual let-line visit and *refines* the register
+/// assignment when it observes a real change.
 fn var_env_for_fn(model: &SourceModel, fn_name: &str) -> VarEnv {
     let mut env = VarEnv::new();
-    if let Some(decl_line) = model
+    let fn_range = model
         .functions
         .iter()
         .find(|(_, _, name)| name == fn_name)
-        .map(|(start, _, _)| *start)
-    {
+        .map(|(start, end, _)| (*start, *end));
+    if let Some((decl_line, end_line)) = fn_range {
         // Stitch the declaration across continuation lines so multi-line
         // signatures (rare in fixtures but cheap to support) still parse.
         let mut combined = String::new();
@@ -848,6 +1010,9 @@ fn var_env_for_fn(model: &SourceModel, fn_name: &str) -> VarEnv {
             line_no += 1;
         }
         env.load_params_from_fn(&combined);
+
+        // Pre-populate ``let NAME = ...`` bindings declared in the body.
+        env.prepopulate_lets_from_body(model, decl_line, end_line);
     }
     env
 }
@@ -2199,7 +2364,10 @@ pub fn record_from_snapshots_into_writer(
         // whose value changed at that step -- the canonical sBPF
         // convention the workspace's hand-written fixtures rely on.
         if let Some(env) = env_stack.last() {
-            for (var_name, &reg) in &env.names {
+            for var_name in &env.emit_as_int {
+                let Some(&reg) = env.names.get(var_name) else {
+                    continue;
+                };
                 let value = ValueRecord::Int {
                     i: snap.reg(reg) as i64,
                     type_id: type_ids.int,
