@@ -380,3 +380,72 @@ fn test_sbpf_step_events() {
         .collect();
     assert_eq!(step_lines, vec![1i64, 5, 6, 7, 8, 9, 10, 11]);
 }
+
+/// Test 7: With a real source file on disk, the recorder must surface
+/// named source-level locals (``let a = ...``, ``let sum = ..``, etc.)
+/// alongside the raw ``r0..r10`` registers.
+///
+/// Reproduces the cross-repo WDIO smoke failure at run 27582656096:
+/// after the executor's syscall + rodata fixes let the SBF VM run to
+/// completion (1277 register snapshots), the ``finds sum_val in local
+/// variables`` assertion still failed because the recorder's
+/// ``record_from_snapshots_into_writer`` only emitted the raw register
+/// names -- never the bindings tracked in its ``VarEnv``.  The fix
+/// emits each env-tracked binding as a named ``Value`` event at every
+/// snapshot.  This test pins the new behaviour by writing a real source
+/// file at the path the recorder will read and asserting the trace
+/// contains ``a``, ``b``, ``sum``, ``doubled``, ``final_val`` in its
+/// variable-name table.
+#[test]
+fn test_named_source_locals_emitted_when_source_file_exists() {
+    use codetracer_solana_recorder::register_trace::parse_regs_file;
+
+    let tmp = tempfile::TempDir::new().unwrap();
+    let src_path = tmp.path().join("flow.rs");
+    std::fs::write(
+        &src_path,
+        "fn process(_p: u64) -> u64 {\n\
+         \x20    let a: u64 = 10;\n\
+         \x20    let b: u64 = 32;\n\
+         \x20    let sum: u64 = a + b;\n\
+         \x20    let doubled: u64 = sum * 2;\n\
+         \x20    let final_val: u64 = doubled + a;\n\
+         \x20    final_val\n\
+         }\n",
+    )
+    .unwrap();
+
+    // Map the synthetic snapshots to lines that match the new
+    // source file (process body lives on lines 2..7).
+    let snapshots = parse_regs_file(&create_synthetic_regs()).unwrap();
+    let path_str = src_path.to_string_lossy().to_string();
+    let source_locs: Vec<(u64, &str, u32)> = vec![
+        (0, path_str.as_str(), 2),
+        (1, path_str.as_str(), 3),
+        (2, path_str.as_str(), 4),
+        (3, path_str.as_str(), 5),
+        (4, path_str.as_str(), 6),
+        (5, path_str.as_str(), 7),
+        (6, path_str.as_str(), 7),
+    ];
+
+    let out = tempfile::TempDir::new().unwrap();
+    record_from_snapshots(&snapshots, &source_locs, &src_path, out.path()).unwrap();
+
+    let events = read_ct_events(out.path());
+    let var_names: std::collections::HashSet<&str> = events
+        .iter()
+        .filter_map(|e| match e {
+            TraceLowLevelEvent::VariableName(n) => Some(n.as_str()),
+            _ => None,
+        })
+        .collect();
+
+    for expected in ["r0", "r1", "r10", "a", "b", "sum", "doubled", "final_val"] {
+        assert!(
+            var_names.contains(expected),
+            "trace variable-name table missing `{expected}`; got: {:?}",
+            var_names
+        );
+    }
+}
