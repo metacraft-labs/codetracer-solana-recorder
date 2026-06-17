@@ -377,6 +377,18 @@ jobs:
             mkdir -p "$GITHUB_WORKSPACE/wdio-diagnostics"
             cp -r "$EXT_DIAG"/* "$GITHUB_WORKSPACE/wdio-diagnostics/"
           fi
+          # Copy the actual recorded trace fixture next to the
+          # client-side fingerprint so a local vs CI byte-comparison
+          # can pinpoint WHICH bytes diverge (the fingerprint already
+          # captured a 1-byte diff in cross-repo run 27709264564 at
+          # offset 0x10 — local ``92``, CI ``aa`` — with the rest of
+          # the first 64 bytes identical and the total file size also
+          # identical; need the full payload to walk the diff).
+          TRACE_DIR="$GITHUB_WORKSPACE/../codetracer-vscode-extension/test/traces/solana-flow-test"
+          if [ -d "$TRACE_DIR" ]; then
+            mkdir -p "$GITHUB_WORKSPACE/wdio-diagnostics/recorded-trace"
+            cp -r "$TRACE_DIR"/* "$GITHUB_WORKSPACE/wdio-diagnostics/recorded-trace/" 2>/dev/null || true
+          fi
           # Capture every replay-server.log the db-backend wrote during
           # this CI run.  ``run_dir_for`` (codetracer/src/db-backend/src/
           # paths.rs) places them under ``$XDG_RUNTIME_DIR/codetracer/
