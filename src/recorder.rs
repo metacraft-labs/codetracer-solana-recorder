@@ -238,6 +238,64 @@ fn resolve_source_against_elf_crate(dwarf_path: &Path, elf_path: &Path) -> PathB
     dwarf_path.to_path_buf()
 }
 
+/// Decide whether the DWARF source path ``file_str`` for a snapshot
+/// is third-party from the user's perspective.
+///
+/// The basename-only ``is_third_party_source`` heuristic
+/// (``lib.rs`` plus ``.cargo/registry/`` / ``/rust/library/`` path
+/// fragments) only catches the most common cases: ``solana-program-
+/// entrypoint``'s ``src/lib.rs`` wrapper.  sBPF programs link in
+/// many more third-party stdlib files whose ``--remap-path-prefix``
+/// projection is indistinguishable from a user-crate source
+/// (``src/hazmat.rs`` from ``curve25519-dalek``'s ``subtle`` ops,
+/// ``src/syscalls.rs`` from ``solana-program``'s syscall shims,
+/// etc.).  Stepping over to those in the WDIO ``performs multiple
+/// step-over operations and changes line`` deep test wedges VS
+/// Code's editor cursor (the third-party file is not on disk so
+/// ``editor.selection.active.line`` doesn't advance, the
+/// ``uniqueLines.size > 1`` assertion sees the same line on every
+/// iteration -- cross-repo run 27657183885).
+///
+/// Filter strategy: when ``user_crate_root`` is known (production:
+/// the nearest ancestor of ``source_path`` carrying a
+/// ``Cargo.toml``), check whether ``file_str`` resolves to an
+/// existing file under that root.  Any path that does NOT resolve
+/// is third-party (it came from a sibling crate's source tree the
+/// linker pulled in via DWARF).  When ``user_crate_root`` is
+/// ``None`` (synthetic-fixture tests pass a relative
+/// ``source_path`` with no real filesystem layout to consult), only
+/// fall back to ``is_third_party_source`` -- and even there, the
+/// ``same_logical_source`` guard keeps snapshots whose
+/// ``file_str`` matches the trace anchor (so a test that uses
+/// ``"lib.rs"`` as both ``source_path`` and the snapshot file
+/// stays visible).
+fn is_third_party_for_user(
+    source_path_str: &str,
+    file_str: &str,
+    user_crate_root: Option<&Path>,
+) -> bool {
+    // Anchor match wins everywhere: a snapshot whose file matches
+    // the trace's ``source_path`` (exact, suffix, or basename --
+    // see ``same_logical_source``) is the user's source by
+    // construction, even if ``--remap-path-prefix`` projected it
+    // to a bare basename ``cargo-build-sbf`` couldn't resolve
+    // against the crate root (e.g. the test program lives in
+    // ``test-programs/solana/<name>.rs`` but DWARF stores
+    // ``<name>.rs`` and ``user_crate_root`` is ``test-programs/``
+    // so ``crate_root.join("<name>.rs")`` doesn't exist).
+    if same_logical_source(source_path_str, file_str) {
+        return false;
+    }
+    if let Some(crate_root) = user_crate_root {
+        let candidate = Path::new(file_str);
+        if candidate.is_absolute() {
+            return !candidate.exists();
+        }
+        return !crate_root.join(candidate).exists();
+    }
+    is_third_party_source(file_str)
+}
+
 /// Returns ``true`` if ``candidate`` could plausibly refer to the
 /// same logical source file as ``anchor``.
 ///
@@ -2291,6 +2349,27 @@ pub fn record_from_snapshots_into_writer(
     // ``process_instruction`` scope spans every user-source step
     // from start to finish so its locals stay visible throughout.
     let source_path_str = source_path.to_string_lossy().to_string();
+    // Resolve the user's crate root once per recording: the nearest
+    // ancestor of ``source_path`` that contains a ``Cargo.toml``.
+    // Used below to decide whether a snapshot's relative DWARF path
+    // (cargo-build-sbf applies ``--remap-path-prefix`` so every
+    // source path arrives as a relative ``src/<basename>.rs``)
+    // names a file that lives in the user's crate or in one of the
+    // bundled solana-program / curve25519-dalek / std dependencies
+    // (``src/lib.rs`` from solana-program-entrypoint, ``src/hazmat.rs``
+    // from subtle, ``src/syscalls.rs``, etc.).  ``None`` when
+    // ``source_path`` is relative (synthetic-fixture tests) or
+    // ``source_path``'s tree has no ancestor Cargo.toml -- the
+    // third-party check below short-circuits to "keep" in those
+    // cases so existing test_comprehensive scenarios stay green.
+    let user_crate_root: Option<PathBuf> = if source_path.is_absolute() {
+        source_path
+            .ancestors()
+            .find(|anc| anc.join("Cargo.toml").exists())
+            .map(Path::to_path_buf)
+    } else {
+        None
+    };
     let mut prev_line: Option<u32> = None;
     let mut prev_pc: Option<u64> = None;
     let mut prev_regs: [u64; 12] = [0u64; 12];
@@ -2315,16 +2394,7 @@ pub fn record_from_snapshots_into_writer(
         // prev_regs so the next user-source landing sees a
         // continuous register flow, but emit no Step / Value / Call
         // events for them.  See the loop preamble for rationale.
-        //
-        // Synthetic-fixture tests that use a bare basename like
-        // ``"lib.rs"`` for both the trace anchor and the snapshot
-        // source paths trigger ``is_third_party_source`` (the
-        // basename heuristic for sBPF programs whose user crate
-        // root is renamed away from cargo's default ``lib.rs``).
-        // The extra ``same_logical_source`` guard keeps those
-        // snapshots visible: a path that matches the trace's
-        // anchor is the user's source by construction.
-        if is_third_party_source(file_str) && !same_logical_source(&source_path_str, file_str) {
+        if is_third_party_for_user(&source_path_str, file_str, user_crate_root.as_deref()) {
             prev_pc = Some(pc);
             prev_regs = snap.registers;
             continue;
