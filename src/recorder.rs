@@ -38,6 +38,7 @@
 //! degrade to empty and the recorder behaves exactly as before.
 
 use std::collections::HashMap;
+use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 
 use codetracer_trace_types::{EventLogKind, Line, NONE_VALUE, TypeId, TypeKind, ValueRecord};
@@ -49,6 +50,44 @@ use crate::cpi::{CpiDetector, CpiEvent};
 use crate::dwarf::DwarfParser;
 use crate::multi_program::ProgramRegistry;
 use crate::register_trace::{RegisterSnapshot, parse_regs_file};
+
+/// Read per-line byte counts for `path` and return them as a flat `Vec<u32>`
+/// where entry `i` is the addressable column count of source line `i+1`
+/// (1-based numbering matching the `paths.dat` Layout A contract — see
+/// `codetracer-trace-format-spec/trace-events.md` §"paths.dat per-line
+/// offset table — Layout A").
+///
+/// Synthetic-only test paths (e.g. `<stdin>`) and missing/unreadable files
+/// degrade to an empty `Vec`; the writer treats `register_path_with_line_lengths`
+/// with an empty slice as "no per-line data", so the column resolution at
+/// read time falls back to surfacing `None`, matching the back-compat-safe
+/// default codified in P6.5.
+///
+/// Ported from the Python recorder's
+/// `runtime/output_paths.rs::read_line_lengths_for_path`.
+pub(crate) fn read_line_lengths_for_path(path: &Path) -> Vec<u32> {
+    let lossy = path.to_string_lossy();
+    if lossy.starts_with('<') && lossy.ends_with('>') {
+        return Vec::new();
+    }
+    let Ok(bytes) = std::fs::read(path) else {
+        return Vec::new();
+    };
+    let mut lines: Vec<u32> = Vec::new();
+    let mut current_len: u32 = 0;
+    for byte in &bytes {
+        if *byte == b'\n' {
+            lines.push(current_len);
+            current_len = 0;
+        } else {
+            current_len = current_len.saturating_add(1);
+        }
+    }
+    if current_len > 0 || bytes.last() != Some(&b'\n') {
+        lines.push(current_len);
+    }
+    lines
+}
 
 // The recorder is CTFS-only per `Recorder-CLI-Conventions.md` §4 (see
 // `codetracer-specs`).  We pin every `create_trace_writer` call site to
@@ -81,19 +120,23 @@ pub fn record_from_traces(
     // 2. Parse DWARF from ELF.
     let dwarf = DwarfParser::new(elf_data)?;
 
-    // 3. Build source locations from DWARF.
-    let source_locations: Vec<(u64, String, u32)> = snapshots
+    // 3. Build source locations from DWARF — carry the column when DWARF
+    //    populated it so column-aware replay navigation has byte-accurate
+    //    landing points.  DWARF emitters that only produce line-only
+    //    entries (e.g. `-g1` builds) leave `column == None` and the
+    //    writer falls back to the column-less step path.
+    let source_locations: Vec<(u64, String, u32, Option<u32>)> = snapshots
         .iter()
         .filter_map(|snap| {
             let loc = dwarf.find_location(snap.pc())?;
-            Some((snap.pc(), loc.file, loc.line))
+            Some((snap.pc(), loc.file, loc.line, loc.column))
         })
         .collect();
 
     // Convert to borrowed form for the shared implementation.
-    let source_locs_ref: Vec<(u64, &str, u32)> = source_locations
+    let source_locs_ref: Vec<(u64, &str, u32, Option<u32>)> = source_locations
         .iter()
-        .map(|(pc, f, l)| (*pc, f.as_str(), *l))
+        .map(|(pc, f, l, c)| (*pc, f.as_str(), *l, *c))
         .collect();
 
     // Derive the trace's "source file" from DWARF: the file that contains
@@ -131,14 +174,14 @@ pub fn record_from_traces(
     // ``solana_flow_test.rs``.  Skip stdlib / cargo-registry paths
     // and prefer the first DWARF location that lives outside both,
     // i.e. the user's program source.
-    let trace_source_path: PathBuf = if let Some((_, f, _)) = source_locations
+    let trace_source_path: PathBuf = if let Some((_, f, _, _)) = source_locations
         .iter()
-        .find(|(_, f, _)| !is_third_party_source(f))
+        .find(|(_, f, _, _)| !is_third_party_source(f))
     {
         PathBuf::from(f)
     } else if let Some(rs) = sibling_rs_source(source_path) {
         rs
-    } else if let Some((_, f, _)) = source_locations.first() {
+    } else if let Some((_, f, _, _)) = source_locations.first() {
         PathBuf::from(f)
     } else {
         source_path.to_path_buf()
@@ -161,7 +204,7 @@ pub fn record_from_traces(
         source_locations.len(),
     );
 
-    record_from_snapshots(&snapshots, &source_locs_ref, &trace_source_path, out_dir)
+    record_from_snapshots_with_columns(&snapshots, &source_locs_ref, &trace_source_path, out_dir)
 }
 
 /// Look for a sibling ``.rs`` source file next to the given ELF path.
@@ -415,6 +458,37 @@ fn sibling_rs_source(elf_path: &Path) -> Option<PathBuf> {
 pub fn record_from_snapshots(
     snapshots: &[RegisterSnapshot],
     source_locations: &[(u64, &str, u32)],
+    source_path: &Path,
+    out_dir: &Path,
+) -> Result<()> {
+    // Promote line-only locations to the column-aware tuple shape with
+    // `column == None`.  The downstream writer routes those through the
+    // column-less `register_step_with_column` path, so back-compat for
+    // every existing call site (tests + the cargo-build-sbf-less
+    // fixtures) is preserved byte-for-byte.
+    let locs: Vec<(u64, &str, u32, Option<u32>)> = source_locations
+        .iter()
+        .map(|(pc, f, l)| (*pc, *f, *l, None))
+        .collect();
+    record_from_snapshots_with_columns(snapshots, &locs, source_path, out_dir)
+}
+
+/// Column-aware variant of [`record_from_snapshots`].
+///
+/// `source_locations` carries a `(pc, file, line, column)` tuple per
+/// snapshot PC.  When `column == Some(c)` the recorder emits a column-
+/// aware step (`register_step_with_column`, P6.3 wire encoding); when
+/// `column == None` the writer falls back to the column-less path so
+/// DWARF debug info that only carries line numbers still records steps.
+///
+/// This is the entry point the DWARF-fed `record_from_traces` pipeline
+/// uses, plus the column-aware integration test fixture.  The non-
+/// column-aware path delegates here with `column = None` for every row,
+/// preserving the legacy meta.dat shape (bit 4 clear) for existing
+/// fixtures that did not assert column ordering.
+pub fn record_from_snapshots_with_columns(
+    snapshots: &[RegisterSnapshot],
+    source_locations: &[(u64, &str, u32, Option<u32>)],
     source_path: &Path,
     out_dir: &Path,
 ) -> Result<()> {
@@ -2239,15 +2313,62 @@ impl TypeIdCache {
 /// Useful for tests with NonStreamingTraceWriter.
 pub fn record_from_snapshots_into_writer(
     snapshots: &[RegisterSnapshot],
-    source_locations: &[(u64, &str, u32)],
+    source_locations: &[(u64, &str, u32, Option<u32>)],
     source_path: &Path,
     writer: &mut dyn TraceWriter,
 ) -> Result<()> {
-    // Build a PC -> (file, line) lookup.
-    let pc_to_loc: std::collections::HashMap<u64, (&str, u32)> = source_locations
+    // Build a PC -> (file, line, column) lookup.
+    let pc_to_loc: std::collections::HashMap<u64, (&str, u32, Option<u32>)> = source_locations
         .iter()
-        .map(|(pc, file, line)| (*pc, (*file, *line)))
+        .map(|(pc, file, line, column)| (*pc, (*file, *line, *column)))
         .collect();
+
+    // Opt the writer into column-aware step encoding so the trace's
+    // `meta.dat` carries `FlagHasColumnAwareSteps` (bit 4) and the
+    // emitter is permitted to layer `DeltaColumn` events on each step.
+    // Must be called before the first `register_step_with_column`.  When
+    // every source location has `column == None` (e.g. fixtures that pass
+    // only line info) the writer still surfaces the flag, but emits zero
+    // `DeltaColumn` events — column-aware readers handle that cleanly,
+    // and the existing per-program ct-print test asserts exact step
+    // counts so any spurious DeltaColumn would fail loudly.
+    writer.enable_column_aware_steps();
+
+    // Per source path emitted by this trace, register the path together
+    // with its per-line byte counts so the `paths.dat` Layout A column-
+    // resolution at read time can decode columns from the running
+    // `global_position_index`.  We dedupe (some traces step through
+    // tens of thousands of snapshots that share at most a handful of
+    // source files) and skip synthetic / unreadable paths via the same
+    // gating the Python recorder uses.
+    {
+        let mut registered: HashSet<String> = HashSet::new();
+        // The primary source path always belongs in the table even when
+        // no snapshot's PC happens to land on it — keeps the metadata
+        // coherent for the column-aware reader.
+        let line_lengths = read_line_lengths_for_path(source_path);
+        let _ = writer.register_path_with_line_lengths(source_path, &line_lengths);
+        registered.insert(source_path.to_string_lossy().into_owned());
+        for (_, file_str, _, _) in source_locations {
+            if registered.insert(file_str.to_string()) {
+                let path = Path::new(file_str);
+                // When `file_str` is a bare filename or otherwise
+                // unreadable from cwd (the legacy fixtures pass bare
+                // basenames like `"control_flow_test.rs"`), fall back
+                // to resolving relative to the primary source path's
+                // directory so we still pick up the on-disk line
+                // lengths for column-aware decoding.
+                let lengths = match read_line_lengths_for_path(path) {
+                    v if !v.is_empty() => v,
+                    _ => source_path
+                        .parent()
+                        .map(|p| read_line_lengths_for_path(&p.join(file_str)))
+                        .unwrap_or_default(),
+                };
+                let _ = writer.register_path_with_line_lengths(path, &lengths);
+            }
+        }
+    }
 
     // Load and analyse the fixture source so we can resolve nested call
     // frames to real function names and synthesise the spec-mandated
@@ -2308,7 +2429,7 @@ pub fn record_from_snapshots_into_writer(
         .iter()
         .find_map(|snap| {
             let pc = snap.pc();
-            let &(_file, line) = pc_to_loc.get(&pc)?;
+            let &(_file, line, _column) = pc_to_loc.get(&pc)?;
             model.function_at(line).map(str::to_string)
         })
         .unwrap_or_else(|| "main".to_string());
@@ -2421,6 +2542,13 @@ pub fn record_from_snapshots_into_writer(
         None
     };
     let mut prev_line: Option<u32> = None;
+    // Track the previously emitted column on the same line so we can
+    // fire a fresh column-aware step when the next snapshot lands on a
+    // different column of the same line (the column-aware navigation
+    // contract from `codetracer-trace-format-spec/trace-events.md`
+    // §"Column Encoding").  Outside column-aware mode this stays at
+    // `None` and the legacy line-only dedupe applies.
+    let mut prev_column: Option<u32> = None;
     let mut prev_pc: Option<u64> = None;
     let mut prev_regs: [u64; 12] = [0u64; 12];
 
@@ -2435,8 +2563,8 @@ pub fn record_from_snapshots_into_writer(
         let pc = snap.pc();
 
         // Look up source location for this PC.
-        let (file_str, line) = match pc_to_loc.get(&pc) {
-            Some(&(f, l)) => (f, l),
+        let (file_str, line, column) = match pc_to_loc.get(&pc) {
+            Some(&(f, l, c)) => (f, l, c),
             None => continue, // No source mapping; skip.
         };
 
@@ -2545,30 +2673,27 @@ pub fn record_from_snapshots_into_writer(
                 }
             }
         }
-        // Emit step when line changes.
-        if prev_line != Some(line) {
+        // Emit step on a fresh (line, column) — line changes always
+        // fire, and same-line column changes fire too so column-aware
+        // navigation can land on each statement of a multi-statement
+        // line.
+        let line_changed = prev_line != Some(line);
+        let column_changed = column.is_some() && prev_column != column;
+        if line_changed || column_changed {
             // Normalise the step's path so it matches the trace
             // anchor (``source_path``).  ``cargo-build-sbf`` applies
             // ``--remap-path-prefix`` to user-crate source paths so
-            // DWARF gives us bare basenames or short relative paths
-            // like ``src/solana_flow_test.rs`` -- but ``TraceWriter::
-            // start`` and the call_entry ``Step`` use the resolved
-            // absolute ``source_path``.  When the two disagree
-            // (anchor absolute, snapshot relative) VS Code opens the
-            // absolute path as the editor tab but can't reconcile
-            // the relative path the DAP server later emits in
-            // ``stopped`` events -- ``editor.selection.active.line``
-            // never advances past the anchor's line 1, and the WDIO
-            // ``performs multiple step-over operations and changes
-            // line`` deep test sees ``uniqueLines.size == 1``
-            // (cross-repo run 27658362322 with sha b626ce3 — 10/11
-            // deep tests passing, this one still wedged).  Resolve
-            // every user-source step's path back to the same
-            // anchor-relative absolute form so VS Code can keep the
-            // cursor in the open editor.
+            // DWARF gives us bare basenames or short relative paths;
+            // canonicalising here keeps every emitted Step on the
+            // same path string as the trace anchor.
             let step_path =
                 canonical_step_path(file_str, &source_path_str, user_crate_root.as_deref());
-            TraceWriter::register_step(writer, &step_path, Line(line as i64));
+            TraceWriter::register_step_with_column(
+                writer,
+                &step_path,
+                Line(line as i64),
+                column.map(|c| Line(c as i64)),
+            );
 
             // Update the active frame's variable→register env from any
             // `let NAME = ...` binding visible on this step before
@@ -2590,6 +2715,7 @@ pub fn record_from_snapshots_into_writer(
             synthesise_step_events(&model, writer, line, &mut type_ids, &active_env, snap);
 
             prev_line = Some(line);
+            prev_column = column;
         }
 
         // Emit register values as variables (r0 through r10).
@@ -2697,6 +2823,14 @@ pub fn record_with_cpi(
     TraceWriter::begin_writing_trace_events(&mut *writer, &events_path)
         .map_err(|e| eyre!("{e}"))?;
 
+    // Opt the writer into column-aware step encoding.  Mirrors the
+    // non-CPI path: when DWARF carries column info the recorder layers
+    // `DeltaColumn` events on each step; otherwise the writer falls
+    // back to the column-less path.  Either way `meta.dat` bit 4
+    // (`FlagHasColumnAwareSteps`) is set, which is the contract
+    // column-aware readers rely on.
+    TraceWriter::enable_column_aware_steps(&mut *writer);
+
     // Load the primary program's source so we can resolve nested call
     // frames to their real `fn name(...)` declarations and synthesise
     // the spec-mandated syscall / typed-value events the SBF
@@ -2705,6 +2839,25 @@ pub fn record_with_cpi(
     // tests pass synthetic `primary.rs` strings) degrade to an empty
     // model and we fall back to the registry-derived names.
     let model = SourceModel::load(source_path);
+
+    // Register the primary source path with its per-line byte counts
+    // BEFORE `TraceWriter::start` — `start` interns the path
+    // implicitly (with no line-length data), so a late call to
+    // `register_path_with_line_lengths` would create a stale paths.dat
+    // entry without per-line byte counts and the column-aware reader
+    // would silently fall back to the legacy DefaultLinesPerFile GLI.
+    // Per-CPI program source files are registered lazily inside the
+    // snapshot loop as they appear via `registry.find_location_with_column`.
+    {
+        let line_lengths = read_line_lengths_for_path(source_path);
+        let _ = TraceWriter::register_path_with_line_lengths(
+            &mut *writer,
+            source_path,
+            &line_lengths,
+        );
+    }
+    let mut registered_paths: HashSet<String> = HashSet::new();
+    registered_paths.insert(source_path.to_string_lossy().into_owned());
 
     // Start the trace.
     TraceWriter::start(&mut *writer, source_path, Line(1));
@@ -2772,6 +2925,9 @@ pub fn record_with_cpi(
 
     // Walk snapshots with CPI detection.
     let mut prev_line: Option<u32> = None;
+    // Mirrors the non-CPI path: track the previously emitted column so
+    // multi-statement lines surface distinct column-aware steps.
+    let mut prev_column: Option<u32> = None;
     let mut prev_pc: Option<u64> = None;
     let mut prev_regs: [u64; 12] = [0u64; 12];
 
@@ -2831,6 +2987,7 @@ pub fn record_with_cpi(
                 fn_stack.push(callee_name);
                 // Reset line tracking for the new program context.
                 prev_line = None;
+                prev_column = None;
             }
             CpiEvent::CpiReturn { return_pc: _ } => {
                 TraceWriter::register_return(&mut *writer, NONE_VALUE);
@@ -2842,6 +2999,7 @@ pub fn record_with_cpi(
                 }
                 // Reset line tracking for the returned-to context.
                 prev_line = None;
+                prev_column = None;
             }
             CpiEvent::SameProgram => {
                 // Within the same program, detect cross-fn jumps using
@@ -2907,19 +3065,51 @@ pub fn record_with_cpi(
             }
         }
 
-        // Look up source location for this PC.
-        let (file_str, line) = match registry.find_location(pc) {
-            Some((f, l)) => (f, l),
+        // Look up source location for this PC, including DWARF column
+        // when available — `find_location_with_column` returns `None`
+        // for the column on synthetic-program entries.
+        let (file_str, line, column) = match registry.find_location_with_column(pc) {
+            Some((f, l, c)) => (f, l, c),
             None => {
                 // No source mapping; emit opcode-based line number.
                 let program_name_str = cpi_detector.current_program();
-                (format!("{program_name_str}.sbf"), pc as u32)
+                (format!("{program_name_str}.sbf"), pc as u32, None)
             }
         };
 
-        // Emit step when line changes.
-        if prev_line != Some(line) {
-            TraceWriter::register_step(&mut *writer, &Path::new(&file_str), Line(line as i64));
+        // Lazily register this source path with the writer so the
+        // column-aware reader can resolve `DeltaColumn` events on every
+        // file referenced by the trace.  Synthetic / unreadable files
+        // degrade to an empty `line_lengths`, which the writer accepts.
+        if registered_paths.insert(file_str.clone()) {
+            let path = Path::new(&file_str);
+            // Bare basenames fall back to resolving against the
+            // primary source path's directory; mirrors the non-CPI
+            // path's resolver so column-aware decoding works on the
+            // existing CPI fixtures that pass relative file names.
+            let lengths = match read_line_lengths_for_path(path) {
+                v if !v.is_empty() => v,
+                _ => source_path
+                    .parent()
+                    .map(|p| read_line_lengths_for_path(&p.join(&file_str)))
+                    .unwrap_or_default(),
+            };
+            let _ = TraceWriter::register_path_with_line_lengths(&mut *writer, path, &lengths);
+        }
+
+        // Emit step on a fresh (line, column) — same contract as the
+        // non-CPI path.  Line changes always fire; same-line column
+        // changes fire too so multi-statement lines surface distinct
+        // column-aware steps.
+        let line_changed = prev_line != Some(line);
+        let column_changed = column.is_some() && prev_column != column;
+        if line_changed || column_changed {
+            TraceWriter::register_step_with_column(
+                &mut *writer,
+                &Path::new(&file_str),
+                Line(line as i64),
+                column.map(|c| Line(c as i64)),
+            );
 
             // Update the active frame's variable→register env from any
             // `let NAME = ...` binding visible on this step before
@@ -2935,6 +3125,7 @@ pub fn record_with_cpi(
             synthesise_step_events(&model, &mut *writer, line, &mut type_ids, &active_env, snap);
 
             prev_line = Some(line);
+            prev_column = column;
         }
 
         // Emit register values as variables (r0 through r10).
