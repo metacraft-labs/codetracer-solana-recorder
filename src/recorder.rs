@@ -241,11 +241,14 @@ fn resolve_source_against_elf_crate(dwarf_path: &Path, elf_path: &Path) -> PathB
 /// Returns ``true`` if ``candidate`` could plausibly refer to the
 /// same logical source file as ``anchor``.
 ///
-/// Used by ``record_from_snapshots_into_writer`` to decide whether a
-/// snapshot's DWARF source path (which may be relative, a bare
-/// basename, or absolute) names the same file as the trace's
-/// ``source_path`` anchor (always absolute).  The comparison treats
-/// any of:
+/// Used so synthetic-fixture tests that pass bare basenames
+/// (``"lib.rs"``) as both the trace anchor and the per-snapshot
+/// source path aren't accidentally classified as third-party --
+/// ``is_third_party_source("lib.rs")`` is ``true`` (the macro-
+/// inline heuristic for sBPF programs whose user crate root is
+/// renamed away from the cargo default), so we need a way to say
+/// "this looks third-party but it's actually the trace anchor".
+/// The comparison treats any of:
 ///   * exact equality,
 ///   * ``anchor`` ending in ``"/" + candidate`` (relative or basename
 ///     hanging off the anchor's directory tree),
@@ -2252,36 +2255,44 @@ pub fn record_from_snapshots_into_writer(
 
     // Walk snapshots.
     //
-    // ``prev_line`` / ``prev_pc`` / ``prev_file`` stay ``None`` at
-    // the start of the walk so the "did the line change?" check
-    // below emits a ``Step`` for the FIRST mapped snapshot even when
-    // its source line happens to match the trace's anchor line
-    // (set by ``TraceWriter::start(source_path, Line(1))`` above --
-    // the synthetic fixtures in ``test_comprehensive.rs`` rely on
-    // this: snapshot 0 at ``line=1`` must emit its own Step on top
-    // of the implicit anchor Step).
+    // Snapshots whose DWARF source path is third-party
+    // (``is_third_party_source``) are entirely silent in the trace:
+    // no ``Step``, no ``Value`` events, no call-boundary push/pop.
+    // The recorder still advances ``prev_pc`` / ``prev_regs`` across
+    // them so the per-snapshot register flow that feeds
+    // ``synthesise_step_events`` and ``VarEnv::record_let`` at the
+    // next user-source landing remains continuous.
     //
-    // ``source_path_str`` holds the trace's anchor file path so the
-    // call-boundary detection below can recognise a transition from
-    // the anchor into a third-party file even at the FIRST mapped
-    // snapshot (where ``prev_file`` is still ``None``).  Without
-    // this seed signal, SBF programs that inline-expand a macro
-    // (e.g. ``entrypoint!(process_instruction)`` -> ``src/lib.rs``)
-    // flow sequentially across the file boundary, no push fires,
-    // and the third-party landing step ends up at the same
-    // ``DbStep.depth`` as the trace's anchor in user source.  DAP
-    // ``next`` (step-over) then surfaces those third-party steps as
-    // user-visible destinations, VS Code can't open the (non-
-    // existent on disk) third-party file, the editor cursor stays
-    // put, and the WDIO ``performs multiple step-over operations
-    // and changes line`` assertion sees the same
-    // ``editor.selection.active.line`` on every iteration
-    // (reproduced against cross-repo run 27626199922 + the local
-    // Solana fixture trace).
+    // Why this beats the alternatives: SBF programs reach the
+    // user's ``process_instruction`` through the
+    // ``entrypoint!(process_instruction)`` macro which inline-
+    // expands into ``solana-program-entrypoint``'s ``src/lib.rs``
+    // (the trampoline that deserialises ``InstructionData`` and
+    // calls into the user fn).  Those wrapper steps live in a
+    // third-party file the user has no source on disk for, so DAP
+    // ``next`` (step-over) at depth=0 would otherwise surface them
+    // as user-visible destinations, VS Code couldn't open the file,
+    // the editor cursor would stay put, and the WDIO ``performs
+    // multiple step-over operations and changes line`` assertion
+    // would see the same ``editor.selection.active.line`` every
+    // iteration (cross-repo run 27626199922 / solana-deep.e2e.ts).
+    //
+    // Pushing a call frame at the macro-into-stdlib transition was
+    // tried first (move the wrapper steps to ``depth=1`` so step-
+    // over skips them) but the frame push reattaches the trace's
+    // very first ``Step`` -- which carries ``sum_val`` and the
+    // other ``process_instruction`` locals registered by the
+    // preview loop above -- to the inner ``fn_at_pc_<pc>`` frame's
+    // empty env, and the WDIO ``finds sum_val in local variables``
+    // smoke assertion fails (cross-repo run 27640716644 second
+    // attempt).  Silently dropping third-party snapshots avoids
+    // both pitfalls: the trace contains only user-source steps so
+    // step-over advances through real lines, and the
+    // ``process_instruction`` scope spans every user-source step
+    // from start to finish so its locals stay visible throughout.
     let source_path_str = source_path.to_string_lossy().to_string();
     let mut prev_line: Option<u32> = None;
     let mut prev_pc: Option<u64> = None;
-    let mut prev_file: Option<String> = None;
     let mut prev_regs: [u64; 12] = [0u64; 12];
 
     // Track the most recently synthesised `Err`-shaped return value so
@@ -2300,6 +2311,25 @@ pub fn record_from_snapshots_into_writer(
             None => continue, // No source mapping; skip.
         };
 
+        // Silently absorb third-party snapshots: advance prev_pc /
+        // prev_regs so the next user-source landing sees a
+        // continuous register flow, but emit no Step / Value / Call
+        // events for them.  See the loop preamble for rationale.
+        //
+        // Synthetic-fixture tests that use a bare basename like
+        // ``"lib.rs"`` for both the trace anchor and the snapshot
+        // source paths trigger ``is_third_party_source`` (the
+        // basename heuristic for sBPF programs whose user crate
+        // root is renamed away from cargo's default ``lib.rs``).
+        // The extra ``same_logical_source`` guard keeps those
+        // snapshots visible: a path that matches the trace's
+        // anchor is the user's source by construction.
+        if is_third_party_source(file_str) && !same_logical_source(&source_path_str, file_str) {
+            prev_pc = Some(pc);
+            prev_regs = snap.registers;
+            continue;
+        }
+
         // Detect function call/return from large PC jumps.  When the
         // source model resolves a function name for both the previous
         // and current line, we use its function-boundary view to
@@ -2309,134 +2339,86 @@ pub fn record_from_snapshots_into_writer(
         // passing synthetic source paths with no real source file), we
         // fall back to the legacy "any forward/backward jump > 2"
         // heuristic so existing test_comprehensive scenarios stay green.
-        // Call-boundary detection.  Runs whenever we have either a
-        // previous PC (legacy PC-delta heuristic) or a previous file
-        // (file-change heuristic); the file-change branch lets the
-        // FIRST mapped snapshot detect a transition between the
-        // trace's anchor (``source_path``) and a third-party
-        // landing.
-        let pc_diff_opt = prev_pc.map(|prev| if pc > prev { pc - prev } else { prev - pc });
-        // ``prev_file`` is ``None`` at the first mapped snapshot.  In
-        // that case compare against the trace's anchor file
-        // (``source_path``) so the entry into a third-party file
-        // still triggers ``file_changed``.  Use a basename + suffix
-        // match because ``source_path`` is typically an absolute
-        // path (e.g. ``/.../test-programs/foo.rs``) while DWARF /
-        // synthetic-fixture snapshots may pass a bare basename (e.g.
-        // ``foo.rs``) or a relative path (e.g. ``src/foo.rs``).
-        // Treat those as referring to the same logical file --
-        // otherwise the per-program ct-print fixtures in
-        // ``test_per_program_ct_print_full.rs`` (which set
-        // ``source_path`` to an absolute ``test-programs/<name>.rs``
-        // and pass bare basenames in their synthetic
-        // ``source_locations``) spuriously push a third-party frame
-        // at the FIRST snapshot.
-        let file_changed = prev_file
-            .as_deref()
-            .map(|p| p != file_str)
-            .unwrap_or_else(|| !same_logical_source(&source_path_str, file_str));
-        let pc_delta_trigger = pc_diff_opt.is_some_and(|d| d > 2);
-        if pc_delta_trigger || file_changed {
-            let prev_fn = prev_line.and_then(|l| model.function_at(l));
-            let curr_fn = model.function_at(line);
-            let cross_boundary = match (prev_fn, curr_fn) {
-                (Some(a), Some(b)) => a != b,
-                _ => true, // unknown side → preserve legacy heuristic
-            };
-            if cross_boundary {
-                // Decide push vs. pop.  For PC-delta triggers we
-                // use the legacy ``pc > prev`` direction; for
-                // file-only triggers (or when ``prev_pc`` is
-                // ``None``, i.e. the very first mapped snapshot) we
-                // use the source-model signal: a known→unknown
-                // transition is "entering a callee" (push), an
-                // unknown→known transition is "returning to the
-                // caller" (pop).  The catch-all unknown→unknown
-                // branch defaults to push when no PC delta is
-                // available, since the most common case is
-                // ``entrypoint!`` inlining into ``src/lib.rs`` at the
-                // trace start.
-                let push = if pc_delta_trigger {
-                    if let Some(prev) = prev_pc {
-                        pc > prev
-                    } else {
-                        true
-                    }
-                } else {
-                    match (prev_fn.is_some(), curr_fn.is_some()) {
-                        (true, false) => true,
-                        (false, true) => false,
-                        _ => prev_pc.is_none_or(|prev| pc > prev),
-                    }
+        if let Some(prev) = prev_pc {
+            let pc_diff = if pc > prev { pc - prev } else { prev - pc };
+            if pc_diff > 2 {
+                let prev_fn = prev_line.and_then(|l| model.function_at(l));
+                let curr_fn = model.function_at(line);
+                let cross_boundary = match (prev_fn, curr_fn) {
+                    (Some(a), Some(b)) => a != b,
+                    _ => true, // unknown side → preserve legacy heuristic
                 };
-                if push {
-                    let callee_name = curr_fn
-                        .map(str::to_string)
-                        .unwrap_or_else(|| format!("fn_at_pc_{pc}"));
-                    let callee_fn_id = TraceWriter::ensure_function_id(
-                        writer,
-                        &callee_name,
-                        &Path::new(file_str),
-                        Line(line as i64),
-                    );
-                    TraceWriter::register_call(writer, callee_fn_id, vec![]);
-                    env_stack.push(var_env_for_fn(&model, &callee_name));
-                    fn_stack.push(callee_name);
-                } else {
-                    // Backward cross-boundary jump: unwind the
-                    // call stack until we're back in `curr_fn`.
-                    // When `curr_fn` is unknown, pop a single
-                    // frame to match the legacy heuristic.
-                    //
-                    // The synthesised return value comes from the
-                    // last visited line of the unwinding frame —
-                    // when that line is `return Err(..)` /
-                    // `return Ok(..)`, the recorder surfaces the
-                    // typed `Result`-shaped Variant instead of the
-                    // legacy `NONE_VALUE` placeholder.  When the
-                    // unwinding fn's last line carries a `?`
-                    // operator, the recorder propagates the most
-                    // recently synthesised `Err`-shaped value
-                    // (mirrors Rust's `?` semantics: re-emit, NOT
-                    // chain).
-                    let return_value = prev_line
-                        .and_then(|l| {
-                            synthesise_return_value_with_propagation(
-                                &model,
-                                l,
-                                &mut type_ids,
-                                writer,
-                                last_err_return.as_ref(),
-                            )
-                        })
-                        .unwrap_or(NONE_VALUE);
-                    // Update `last_err_return` so the caller's
-                    // closing `?`-bearing line can re-emit it.
-                    if is_err_variant(&return_value) {
-                        last_err_return = Some(return_value.clone());
-                    } else if !matches!(return_value, ValueRecord::None { .. }) {
-                        // A non-error typed return (e.g. `Ok(..)`)
-                        // wipes the propagation slot so a later
-                        // `?` doesn't accidentally pick it up.
-                        last_err_return = None;
-                    }
-                    match curr_fn {
-                        Some(target) => {
-                            while fn_stack.len() > 1
-                                && fn_stack.last().map(String::as_str) != Some(target)
-                            {
-                                TraceWriter::register_return(writer, return_value.clone());
-                                fn_stack.pop();
-                                env_stack.pop();
-                            }
+                if cross_boundary {
+                    let push = pc > prev;
+                    if push {
+                        let callee_name = curr_fn
+                            .map(str::to_string)
+                            .unwrap_or_else(|| format!("fn_at_pc_{pc}"));
+                        let callee_fn_id = TraceWriter::ensure_function_id(
+                            writer,
+                            &callee_name,
+                            &Path::new(file_str),
+                            Line(line as i64),
+                        );
+                        TraceWriter::register_call(writer, callee_fn_id, vec![]);
+                        env_stack.push(var_env_for_fn(&model, &callee_name));
+                        fn_stack.push(callee_name);
+                    } else {
+                        // Backward cross-boundary jump: unwind the
+                        // call stack until we're back in `curr_fn`.
+                        // When `curr_fn` is unknown, pop a single
+                        // frame to match the legacy heuristic.
+                        //
+                        // The synthesised return value comes from the
+                        // last visited line of the unwinding frame —
+                        // when that line is `return Err(..)` /
+                        // `return Ok(..)`, the recorder surfaces the
+                        // typed `Result`-shaped Variant instead of the
+                        // legacy `NONE_VALUE` placeholder.  When the
+                        // unwinding fn's last line carries a `?`
+                        // operator, the recorder propagates the most
+                        // recently synthesised `Err`-shaped value
+                        // (mirrors Rust's `?` semantics: re-emit, NOT
+                        // chain).
+                        let return_value = prev_line
+                            .and_then(|l| {
+                                synthesise_return_value_with_propagation(
+                                    &model,
+                                    l,
+                                    &mut type_ids,
+                                    writer,
+                                    last_err_return.as_ref(),
+                                )
+                            })
+                            .unwrap_or(NONE_VALUE);
+                        // Update `last_err_return` so the caller's
+                        // closing `?`-bearing line can re-emit it.
+                        if is_err_variant(&return_value) {
+                            last_err_return = Some(return_value.clone());
+                        } else if !matches!(return_value, ValueRecord::None { .. }) {
+                            // A non-error typed return (e.g. `Ok(..)`)
+                            // wipes the propagation slot so a later
+                            // `?` doesn't accidentally pick it up.
+                            last_err_return = None;
                         }
-                        None => {
-                            if fn_stack.len() > 1 {
-                                TraceWriter::register_return(writer, return_value);
-                                fn_stack.pop();
-                                env_stack.pop();
-                            } else {
-                                TraceWriter::register_return(writer, return_value);
+                        match curr_fn {
+                            Some(target) => {
+                                while fn_stack.len() > 1
+                                    && fn_stack.last().map(String::as_str) != Some(target)
+                                {
+                                    TraceWriter::register_return(writer, return_value.clone());
+                                    fn_stack.pop();
+                                    env_stack.pop();
+                                }
+                            }
+                            None => {
+                                if fn_stack.len() > 1 {
+                                    TraceWriter::register_return(writer, return_value);
+                                    fn_stack.pop();
+                                    env_stack.pop();
+                                } else {
+                                    TraceWriter::register_return(writer, return_value);
+                                }
                             }
                         }
                     }
@@ -2514,7 +2496,6 @@ pub fn record_from_snapshots_into_writer(
         }
 
         prev_pc = Some(pc);
-        prev_file = Some(file_str.to_string());
         prev_regs = snap.registers;
     }
 
