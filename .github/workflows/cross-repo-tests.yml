@@ -377,6 +377,27 @@ jobs:
             mkdir -p "$GITHUB_WORKSPACE/wdio-diagnostics"
             cp -r "$EXT_DIAG"/* "$GITHUB_WORKSPACE/wdio-diagnostics/"
           fi
+          # Capture every replay-server.log the db-backend wrote during
+          # this CI run.  ``run_dir_for`` (codetracer/src/db-backend/src/
+          # paths.rs) places them under ``$XDG_RUNTIME_DIR/codetracer/
+          # run-<pid>/replay-server.log`` on Linux self-hosted runners.
+          # ``run-<pid>`` directories may also live under ``/tmp/
+          # codetracer/`` if XDG_RUNTIME_DIR was unset; copy from both.
+          # The log shows the exact step_id chosen on each step,
+          # ``DbStep`` line/column for the load_locals query, and
+          # ``variable_cells_for_step`` cardinality — which is what we
+          # need to tell a CTFS-format regression apart from a
+          # step-navigation regression.
+          mkdir -p "$GITHUB_WORKSPACE/wdio-diagnostics/replay-server-logs"
+          for base in "${XDG_RUNTIME_DIR:-/run/user/$(id -u)}/codetracer" /tmp/codetracer; do
+            if [ -d "$base" ]; then
+              for log in "$base"/run-*/replay-server.log; do
+                [ -f "$log" ] || continue
+                run_dir="$(basename "$(dirname "$log")")"
+                cp "$log" "$GITHUB_WORKSPACE/wdio-diagnostics/replay-server-logs/${run_dir}-replay-server.log"
+              done
+            fi
+          done
 
       - name: Upload diagnostics on failure
         if: failure()
