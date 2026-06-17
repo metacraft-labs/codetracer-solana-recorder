@@ -269,6 +269,56 @@ fn resolve_source_against_elf_crate(dwarf_path: &Path, elf_path: &Path) -> PathB
 /// ``file_str`` matches the trace anchor (so a test that uses
 /// ``"lib.rs"`` as both ``source_path`` and the snapshot file
 /// stays visible).
+/// Resolve a snapshot's DWARF ``file_str`` to the same path
+/// representation the trace's anchor (``source_path``) uses, so
+/// every emitted ``Step`` shares a single path string per logical
+/// source file.
+///
+/// Why it matters: VS Code's DAP integration moves the editor
+/// cursor on each ``stopped`` event only when the event's
+/// ``source`` path matches the path of an already-open editor tab.
+/// The trace's call_entry ``Step`` uses ``source_path`` (absolute --
+/// resolved by ``resolve_source_against_elf_crate``) but
+/// ``cargo-build-sbf``'s ``--remap-path-prefix`` projects every
+/// later DWARF source path to a short relative form like
+/// ``src/solana_flow_test.rs``.  Without normalisation the trace
+/// emits step 0 at the absolute anchor, step 1+ at the relative
+/// snapshot — VS Code opens the absolute file as the editor tab,
+/// can't reconcile the relative paths the DAP server later
+/// reports, the cursor stays at line 1, and the WDIO ``performs
+/// multiple step-over operations and changes line`` deep test
+/// sees the same line on every iteration (cross-repo run
+/// 27658362322 attempt 2 — 10/11 deep tests passing, this one
+/// still wedged).
+///
+/// Strategy: ``file_str`` that matches the anchor via
+/// ``same_logical_source`` collapses straight to ``source_path``.
+/// Sibling user-crate files (the multi-file user-crate scenario
+/// in ``test_multiple_source_files``) are resolved against
+/// ``user_crate_root`` when available.  Everything else is passed
+/// through unchanged so synthetic-fixture tests that pass bare
+/// basenames still see the basename in the recorded trace.
+fn canonical_step_path(
+    file_str: &str,
+    source_path_str: &str,
+    user_crate_root: Option<&Path>,
+) -> PathBuf {
+    if same_logical_source(source_path_str, file_str) {
+        return PathBuf::from(source_path_str);
+    }
+    if let Some(crate_root) = user_crate_root {
+        let candidate = Path::new(file_str);
+        if candidate.is_absolute() {
+            return candidate.to_path_buf();
+        }
+        let joined = crate_root.join(candidate);
+        if joined.exists() {
+            return joined;
+        }
+    }
+    PathBuf::from(file_str)
+}
+
 fn is_third_party_for_user(
     source_path_str: &str,
     file_str: &str,
@@ -2497,7 +2547,28 @@ pub fn record_from_snapshots_into_writer(
         }
         // Emit step when line changes.
         if prev_line != Some(line) {
-            TraceWriter::register_step(writer, &Path::new(file_str), Line(line as i64));
+            // Normalise the step's path so it matches the trace
+            // anchor (``source_path``).  ``cargo-build-sbf`` applies
+            // ``--remap-path-prefix`` to user-crate source paths so
+            // DWARF gives us bare basenames or short relative paths
+            // like ``src/solana_flow_test.rs`` -- but ``TraceWriter::
+            // start`` and the call_entry ``Step`` use the resolved
+            // absolute ``source_path``.  When the two disagree
+            // (anchor absolute, snapshot relative) VS Code opens the
+            // absolute path as the editor tab but can't reconcile
+            // the relative path the DAP server later emits in
+            // ``stopped`` events -- ``editor.selection.active.line``
+            // never advances past the anchor's line 1, and the WDIO
+            // ``performs multiple step-over operations and changes
+            // line`` deep test sees ``uniqueLines.size == 1``
+            // (cross-repo run 27658362322 with sha b626ce3 — 10/11
+            // deep tests passing, this one still wedged).  Resolve
+            // every user-source step's path back to the same
+            // anchor-relative absolute form so VS Code can keep the
+            // cursor in the open editor.
+            let step_path =
+                canonical_step_path(file_str, &source_path_str, user_crate_root.as_deref());
+            TraceWriter::register_step(writer, &step_path, Line(line as i64));
 
             // Update the active frame's variable→register env from any
             // `let NAME = ...` binding visible on this step before
