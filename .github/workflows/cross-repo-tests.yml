@@ -392,41 +392,56 @@ jobs:
           # Capture every replay-server.log the db-backend wrote during
           # this CI run.  ``run_dir_for`` (codetracer/src/db-backend/src/
           # paths.rs) picks the base from $CODETRACER_RUNTIME_DIR or
-          # $XDG_RUNTIME_DIR/codetracer/ or falls back to /tmp/codetracer/.
-          # The self-hosted runners run as system users (no XDG runtime
-          # dir), so the fallback path is the typical one — but the
-          # systemd-private tmp namespace and the recording's UUIDv7
-          # run-id make the exact location hard to predict.  Walk the
-          # whole filesystem instead and trust the unique basename.
-          # Log: step_id chosen on each step, DbStep line/column for the
-          # load_locals query, variable_cells_for_step cardinality.
+          # $XDG_RUNTIME_DIR/codetracer/ or falls back to
+          # ``env::temp_dir().join("codetracer/")``.  Run 27735951341
+          # showed the self-hosted runners have no XDG_RUNTIME_DIR and
+          # the WDIO harness sets ``TMPDIR=/tmp/wdio-vscode-ct``, so
+          # ``env::temp_dir()`` returns that path and the db-backend
+          # logs end up at
+          # ``/tmp/wdio-vscode-ct/codetracer/run-<pid>/replay-server.log``.
+          # The broad ``find /`` search also kept missing them despite
+          # ``2>/dev/null`` swallowing permission errors — point find
+          # at the directories where the log can actually be, and dump
+          # the result either way so the next iteration can react.
           mkdir -p "$GITHUB_WORKSPACE/wdio-diagnostics/replay-server-logs"
-          find / -name "replay-server.log" -mmin -120 2>/dev/null | while read -r log; do
-            run_dir="$(basename "$(dirname "$log")")"
-            cp "$log" "$GITHUB_WORKSPACE/wdio-diagnostics/replay-server-logs/${run_dir}-replay-server.log" || true
+          search_roots=(
+            /tmp/wdio-vscode-ct/codetracer
+            /tmp/codetracer
+            "${XDG_RUNTIME_DIR:-/run/user/$(id -u 2>/dev/null)}/codetracer"
+            "$HOME/.cache/codetracer"
+            "$HOME/Library/Caches/com.codetracer.CodeTracer"
+            "$RUNNER_TEMP/codetracer"
+          )
+          for root in "${search_roots[@]}"; do
+            [ -d "$root" ] || continue
+            echo "scanning $root" >&2
+            find "$root" -name "replay-server.log" 2>/dev/null | while read -r log; do
+              # Encode the full path in the destination filename so two logs
+              # from different run-dirs don't collide on the same basename.
+              dest_name="$(echo "$log" | sed 's|/|_|g')"
+              cp "$log" "$GITHUB_WORKSPACE/wdio-diagnostics/replay-server-logs/${dest_name}" || true
+            done
           done
-          # If find turned up nothing, emit a hint file with the dirs we
-          # *did* observe so the next iteration can adjust the search.
-          if [ -z "$(ls -A "$GITHUB_WORKSPACE/wdio-diagnostics/replay-server-logs" 2>/dev/null)" ]; then
-            {
-              echo "no replay-server.log found in the last 120 minutes"
+          # Whether or not we found logs, always dump the observed
+          # layout so we can see which root path is canonical for this
+          # runner and tighten the search if needed next iteration.
+          {
+            echo "Found logs: $(ls "$GITHUB_WORKSPACE/wdio-diagnostics/replay-server-logs/" 2>/dev/null | wc -l)"
+            echo
+            echo "== env =="
+            env | grep -iE "xdg|home|tmp|codetracer|runtime" | sort
+            echo
+            echo "== /tmp top-level =="
+            ls -la /tmp 2>&1 | head -30
+            echo
+            for root in "${search_roots[@]}"; do
+              echo "== ${root} =="
+              ls -laR "$root" 2>&1 | head -40
               echo
-              echo "== env =="
-              env | grep -iE "xdg|home|tmp|codetracer|runtime" | sort
-              echo
-              echo "== /tmp top-level =="
-              ls -la /tmp 2>&1 | head -30
-              echo
-              echo "== /tmp/codetracer (if any) =="
-              ls -laR /tmp/codetracer 2>&1 | head -40
-              echo
-              echo "== /run/user/* =="
-              ls -la /run/user 2>&1 | head -10
-              echo
-              echo "== Any codetracer dir under $HOME / $RUNNER_TEMP =="
-              find "$HOME" "${RUNNER_TEMP:-/tmp}" -maxdepth 4 -name "codetracer" -type d 2>/dev/null | head -10
-            } > "$GITHUB_WORKSPACE/wdio-diagnostics/replay-server-logs/MISSING-search-hint.txt"
-          fi
+            done
+            echo "== /run/user/* =="
+            ls -la /run/user 2>&1 | head -10
+          } > "$GITHUB_WORKSPACE/wdio-diagnostics/replay-server-logs/_search-hint.txt"
 
           # Capture which sibling-repo SHA was actually checked out for
           # every cross-repo dependency this run consumed.  Local
