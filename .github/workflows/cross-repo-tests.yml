@@ -377,6 +377,104 @@ jobs:
             mkdir -p "$GITHUB_WORKSPACE/wdio-diagnostics"
             cp -r "$EXT_DIAG"/* "$GITHUB_WORKSPACE/wdio-diagnostics/"
           fi
+          # Copy the actual recorded trace fixture next to the
+          # client-side fingerprint so a local vs CI byte-comparison
+          # can pinpoint WHICH bytes diverge (the fingerprint already
+          # captured a 1-byte diff in cross-repo run 27709264564 at
+          # offset 0x10 — local ``92``, CI ``aa`` — with the rest of
+          # the first 64 bytes identical and the total file size also
+          # identical; need the full payload to walk the diff).
+          TRACE_DIR="$GITHUB_WORKSPACE/../codetracer-vscode-extension/test/traces/solana-flow-test"
+          if [ -d "$TRACE_DIR" ]; then
+            mkdir -p "$GITHUB_WORKSPACE/wdio-diagnostics/recorded-trace"
+            cp -r "$TRACE_DIR"/* "$GITHUB_WORKSPACE/wdio-diagnostics/recorded-trace/" 2>/dev/null || true
+          fi
+          # Capture every replay-server.log the db-backend wrote during
+          # this CI run.  ``run_dir_for`` (codetracer/src/db-backend/src/
+          # paths.rs) picks the base from $CODETRACER_RUNTIME_DIR or
+          # $XDG_RUNTIME_DIR/codetracer/ or falls back to
+          # ``env::temp_dir().join("codetracer/")``.  Run 27735951341
+          # showed the self-hosted runners have no XDG_RUNTIME_DIR and
+          # the WDIO harness sets ``TMPDIR=/tmp/wdio-vscode-ct``, so
+          # ``env::temp_dir()`` returns that path and the db-backend
+          # logs end up at
+          # ``/tmp/wdio-vscode-ct/codetracer/run-<pid>/replay-server.log``.
+          # The broad ``find /`` search also kept missing them despite
+          # ``2>/dev/null`` swallowing permission errors — point find
+          # at the directories where the log can actually be, and dump
+          # the result either way so the next iteration can react.
+          mkdir -p "$GITHUB_WORKSPACE/wdio-diagnostics/replay-server-logs"
+          search_roots=(
+            /tmp/wdio-vscode-ct/codetracer
+            /tmp/codetracer
+            "${XDG_RUNTIME_DIR:-/run/user/$(id -u 2>/dev/null)}/codetracer"
+            "$HOME/.cache/codetracer"
+            "$HOME/Library/Caches/com.codetracer.CodeTracer"
+            "$RUNNER_TEMP/codetracer"
+          )
+          for root in "${search_roots[@]}"; do
+            [ -d "$root" ] || continue
+            echo "scanning $root" >&2
+            find "$root" -name "replay-server.log" 2>/dev/null | while read -r log; do
+              # Encode the full path in the destination filename so two logs
+              # from different run-dirs don't collide on the same basename.
+              dest_name="$(echo "$log" | sed 's|/|_|g')"
+              cp "$log" "$GITHUB_WORKSPACE/wdio-diagnostics/replay-server-logs/${dest_name}" || true
+            done
+          done
+          # Whether or not we found logs, always dump the observed
+          # layout so we can see which root path is canonical for this
+          # runner and tighten the search if needed next iteration.
+          {
+            echo "Found logs: $(ls "$GITHUB_WORKSPACE/wdio-diagnostics/replay-server-logs/" 2>/dev/null | wc -l)"
+            echo
+            echo "== env =="
+            env | grep -iE "xdg|home|tmp|codetracer|runtime" | sort
+            echo
+            echo "== /tmp top-level =="
+            ls -la /tmp 2>&1 | head -30
+            echo
+            for root in "${search_roots[@]}"; do
+              echo "== ${root} =="
+              ls -laR "$root" 2>&1 | head -40
+              echo
+            done
+            echo "== /run/user/* =="
+            ls -la /run/user 2>&1 | head -10
+          } > "$GITHUB_WORKSPACE/wdio-diagnostics/replay-server-logs/_search-hint.txt"
+
+          # Capture the SHA of EVERY sibling repo CI actually used.  The
+          # initial 3-repo capture (recorder, vscode-ext, codetracer) was
+          # not enough: run 27710063852 had a byte-level trace diff that
+          # turned out to be ``codetracer-trace-format``'s ``ad76dc1
+          # fix(C1): carry column through NimTraceWriter::
+          # register_step_with_column`` — a sibling repo the original
+          # capture didn't even mention.  Walk the workspace parent dir
+          # and emit a SHA + branch + head subject for every cloned repo.
+          mkdir -p "$GITHUB_WORKSPACE/wdio-diagnostics"
+          {
+            echo "{"
+            sep=""
+            for dir in "$GITHUB_WORKSPACE/.." "$GITHUB_WORKSPACE/.."/*/; do
+              for candidate in "$dir" "$dir"/*/; do
+                [ -d "$candidate" ] || continue
+                if [ -d "$candidate/.git" ] || [ -f "$candidate/.git" ]; then
+                  name=$(basename "$candidate")
+                  sha=$(git -C "$candidate" rev-parse HEAD 2>/dev/null || echo "")
+                  branch=$(git -C "$candidate" rev-parse --abbrev-ref HEAD 2>/dev/null || echo "")
+                  desc=$(git -C "$candidate" log -1 --format='%s' 2>/dev/null | sed 's/"/\\"/g' | head -c 200 || echo "")
+                  origin=$(git -C "$candidate" config --get remote.origin.url 2>/dev/null || \
+                           git -C "$candidate" config --get remote.metacraft-labs.url 2>/dev/null || \
+                           echo "")
+                  printf '%s  "%s": { "sha": "%s", "branch": "%s", "head_subject": "%s", "origin": "%s" }' \
+                    "$sep" "$name" "$sha" "$branch" "$desc" "$origin"
+                  sep=$',\n'
+                fi
+              done
+            done
+            echo
+            echo "}"
+          } > "$GITHUB_WORKSPACE/wdio-diagnostics/sibling-repo-state.json"
 
       - name: Upload diagnostics on failure
         if: failure()
