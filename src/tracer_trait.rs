@@ -171,6 +171,14 @@ impl CodeTracerTracer {
         // reserved-bits check.
         TraceWriter::enable_column_aware_steps(&mut *writer);
 
+        // M-capability-flags: the Solana recorder ships sbpf/RBPF PC
+        // → source maps that resolve each VM instruction to a single
+        // sub-statement on the source line, so both per-column
+        // breakpoints and per-column motions are well-defined.
+        // Advertise both capabilities to the GUI.
+        TraceWriter::enable_column_breakpoints_support(&mut *writer);
+        TraceWriter::enable_column_motions_support(&mut *writer);
+
         // Pre-register every distinct source path together with its
         // per-line byte counts BEFORE `TraceWriter::start` — `start`
         // implicitly interns the primary path with no line-length
