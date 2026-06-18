@@ -278,7 +278,18 @@ jobs:
       - name: Build codetracer
         run: |
           cd "$GITHUB_WORKSPACE/../codetracer"
-          OVERRIDE="--override-input codetracer-trace-format path:./libs/codetracer-trace-format"
+          # Override BOTH trace-format AND trace-format-nim against the
+          # workflow-cloned siblings so the Rust wrapper and the Nim FFI
+          # advance together.  Without the -nim override, codetracer's
+          # flake.lock pins a stale -nim that predates symbols
+          # (``ct_reader_supports_column_motions``,
+          # ``ct_reader_supports_column_breakpoints``) the trace-format
+          # Rust wrapper @ ``588b829`` now references, and the
+          # ``db-backend`` link fails with ``undefined reference to
+          # ct_reader_supports_column_motions`` (cross-repo run
+          # 27755553496 step ``Build codetracer``).
+          OVERRIDE="--override-input codetracer-trace-format path:./libs/codetracer-trace-format \
+                    --override-input codetracer-trace-format-nim path:$GITHUB_WORKSPACE/../codetracer-trace-format-nim"
           # ``metacraft-labs-codetracer.cachix.org`` serves a stale
           # narinfo for the noir flake input keyed under a NAR-hash
           # that no longer matches the lockfile, so the build aborts
