@@ -443,31 +443,34 @@ jobs:
             ls -la /run/user 2>&1 | head -10
           } > "$GITHUB_WORKSPACE/wdio-diagnostics/replay-server-logs/_search-hint.txt"
 
-          # Capture which sibling-repo SHA was actually checked out for
-          # every cross-repo dependency this run consumed.  Local
-          # devshells often run against newer commits than the CI's
-          # pinned ones, so a discrepancy here can explain
-          # local-passes-CI-fails without any byte-level recorder
-          # difference at all.
+          # Capture the SHA of EVERY sibling repo CI actually used.  The
+          # initial 3-repo capture (recorder, vscode-ext, codetracer) was
+          # not enough: run 27710063852 had a byte-level trace diff that
+          # turned out to be ``codetracer-trace-format``'s ``ad76dc1
+          # fix(C1): carry column through NimTraceWriter::
+          # register_step_with_column`` — a sibling repo the original
+          # capture didn't even mention.  Walk the workspace parent dir
+          # and emit a SHA + branch + head subject for every cloned repo.
           mkdir -p "$GITHUB_WORKSPACE/wdio-diagnostics"
           {
             echo "{"
             sep=""
-            for repo in codetracer-solana-recorder codetracer-vscode-extension codetracer; do
-              dir=""
-              for candidate in "$GITHUB_WORKSPACE/../$repo" "$GITHUB_WORKSPACE/$repo"; do
+            for dir in "$GITHUB_WORKSPACE/.." "$GITHUB_WORKSPACE/.."/*/; do
+              for candidate in "$dir" "$dir"/*/; do
+                [ -d "$candidate" ] || continue
                 if [ -d "$candidate/.git" ] || [ -f "$candidate/.git" ]; then
-                  dir="$candidate"; break
+                  name=$(basename "$candidate")
+                  sha=$(git -C "$candidate" rev-parse HEAD 2>/dev/null || echo "")
+                  branch=$(git -C "$candidate" rev-parse --abbrev-ref HEAD 2>/dev/null || echo "")
+                  desc=$(git -C "$candidate" log -1 --format='%s' 2>/dev/null | sed 's/"/\\"/g' | head -c 200 || echo "")
+                  origin=$(git -C "$candidate" config --get remote.origin.url 2>/dev/null || \
+                           git -C "$candidate" config --get remote.metacraft-labs.url 2>/dev/null || \
+                           echo "")
+                  printf '%s  "%s": { "sha": "%s", "branch": "%s", "head_subject": "%s", "origin": "%s" }' \
+                    "$sep" "$name" "$sha" "$branch" "$desc" "$origin"
+                  sep=$',\n'
                 fi
               done
-              if [ -n "$dir" ]; then
-                sha=$(git -C "$dir" rev-parse HEAD 2>/dev/null || echo "")
-                branch=$(git -C "$dir" rev-parse --abbrev-ref HEAD 2>/dev/null || echo "")
-                desc=$(git -C "$dir" log -1 --format='%s' 2>/dev/null | sed 's/"/\\"/g' || echo "")
-                printf '%s  "%s": { "sha": "%s", "branch": "%s", "head_subject": "%s" }' \
-                  "$sep" "$repo" "$sha" "$branch" "$desc"
-                sep=$',\n'
-              fi
             done
             echo
             echo "}"
