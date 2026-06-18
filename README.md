@@ -48,6 +48,12 @@ inspection, use `ct print` (shipped with
 
 However, you probably want to use it in combination with CodeTracer, which would be released soon.
 
+### Examples
+
+See [`examples/`](examples/) for self-contained Solana programs you
+can record and replay end-to-end with the `ct` CLI, including a
+column-aware step-over walkthrough.
+
 ### Architecture
 
 The recorder is organized into the following modules:
