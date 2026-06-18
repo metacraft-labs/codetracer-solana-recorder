@@ -2334,6 +2334,15 @@ pub fn record_from_snapshots_into_writer(
     // counts so any spurious DeltaColumn would fail loudly.
     writer.enable_column_aware_steps();
 
+    // M-capability-flags: Solana's PC→source maps mean each VM
+    // instruction has a sharp sub-statement source position, so the
+    // GUI can offer per-column breakpoints and per-column motions
+    // against the recorded steps.  Advertise both capabilities so the
+    // M6 Alt+click affordance and sub-statement step buttons are
+    // available.
+    writer.enable_column_breakpoints_support();
+    writer.enable_column_motions_support();
+
     // Per source path emitted by this trace, register the path together
     // with its per-line byte counts so the `paths.dat` Layout A column-
     // resolution at read time can decode columns from the running
@@ -2830,6 +2839,12 @@ pub fn record_with_cpi(
     // (`FlagHasColumnAwareSteps`) is set, which is the contract
     // column-aware readers rely on.
     TraceWriter::enable_column_aware_steps(&mut *writer);
+
+    // M-capability-flags: see the sibling non-CPI path above for the
+    // same rationale.  Solana's PC→source maps support per-column
+    // breakpoint placement and per-column step motions.
+    TraceWriter::enable_column_breakpoints_support(&mut *writer);
+    TraceWriter::enable_column_motions_support(&mut *writer);
 
     // Load the primary program's source so we can resolve nested call
     // frames to their real `fn name(...)` declarations and synthesise
