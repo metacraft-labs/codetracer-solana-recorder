@@ -25,7 +25,7 @@ codetracer-specs 61aa7d740374fb241e49d896d3fc83bfb3d7a4e4 main
 codetracer-ton-recorder 4dac5e38e093bbf52f7b44a2fe0de8c93d5391de main
 codetracer-trace-format dev dev
 codetracer-trace-format-nim a40f23c2cbacc79b676d157f110abed09671d8fd main
-codetracer-vscode-extension 3aba76c1331a238b8761c68972c28bd6fcb22b9c main
+codetracer-vscode-extension 5c3263304fb2d05e6e9e86d24d81ce57083d3200 main
 codetracer-wasmi-recorder 940344784979d8c3a9b59fa2ff1fcfd73cb5fbd3 HEAD
 codetracer-wasm-recorder 053dc64cf86a082d050d9f72f54e84285e8d2e82 wasm-tracing
 ctfs-poc 5ec28e55b19390d23566696a875d9e0dfb874b6f HEAD
