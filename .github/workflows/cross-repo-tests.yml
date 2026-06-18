@@ -391,25 +391,72 @@ jobs:
           fi
           # Capture every replay-server.log the db-backend wrote during
           # this CI run.  ``run_dir_for`` (codetracer/src/db-backend/src/
-          # paths.rs) places them under ``$XDG_RUNTIME_DIR/codetracer/
-          # run-<pid>/replay-server.log`` on Linux self-hosted runners.
-          # ``run-<pid>`` directories may also live under ``/tmp/
-          # codetracer/`` if XDG_RUNTIME_DIR was unset; copy from both.
-          # The log shows the exact step_id chosen on each step,
-          # ``DbStep`` line/column for the load_locals query, and
-          # ``variable_cells_for_step`` cardinality — which is what we
-          # need to tell a CTFS-format regression apart from a
-          # step-navigation regression.
+          # paths.rs) picks the base from $CODETRACER_RUNTIME_DIR or
+          # $XDG_RUNTIME_DIR/codetracer/ or falls back to /tmp/codetracer/.
+          # The self-hosted runners run as system users (no XDG runtime
+          # dir), so the fallback path is the typical one — but the
+          # systemd-private tmp namespace and the recording's UUIDv7
+          # run-id make the exact location hard to predict.  Walk the
+          # whole filesystem instead and trust the unique basename.
+          # Log: step_id chosen on each step, DbStep line/column for the
+          # load_locals query, variable_cells_for_step cardinality.
           mkdir -p "$GITHUB_WORKSPACE/wdio-diagnostics/replay-server-logs"
-          for base in "${XDG_RUNTIME_DIR:-/run/user/$(id -u)}/codetracer" /tmp/codetracer; do
-            if [ -d "$base" ]; then
-              for log in "$base"/run-*/replay-server.log; do
-                [ -f "$log" ] || continue
-                run_dir="$(basename "$(dirname "$log")")"
-                cp "$log" "$GITHUB_WORKSPACE/wdio-diagnostics/replay-server-logs/${run_dir}-replay-server.log"
-              done
-            fi
+          find / -name "replay-server.log" -mmin -120 2>/dev/null | while read -r log; do
+            run_dir="$(basename "$(dirname "$log")")"
+            cp "$log" "$GITHUB_WORKSPACE/wdio-diagnostics/replay-server-logs/${run_dir}-replay-server.log" || true
           done
+          # If find turned up nothing, emit a hint file with the dirs we
+          # *did* observe so the next iteration can adjust the search.
+          if [ -z "$(ls -A "$GITHUB_WORKSPACE/wdio-diagnostics/replay-server-logs" 2>/dev/null)" ]; then
+            {
+              echo "no replay-server.log found in the last 120 minutes"
+              echo
+              echo "== env =="
+              env | grep -iE "xdg|home|tmp|codetracer|runtime" | sort
+              echo
+              echo "== /tmp top-level =="
+              ls -la /tmp 2>&1 | head -30
+              echo
+              echo "== /tmp/codetracer (if any) =="
+              ls -laR /tmp/codetracer 2>&1 | head -40
+              echo
+              echo "== /run/user/* =="
+              ls -la /run/user 2>&1 | head -10
+              echo
+              echo "== Any codetracer dir under $HOME / $RUNNER_TEMP =="
+              find "$HOME" "${RUNNER_TEMP:-/tmp}" -maxdepth 4 -name "codetracer" -type d 2>/dev/null | head -10
+            } > "$GITHUB_WORKSPACE/wdio-diagnostics/replay-server-logs/MISSING-search-hint.txt"
+          fi
+
+          # Capture which sibling-repo SHA was actually checked out for
+          # every cross-repo dependency this run consumed.  Local
+          # devshells often run against newer commits than the CI's
+          # pinned ones, so a discrepancy here can explain
+          # local-passes-CI-fails without any byte-level recorder
+          # difference at all.
+          mkdir -p "$GITHUB_WORKSPACE/wdio-diagnostics"
+          {
+            echo "{"
+            sep=""
+            for repo in codetracer-solana-recorder codetracer-vscode-extension codetracer; do
+              dir=""
+              for candidate in "$GITHUB_WORKSPACE/../$repo" "$GITHUB_WORKSPACE/$repo"; do
+                if [ -d "$candidate/.git" ] || [ -f "$candidate/.git" ]; then
+                  dir="$candidate"; break
+                fi
+              done
+              if [ -n "$dir" ]; then
+                sha=$(git -C "$dir" rev-parse HEAD 2>/dev/null || echo "")
+                branch=$(git -C "$dir" rev-parse --abbrev-ref HEAD 2>/dev/null || echo "")
+                desc=$(git -C "$dir" log -1 --format='%s' 2>/dev/null | sed 's/"/\\"/g' || echo "")
+                printf '%s  "%s": { "sha": "%s", "branch": "%s", "head_subject": "%s" }' \
+                  "$sep" "$repo" "$sha" "$branch" "$desc"
+                sep=$',\n'
+              fi
+            done
+            echo
+            echo "}"
+          } > "$GITHUB_WORKSPACE/wdio-diagnostics/sibling-repo-state.json"
 
       - name: Upload diagnostics on failure
         if: failure()
