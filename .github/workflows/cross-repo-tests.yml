@@ -13,9 +13,9 @@ name: Cross-Repo Integration Tests
 
 on:
   pull_request:
-    branches: [main]
+    branches: [main, dev, stable]
   push:
-    branches: [main]
+    branches: [main, dev, stable]
 
   workflow_dispatch:
     inputs:
@@ -45,6 +45,13 @@ jobs:
           owner: metacraft-labs
 
       - name: Configure NIX_CONFIG with access-tokens
+        # The original top-level ``env: NIX_CONFIG`` block referenced
+        # ``steps.app-token.outputs.token`` -- but the ``steps`` context
+        # is unavailable at workflow level (the new GitHub Actions
+        # validator rejects the file before any job starts).  Set
+        # ``NIX_CONFIG`` via ``$GITHUB_ENV`` from a step that runs
+        # AFTER ``app-token`` so subsequent ``nix develop`` invocations
+        # can still fetch private flake inputs.
         run: |
           {
             echo 'NIX_CONFIG<<NIX_EOF'
@@ -153,7 +160,9 @@ jobs:
           set +e
           git config --get-regexp '^submodule\..*\.url$' | cut -d. -f2 | while read -r mod; do
             echo "Updating submodule: $mod"
-            git submodule update --depth 1 -- "$mod" 2>&1
+            git \
+              -c "url.https://x-access-token:${GH_TOKEN}@github.com/.insteadOf=https://github.com/" \
+              submodule update --init --recursive --depth 1 -- "$mod" 2>&1
             rc=$?
             if [ $rc -ne 0 ]; then
               echo "::warning::submodule $mod failed to update (rc=$rc, non-fatal)"
@@ -163,7 +172,15 @@ jobs:
           cd -
           if [ "$CT_REF" != "main" ]; then
             git -C "$DEST" fetch origin "$CT_REF"
-            git -C "$DEST" checkout "$CT_REF"
+            # Use FETCH_HEAD so the checkout works for both SHAs and
+            # branch names.  ``git checkout <branch>`` would fail with
+            # ``pathspec '<branch>' did not match any file(s) known to
+            # git`` because the initial ``--depth 1`` clone above
+            # doesn't track remote branches; ``FETCH_HEAD`` is the
+            # ref that ``git fetch origin <ref>`` always populates.
+            # The vscode-extension clone block (below) already uses
+            # this pattern -- this brings codetracer into line.
+            git -C "$DEST" checkout FETCH_HEAD
           fi
 
       - name: Clone codetracer-vscode-extension
@@ -192,12 +209,105 @@ jobs:
             "https://x-access-token:${GH_TOKEN}@github.com/metacraft-labs/nix-blockchain-development.git" \
             "$DEST"
 
+
+      - name: Clone codetracer-trace-format as recorder Cargo sibling
+        env:
+          GH_TOKEN: ${{ steps.app-token.outputs.token }}
+        # The recorder's Cargo.toml declares
+        # `codetracer_trace_types` / `codetracer_trace_writer_nim` as
+        # path deps at `../codetracer-trace-format/...`.  Any step
+        # that runs `cargo` against this checkout (the fixture-
+        # recording step shells out to the recorder's nix shell
+        # via `recorder_exec`, which cargo-builds the recorder)
+        # needs the sibling on disk at the same level as the
+        # recorder.
+        run: |
+          PINS="$GITHUB_WORKSPACE/.github/sibling-pins"
+          TF_REF="main"
+          if [ -f "$PINS" ]; then
+            PIN_REF="$(grep '^codetracer-trace-format ' "$PINS" | cut -d' ' -f2)" || true
+            [ -n "$PIN_REF" ] && TF_REF="$PIN_REF"
+          fi
+          DEST="$GITHUB_WORKSPACE/../codetracer-trace-format"
+          rm -rf "$DEST"
+          git clone "https://x-access-token:${GH_TOKEN}@github.com/metacraft-labs/codetracer-trace-format.git" "$DEST"
+          git -C "$DEST" checkout "$TF_REF"
+
+      - name: Clone codetracer-trace-format-nim as recorder sibling
+        env:
+          GH_TOKEN: ${{ steps.app-token.outputs.token }}
+        # codetracer_trace_writer_nim's build.rs reads the FFI
+        # entry point at
+        # `../codetracer-trace-format-nim/src/codetracer_trace_writer_ffi.nim`.
+        # The fixture-recording step's recorder_exec cargo-builds
+        # the recorder, which compiles codetracer_trace_writer_nim,
+        # which panics without this sibling on disk.
+        run: |
+          PINS="$GITHUB_WORKSPACE/.github/sibling-pins"
+          TFN_REF="main"
+          if [ -f "$PINS" ]; then
+            PIN_REF="$(grep '^codetracer-trace-format-nim ' "$PINS" | cut -d' ' -f2)" || true
+            [ -n "$PIN_REF" ] && TFN_REF="$PIN_REF"
+          fi
+          DEST="$GITHUB_WORKSPACE/../codetracer-trace-format-nim"
+          rm -rf "$DEST"
+          git clone "https://x-access-token:${GH_TOKEN}@github.com/metacraft-labs/codetracer-trace-format-nim.git" "$DEST"
+          git -C "$DEST" checkout "$TFN_REF" 2>/dev/null || true
+
+      - name: Clone codetracer-trace-format into codetracer/libs (CI override)
+        env:
+          GH_TOKEN: ${{ steps.app-token.outputs.token }}
+        # The codetracer Build step below uses
+        # ``--override-input codetracer-trace-format
+        # path:./libs/codetracer-trace-format``.  The codetracer
+        # checkout doesn't ship that directory, so we clone the
+        # sibling pin into the expected path before nix build.
+        run: |
+          PINS="$GITHUB_WORKSPACE/.github/sibling-pins"
+          TF_REF="main"
+          if [ -f "$PINS" ]; then
+            PIN_REF="$(grep '^codetracer-trace-format ' "$PINS" | cut -d' ' -f2)" || true
+            [ -n "$PIN_REF" ] && TF_REF="$PIN_REF"
+          fi
+          DEST="$GITHUB_WORKSPACE/../codetracer/libs/codetracer-trace-format"
+          rm -rf "$DEST"
+          git clone "https://x-access-token:${GH_TOKEN}@github.com/metacraft-labs/codetracer-trace-format.git" "$DEST"
+          git -C "$DEST" checkout "$TF_REF"
+
       - name: Build codetracer
         run: |
           cd "$GITHUB_WORKSPACE/../codetracer"
-          OVERRIDE="--override-input codetracer-trace-format path:./libs/codetracer-trace-format"
-          nix build -L ".?submodules=1#codetracer" $OVERRIDE -o result-ct
-          nix build -L ".?submodules=1#db-backend" $OVERRIDE -o result-db
+          # Override BOTH trace-format AND trace-format-nim against the
+          # workflow-cloned siblings so the Rust wrapper and the Nim FFI
+          # advance together.  Without the -nim override, codetracer's
+          # flake.lock pins a stale -nim that predates symbols
+          # (``ct_reader_supports_column_motions``,
+          # ``ct_reader_supports_column_breakpoints``) the trace-format
+          # Rust wrapper @ ``588b829`` now references, and the
+          # ``db-backend`` link fails with ``undefined reference to
+          # ct_reader_supports_column_motions`` (cross-repo run
+          # 27755553496 step ``Build codetracer``).
+          OVERRIDE="--override-input codetracer-trace-format path:./libs/codetracer-trace-format \
+                    --override-input codetracer-trace-format-nim path:$GITHUB_WORKSPACE/../codetracer-trace-format-nim"
+          # ``metacraft-labs-codetracer.cachix.org`` serves a stale
+          # narinfo for the noir flake input keyed under a NAR-hash
+          # that no longer matches the lockfile, so the build aborts
+          # with ``NAR hash mismatch in input git+https://...noir...``.
+          # Force-skip every non-default substituter (``cache.nixos.org``
+          # alone is plenty for the standard nixpkgs paths) so nix
+          # fetches the noir source from origin and computes the
+          # correct hash itself.  Documented as CI-stabilization §4.
+          SUBST_OVERRIDE="--option accept-flake-config false --option substituters https://cache.nixos.org"
+          # The runner's per-user fetcher cache
+          # (~/.cache/nix/fetcher-cache-v2.sqlite) holds a stale
+          # narinfo for the noir git+https input that contradicts the
+          # lockfile.  ``--refresh`` forces nix to re-resolve every
+          # flake input from origin even when the local cache has an
+          # entry, so the cached narHash gets replaced by what
+          # upstream currently serves.
+          REFRESH="--refresh"
+          nix build $SUBST_OVERRIDE $REFRESH -L ".?submodules=1#codetracer" $OVERRIDE -o result-ct
+          nix build $SUBST_OVERRIDE -L ".?submodules=1#db-backend" $OVERRIDE -o result-db
           # Merge both outputs into a single bin directory so the extension
           # can find both ct and db-backend via a single runnablePath.
           mkdir -p combined-bin
@@ -277,6 +387,104 @@ jobs:
             mkdir -p "$GITHUB_WORKSPACE/wdio-diagnostics"
             cp -r "$EXT_DIAG"/* "$GITHUB_WORKSPACE/wdio-diagnostics/"
           fi
+          # Copy the actual recorded trace fixture next to the
+          # client-side fingerprint so a local vs CI byte-comparison
+          # can pinpoint WHICH bytes diverge (the fingerprint already
+          # captured a 1-byte diff in cross-repo run 27709264564 at
+          # offset 0x10 — local ``92``, CI ``aa`` — with the rest of
+          # the first 64 bytes identical and the total file size also
+          # identical; need the full payload to walk the diff).
+          TRACE_DIR="$GITHUB_WORKSPACE/../codetracer-vscode-extension/test/traces/solana-flow-test"
+          if [ -d "$TRACE_DIR" ]; then
+            mkdir -p "$GITHUB_WORKSPACE/wdio-diagnostics/recorded-trace"
+            cp -r "$TRACE_DIR"/* "$GITHUB_WORKSPACE/wdio-diagnostics/recorded-trace/" 2>/dev/null || true
+          fi
+          # Capture every replay-server.log the db-backend wrote during
+          # this CI run.  ``run_dir_for`` (codetracer/src/db-backend/src/
+          # paths.rs) picks the base from $CODETRACER_RUNTIME_DIR or
+          # $XDG_RUNTIME_DIR/codetracer/ or falls back to
+          # ``env::temp_dir().join("codetracer/")``.  Run 27735951341
+          # showed the self-hosted runners have no XDG_RUNTIME_DIR and
+          # the WDIO harness sets ``TMPDIR=/tmp/wdio-vscode-ct``, so
+          # ``env::temp_dir()`` returns that path and the db-backend
+          # logs end up at
+          # ``/tmp/wdio-vscode-ct/codetracer/run-<pid>/replay-server.log``.
+          # The broad ``find /`` search also kept missing them despite
+          # ``2>/dev/null`` swallowing permission errors — point find
+          # at the directories where the log can actually be, and dump
+          # the result either way so the next iteration can react.
+          mkdir -p "$GITHUB_WORKSPACE/wdio-diagnostics/replay-server-logs"
+          search_roots=(
+            /tmp/wdio-vscode-ct/codetracer
+            /tmp/codetracer
+            "${XDG_RUNTIME_DIR:-/run/user/$(id -u 2>/dev/null)}/codetracer"
+            "$HOME/.cache/codetracer"
+            "$HOME/Library/Caches/com.codetracer.CodeTracer"
+            "$RUNNER_TEMP/codetracer"
+          )
+          for root in "${search_roots[@]}"; do
+            [ -d "$root" ] || continue
+            echo "scanning $root" >&2
+            find "$root" -name "replay-server.log" 2>/dev/null | while read -r log; do
+              # Encode the full path in the destination filename so two logs
+              # from different run-dirs don't collide on the same basename.
+              dest_name="$(echo "$log" | sed 's|/|_|g')"
+              cp "$log" "$GITHUB_WORKSPACE/wdio-diagnostics/replay-server-logs/${dest_name}" || true
+            done
+          done
+          # Whether or not we found logs, always dump the observed
+          # layout so we can see which root path is canonical for this
+          # runner and tighten the search if needed next iteration.
+          {
+            echo "Found logs: $(ls "$GITHUB_WORKSPACE/wdio-diagnostics/replay-server-logs/" 2>/dev/null | wc -l)"
+            echo
+            echo "== env =="
+            env | grep -iE "xdg|home|tmp|codetracer|runtime" | sort
+            echo
+            echo "== /tmp top-level =="
+            ls -la /tmp 2>&1 | head -30
+            echo
+            for root in "${search_roots[@]}"; do
+              echo "== ${root} =="
+              ls -laR "$root" 2>&1 | head -40
+              echo
+            done
+            echo "== /run/user/* =="
+            ls -la /run/user 2>&1 | head -10
+          } > "$GITHUB_WORKSPACE/wdio-diagnostics/replay-server-logs/_search-hint.txt"
+
+          # Capture the SHA of EVERY sibling repo CI actually used.  The
+          # initial 3-repo capture (recorder, vscode-ext, codetracer) was
+          # not enough: run 27710063852 had a byte-level trace diff that
+          # turned out to be ``codetracer-trace-format``'s ``ad76dc1
+          # fix(C1): carry column through NimTraceWriter::
+          # register_step_with_column`` — a sibling repo the original
+          # capture didn't even mention.  Walk the workspace parent dir
+          # and emit a SHA + branch + head subject for every cloned repo.
+          mkdir -p "$GITHUB_WORKSPACE/wdio-diagnostics"
+          {
+            echo "{"
+            sep=""
+            for dir in "$GITHUB_WORKSPACE/.." "$GITHUB_WORKSPACE/.."/*/; do
+              for candidate in "$dir" "$dir"/*/; do
+                [ -d "$candidate" ] || continue
+                if [ -d "$candidate/.git" ] || [ -f "$candidate/.git" ]; then
+                  name=$(basename "$candidate")
+                  sha=$(git -C "$candidate" rev-parse HEAD 2>/dev/null || echo "")
+                  branch=$(git -C "$candidate" rev-parse --abbrev-ref HEAD 2>/dev/null || echo "")
+                  desc=$(git -C "$candidate" log -1 --format='%s' 2>/dev/null | sed 's/"/\\"/g' | head -c 200 || echo "")
+                  origin=$(git -C "$candidate" config --get remote.origin.url 2>/dev/null || \
+                           git -C "$candidate" config --get remote.metacraft-labs.url 2>/dev/null || \
+                           echo "")
+                  printf '%s  "%s": { "sha": "%s", "branch": "%s", "head_subject": "%s", "origin": "%s" }' \
+                    "$sep" "$name" "$sha" "$branch" "$desc" "$origin"
+                  sep=$',\n'
+                fi
+              done
+            done
+            echo
+            echo "}"
+          } > "$GITHUB_WORKSPACE/wdio-diagnostics/sibling-repo-state.json"
 
       - name: Upload diagnostics on failure
         if: failure()

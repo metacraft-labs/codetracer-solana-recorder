@@ -9,13 +9,9 @@
 // fallback that compiles as a regular Rust lib.
 
 #[cfg(target_os = "solana")]
-use solana_program_entrypoint::entrypoint;
-#[cfg(target_os = "solana")]
-use solana_account_info::AccountInfo;
-#[cfg(target_os = "solana")]
-use solana_program_error::ProgramResult;
-#[cfg(target_os = "solana")]
-use solana_pubkey::Pubkey;
+use solana_program::{
+    account_info::AccountInfo, entrypoint, entrypoint::ProgramResult, msg, pubkey::Pubkey,
+};
 
 #[cfg(target_os = "solana")]
 entrypoint!(process_instruction);
@@ -31,7 +27,7 @@ fn process_instruction(
     let sum_val: u64 = a + b;
     let doubled: u64 = sum_val * 2;
     let final_result: u64 = doubled + a;
-    solana_msg::msg!("result: {}", final_result);
+    msg!("result: {}", final_result);
     Ok(())
 }
 

@@ -28,7 +28,6 @@ use codetracer_solana_recorder::dwarf::{DwarfParser, find_functions};
 use codetracer_solana_recorder::multi_program::ProgramRegistry;
 use codetracer_solana_recorder::recorder::record_with_cpi;
 use codetracer_solana_recorder::register_trace::RegisterSnapshot;
-use codetracer_trace_types::TraceLowLevelEvent;
 
 // ---------------------------------------------------------------------------
 // Helpers
@@ -259,7 +258,7 @@ fn test_nested_cpi_with_real_boundaries() {
     let span = max_pc - min_pc;
 
     // Divide into 3 equal ranges.
-    let ranges = vec![
+    let ranges = [
         min_pc..min_pc + span / 3,
         min_pc + span / 3..min_pc + 2 * span / 3,
         min_pc + 2 * span / 3..max_pc,
@@ -379,7 +378,7 @@ fn test_record_with_cpi_using_real_boundaries() {
         .unwrap()
         .filter_map(|e| e.ok())
         .map(|e| e.path())
-        .filter(|p| p.extension().map_or(false, |ext| ext == "ct"))
+        .filter(|p| p.extension().is_some_and(|ext| ext == "ct"))
         .collect();
     assert!(!ct_files.is_empty(), "expected .ct file");
     let ct_content = std::fs::read(&ct_files[0]).unwrap();
@@ -474,7 +473,7 @@ fn test_cpi_trace_event_ordering() {
     let elf_data = load_recorder_elf();
     let (range_a, range_b, locs_a, locs_b) = partition_functions_for_cpi(&elf_data);
 
-    if locs_a.len() < 2 || locs_b.len() < 1 {
+    if locs_a.len() < 2 || locs_b.is_empty() {
         eprintln!("Skipping: insufficient locations");
         return;
     }
@@ -508,7 +507,7 @@ fn test_cpi_trace_event_ordering() {
         .unwrap()
         .filter_map(|e| e.ok())
         .map(|e| e.path())
-        .filter(|p| p.extension().map_or(false, |ext| ext == "ct"))
+        .filter(|p| p.extension().is_some_and(|ext| ext == "ct"))
         .collect();
     assert!(!ct_files.is_empty(), "expected .ct file");
     let ct_content = std::fs::read(&ct_files[0]).unwrap();

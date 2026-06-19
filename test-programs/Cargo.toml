@@ -1,0 +1,48 @@
+[package]
+name = "test_programs"
+version = "0.1.0"
+edition = "2021"
+publish = false
+description = "Solana test programs compiled to SBF for the codetracer-solana-recorder's fixture-recording tests"
+
+# The fixture-recording path (codetracer-vscode-extension/scripts/
+# prepare-solana-fixture.sh) does ``cd test-programs && cargo build-sbf``
+# which compiles this crate against the Solana program SDK for the
+# ``sbpf-solana-solana`` target.  The resulting ``target/deploy/
+# test_programs.so`` is then fed into the recorder.
+#
+# This is a standalone crate; the parent ``codetracer-solana-recorder``
+# Cargo.toml is a ``[package]`` (not a workspace), so this directory
+# is intentionally not picked up by a top-level ``cargo build``.  Host-
+# side unit tests against the non-SBF branch live under ``cargo test``
+# from this directory.
+# The lib source is named ``solana_flow_test.rs`` (not the cargo-default
+# ``lib.rs``) so the DWARF debug-info inside ``test_programs.so``
+# references ``solana_flow_test.rs``.  The vscode-extension's WDIO
+# smoke test (``test/wdio/specs/smoke/solana.e2e.ts``) expects an
+# editor tab with that basename to open when the trace loads -- with
+# the cargo-default name, the DAP server pointed at ``lib.rs`` and the
+# tab never matched ``solana_flow_test.rs``.
+[lib]
+path = "src/solana_flow_test.rs"
+crate-type = ["cdylib", "lib"]
+
+[dependencies]
+solana-program = "2"
+
+[features]
+no-entrypoint = []
+
+# cargo-build-sbf compiles SBF programs against ``[profile.release]`` by
+# default; the upstream LimeChain ``sbpf-coverage`` documentation
+# (https://github.com/LimeChain/sbpf-coverage) is the canonical
+# reference for what's needed to keep DWARF in the .so so PC → source
+# mapping survives.  Without these the strip phase plus optimisations
+# leave the ELF with an empty ``.debug_info`` -- the recorder then
+# can't resolve any source location and the WDIO smoke test never
+# sees ``process_instruction`` / ``sum_val`` in the trace.
+[profile.release]
+debug = true
+lto = "off"
+opt-level = 0
+strip = "none"

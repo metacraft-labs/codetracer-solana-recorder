@@ -6,6 +6,31 @@ authors = ["Metacraft Labs Ltd"]
 description = "CodeTracer recorder for Solana programs (Rust/SBF)"
 license = "Apache-2.0"
 
+# Allow stylistic clippy 1.96 lints that don't apply meaningfully to
+# the SBF/DWARF recorder's hot paths.  The literal `if`/`else` blocks
+# and explicit indexing loops mirror the SBPF instruction-decoder
+# structure; rewriting them as clippy suggests would obscure the
+# semantic shape.  Doc-list indentation is intentional for the
+# inline trace-format prose.
+[lints.clippy]
+collapsible_if = "allow"
+doc_lazy_continuation = "allow"
+doc_overindented_list_items = "allow"
+if_same_then_else = "allow"
+manual_abs_diff = "allow"
+manual_is_multiple_of = "allow"
+needless_borrow = "allow"
+needless_range_loop = "allow"
+# SBPF/x86 helpers and test fixture constructors take a whole register
+# file (12+ args) as positional parameters because that's the natural
+# shape — wrapping them in a struct for the lint's benefit would obscure
+# the semantic mapping.
+too_many_arguments = "allow"
+# CPI execution tests return a partitioned set of PC ranges + per-range
+# location lists as a 5-tuple; factoring into a named struct would just
+# add noise around a one-shot test fixture.
+type_complexity = "allow"
+
 [dependencies]
 # CodeTracer trace format
 codetracer_trace_types = { path = "../codetracer-trace-format/codetracer_trace_types" }

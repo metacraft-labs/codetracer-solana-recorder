@@ -1,3 +1,7 @@
 /target
+/test-programs/target
 .env
 .direnv
+
+# reprobuild build artifacts
+.repro/

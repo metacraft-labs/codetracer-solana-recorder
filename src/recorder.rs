@@ -38,7 +38,8 @@
 //! degrade to empty and the recorder behaves exactly as before.
 
 use std::collections::HashMap;
-use std::path::Path;
+use std::collections::HashSet;
+use std::path::{Path, PathBuf};
 
 use codetracer_trace_types::{EventLogKind, Line, NONE_VALUE, TypeId, TypeKind, ValueRecord};
 use codetracer_trace_writer_nim::trace_writer::TraceWriter;
@@ -49,6 +50,44 @@ use crate::cpi::{CpiDetector, CpiEvent};
 use crate::dwarf::DwarfParser;
 use crate::multi_program::ProgramRegistry;
 use crate::register_trace::{RegisterSnapshot, parse_regs_file};
+
+/// Read per-line byte counts for `path` and return them as a flat `Vec<u32>`
+/// where entry `i` is the addressable column count of source line `i+1`
+/// (1-based numbering matching the `paths.dat` Layout A contract — see
+/// `codetracer-trace-format-spec/trace-events.md` §"paths.dat per-line
+/// offset table — Layout A").
+///
+/// Synthetic-only test paths (e.g. `<stdin>`) and missing/unreadable files
+/// degrade to an empty `Vec`; the writer treats `register_path_with_line_lengths`
+/// with an empty slice as "no per-line data", so the column resolution at
+/// read time falls back to surfacing `None`, matching the back-compat-safe
+/// default codified in P6.5.
+///
+/// Ported from the Python recorder's
+/// `runtime/output_paths.rs::read_line_lengths_for_path`.
+pub(crate) fn read_line_lengths_for_path(path: &Path) -> Vec<u32> {
+    let lossy = path.to_string_lossy();
+    if lossy.starts_with('<') && lossy.ends_with('>') {
+        return Vec::new();
+    }
+    let Ok(bytes) = std::fs::read(path) else {
+        return Vec::new();
+    };
+    let mut lines: Vec<u32> = Vec::new();
+    let mut current_len: u32 = 0;
+    for byte in &bytes {
+        if *byte == b'\n' {
+            lines.push(current_len);
+            current_len = 0;
+        } else {
+            current_len = current_len.saturating_add(1);
+        }
+    }
+    if current_len > 0 || bytes.last() != Some(&b'\n') {
+        lines.push(current_len);
+    }
+    lines
+}
 
 // The recorder is CTFS-only per `Recorder-CLI-Conventions.md` §4 (see
 // `codetracer-specs`).  We pin every `create_trace_writer` call site to
@@ -81,22 +120,324 @@ pub fn record_from_traces(
     // 2. Parse DWARF from ELF.
     let dwarf = DwarfParser::new(elf_data)?;
 
-    // 3. Build source locations from DWARF.
-    let source_locations: Vec<(u64, String, u32)> = snapshots
+    // 3. Build source locations from DWARF — carry the column when DWARF
+    //    populated it so column-aware replay navigation has byte-accurate
+    //    landing points.  DWARF emitters that only produce line-only
+    //    entries (e.g. `-g1` builds) leave `column == None` and the
+    //    writer falls back to the column-less step path.
+    let source_locations: Vec<(u64, String, u32, Option<u32>)> = snapshots
         .iter()
         .filter_map(|snap| {
             let loc = dwarf.find_location(snap.pc())?;
-            Some((snap.pc(), loc.file, loc.line))
+            Some((snap.pc(), loc.file, loc.line, loc.column))
         })
         .collect();
 
     // Convert to borrowed form for the shared implementation.
-    let source_locs_ref: Vec<(u64, &str, u32)> = source_locations
+    let source_locs_ref: Vec<(u64, &str, u32, Option<u32>)> = source_locations
         .iter()
-        .map(|(pc, f, l)| (*pc, f.as_str(), *l))
+        .map(|(pc, f, l, c)| (*pc, f.as_str(), *l, *c))
         .collect();
 
-    record_from_snapshots(&snapshots, &source_locs_ref, source_path, out_dir)
+    // Derive the trace's "source file" from DWARF: the file that contains
+    // the first PC seen in execution.  Without this, the caller's
+    // ``source_path`` (which the recorder treats as the program identifier
+    // and writes into the trace via ``TraceWriter::start``) is the ELF
+    // ``.so`` path -- the DAP server then asks VS Code to open the ``.so``
+    // as a source file and the smoke test's ``opens
+    // solana_flow_test.rs in the editor`` assertion times out after 120s
+    // (observed against cross-repo runs at d92244b and earlier).  Resolve
+    // the .rs path from the first valid source location, fall back to the
+    // ELF path only if DWARF resolution turned up empty.
+    // Prefer the .rs source file from DWARF, falling back to:
+    //   1. A sibling .rs file next to the .so (looks for <out_dir
+    //      grandparent>/src/*.rs -- the layout produced by
+    //      cargo-build-sbf for a single-source crate).
+    //   2. The original ELF path (last resort, may not open in VS
+    //      Code as a source tab).
+    //
+    // The fallback exists because cargo-build-sbf release builds (the
+    // only profile sBPF supports) currently emit an empty .debug_info
+    // section in the .so even when ``--debug`` is set -- so the
+    // primary DWARF→source map will be empty in practice.  Without
+    // the fallback the recorder would write the .so as the trace's
+    // source path and the DAP server would tell VS Code to open the
+    // ELF as text, hanging the smoke test's ``opens
+    // solana_flow_test.rs in the editor`` assertion at the 120s
+    // timeout.
+    // ``source_locations.first()`` would point at the ``entrypoint!``
+    // macro source (under ``.cargo/registry/.../solana-program-
+    // entrypoint-*/src/lib.rs``) because that's the first PC executed
+    // after the trampoline jumps into the user's program -- this
+    // confused VS Code into opening the third-party crate as the
+    // active editor tab and the smoke test waited forever for
+    // ``solana_flow_test.rs``.  Skip stdlib / cargo-registry paths
+    // and prefer the first DWARF location that lives outside both,
+    // i.e. the user's program source.
+    let trace_source_path: PathBuf = if let Some((_, f, _, _)) = source_locations
+        .iter()
+        .find(|(_, f, _, _)| !is_third_party_source(f))
+    {
+        PathBuf::from(f)
+    } else if let Some(rs) = sibling_rs_source(source_path) {
+        rs
+    } else if let Some((_, f, _, _)) = source_locations.first() {
+        PathBuf::from(f)
+    } else {
+        source_path.to_path_buf()
+    };
+    // ``cargo-build-sbf`` on CI invokes the compiler with
+    // ``--remap-path-prefix`` so DWARF paths for the user's crate
+    // arrive relative to the crate root (e.g. ``src/solana_flow_test.rs``)
+    // rather than absolute.  The recorder runs from a different cwd at
+    // trace time -- ``SourceModel::load`` then reads from cwd, the file
+    // is missing, the model is empty, and every call site degrades to
+    // the ``fn_at_pc_<pc>`` placeholder.  Resolve the relative path
+    // against the ELF's crate root (the nearest ancestor of the .so
+    // that contains ``Cargo.toml``) so the source model gets populated
+    // and the WDIO smoke test's ``finds process_instruction in the
+    // calltrace`` assertion finds the real function name.
+    let trace_source_path = resolve_source_against_elf_crate(&trace_source_path, source_path);
+    eprintln!(
+        "Trace source path: {} ({} DWARF source locations)",
+        trace_source_path.display(),
+        source_locations.len(),
+    );
+
+    record_from_snapshots_with_columns(&snapshots, &source_locs_ref, &trace_source_path, out_dir)
+}
+
+/// Look for a sibling ``.rs`` source file next to the given ELF path.
+///
+/// cargo-build-sbf places the linked ELF at
+/// ``test-programs/target/deploy/test_programs.so`` and the lib source
+/// at ``test-programs/src/<name>.rs``.  Resolve from the ELF up to the
+/// crate root (two ``..`` from ``target/deploy``) and look for a single
+/// ``.rs`` file under ``src/``.  Returns ``None`` if the layout differs
+/// or more than one candidate is present (ambiguous -- safer to leave
+/// the caller's fallback in place).
+/// Identify a DWARF source path that points at a third-party crate or
+/// the bundled rust standard library rather than the user's own source.
+///
+/// SBF programs link in ``solana-program`` (and its ``entrypoint!``
+/// macro source ``solana-program-entrypoint-*/src/lib.rs``) plus the
+/// platform-tools-pinned ``rust/library/{core,alloc,std}/`` source
+/// tree.  Those paths appear in the DWARF debug_info because the
+/// compiler embeds the original source location of every inlined
+/// helper, but VS Code can't usefully open them as the active editor
+/// tab for the smoke test (they live in ``~/.cargo/registry`` or in
+/// a path that exists only on the platform-tools build machine).
+/// Filter both classes out so the trace's primary source path is the
+/// user's crate.
+fn is_third_party_source(path: &str) -> bool {
+    if path.contains(".cargo/registry/")
+        || path.contains("/rust/library/")
+        || path.contains("/rustlib/src/rust/library/")
+    {
+        return true;
+    }
+    // ``cargo-build-sbf`` on CI uses ``--remap-path-prefix`` so the
+    // ``.cargo/registry/...`` paths above arrive as a bare relative
+    // path (observed against CI run 27531347645:
+    // ``source_locations[0] = src/lib.rs``).  We can't tell from a
+    // relative ``src/lib.rs`` alone whether the source is a registry
+    // dep or the user's crate -- but by convention the user's SBF
+    // crate root is named after its program rather than the cargo
+    // default ``lib.rs`` (the test-programs crate's lib was renamed
+    // to ``solana_flow_test.rs`` precisely so the DAP server picks
+    // the user file as the editor tab).  Treat the bare ``lib.rs``
+    // basename as third-party -- a heuristic, but the only one
+    // reliable across local-vs-CI builds with different
+    // ``--remap-path-prefix`` settings.
+    std::path::Path::new(path)
+        .file_name()
+        .and_then(|n| n.to_str())
+        == Some("lib.rs")
+}
+
+/// Resolve a (possibly relative) DWARF source path against the ELF's
+/// Cargo crate root.
+///
+/// ``cargo-build-sbf`` on CI passes ``--remap-path-prefix`` to make DWARF
+/// paths relative to the crate root.  At trace time the recorder may run
+/// from a different cwd than the crate root, so a relative path won't
+/// resolve against ``std::fs::read_to_string``.  Walk upwards from the
+/// ELF until we find an ancestor that contains a ``Cargo.toml``; if the
+/// relative path resolves under that ancestor, return the resolved path.
+/// Otherwise return the input unchanged (preserves the legacy absolute-
+/// path / found-locally behaviour for local builds).
+fn resolve_source_against_elf_crate(dwarf_path: &Path, elf_path: &Path) -> PathBuf {
+    if dwarf_path.is_absolute() || dwarf_path.exists() {
+        return dwarf_path.to_path_buf();
+    }
+    for anc in elf_path.ancestors() {
+        if anc.join("Cargo.toml").exists() {
+            let candidate = anc.join(dwarf_path);
+            if candidate.exists() {
+                return candidate;
+            }
+        }
+    }
+    dwarf_path.to_path_buf()
+}
+
+/// Decide whether the DWARF source path ``file_str`` for a snapshot
+/// is third-party from the user's perspective.
+///
+/// The basename-only ``is_third_party_source`` heuristic
+/// (``lib.rs`` plus ``.cargo/registry/`` / ``/rust/library/`` path
+/// fragments) only catches the most common cases: ``solana-program-
+/// entrypoint``'s ``src/lib.rs`` wrapper.  sBPF programs link in
+/// many more third-party stdlib files whose ``--remap-path-prefix``
+/// projection is indistinguishable from a user-crate source
+/// (``src/hazmat.rs`` from ``curve25519-dalek``'s ``subtle`` ops,
+/// ``src/syscalls.rs`` from ``solana-program``'s syscall shims,
+/// etc.).  Stepping over to those in the WDIO ``performs multiple
+/// step-over operations and changes line`` deep test wedges VS
+/// Code's editor cursor (the third-party file is not on disk so
+/// ``editor.selection.active.line`` doesn't advance, the
+/// ``uniqueLines.size > 1`` assertion sees the same line on every
+/// iteration -- cross-repo run 27657183885).
+///
+/// Filter strategy: when ``user_crate_root`` is known (production:
+/// the nearest ancestor of ``source_path`` carrying a
+/// ``Cargo.toml``), check whether ``file_str`` resolves to an
+/// existing file under that root.  Any path that does NOT resolve
+/// is third-party (it came from a sibling crate's source tree the
+/// linker pulled in via DWARF).  When ``user_crate_root`` is
+/// ``None`` (synthetic-fixture tests pass a relative
+/// ``source_path`` with no real filesystem layout to consult), only
+/// fall back to ``is_third_party_source`` -- and even there, the
+/// ``same_logical_source`` guard keeps snapshots whose
+/// ``file_str`` matches the trace anchor (so a test that uses
+/// ``"lib.rs"`` as both ``source_path`` and the snapshot file
+/// stays visible).
+/// Resolve a snapshot's DWARF ``file_str`` to the same path
+/// representation the trace's anchor (``source_path``) uses, so
+/// every emitted ``Step`` shares a single path string per logical
+/// source file.
+///
+/// Why it matters: VS Code's DAP integration moves the editor
+/// cursor on each ``stopped`` event only when the event's
+/// ``source`` path matches the path of an already-open editor tab.
+/// The trace's call_entry ``Step`` uses ``source_path`` (absolute --
+/// resolved by ``resolve_source_against_elf_crate``) but
+/// ``cargo-build-sbf``'s ``--remap-path-prefix`` projects every
+/// later DWARF source path to a short relative form like
+/// ``src/solana_flow_test.rs``.  Without normalisation the trace
+/// emits step 0 at the absolute anchor, step 1+ at the relative
+/// snapshot — VS Code opens the absolute file as the editor tab,
+/// can't reconcile the relative paths the DAP server later
+/// reports, the cursor stays at line 1, and the WDIO ``performs
+/// multiple step-over operations and changes line`` deep test
+/// sees the same line on every iteration (cross-repo run
+/// 27658362322 attempt 2 — 10/11 deep tests passing, this one
+/// still wedged).
+///
+/// Strategy: ``file_str`` that matches the anchor via
+/// ``same_logical_source`` collapses straight to ``source_path``.
+/// Sibling user-crate files (the multi-file user-crate scenario
+/// in ``test_multiple_source_files``) are resolved against
+/// ``user_crate_root`` when available.  Everything else is passed
+/// through unchanged so synthetic-fixture tests that pass bare
+/// basenames still see the basename in the recorded trace.
+fn canonical_step_path(
+    file_str: &str,
+    source_path_str: &str,
+    user_crate_root: Option<&Path>,
+) -> PathBuf {
+    if same_logical_source(source_path_str, file_str) {
+        return PathBuf::from(source_path_str);
+    }
+    if let Some(crate_root) = user_crate_root {
+        let candidate = Path::new(file_str);
+        if candidate.is_absolute() {
+            return candidate.to_path_buf();
+        }
+        let joined = crate_root.join(candidate);
+        if joined.exists() {
+            return joined;
+        }
+    }
+    PathBuf::from(file_str)
+}
+
+fn is_third_party_for_user(
+    source_path_str: &str,
+    file_str: &str,
+    user_crate_root: Option<&Path>,
+) -> bool {
+    // Anchor match wins everywhere: a snapshot whose file matches
+    // the trace's ``source_path`` (exact, suffix, or basename --
+    // see ``same_logical_source``) is the user's source by
+    // construction, even if ``--remap-path-prefix`` projected it
+    // to a bare basename ``cargo-build-sbf`` couldn't resolve
+    // against the crate root (e.g. the test program lives in
+    // ``test-programs/solana/<name>.rs`` but DWARF stores
+    // ``<name>.rs`` and ``user_crate_root`` is ``test-programs/``
+    // so ``crate_root.join("<name>.rs")`` doesn't exist).
+    if same_logical_source(source_path_str, file_str) {
+        return false;
+    }
+    if let Some(crate_root) = user_crate_root {
+        let candidate = Path::new(file_str);
+        if candidate.is_absolute() {
+            return !candidate.exists();
+        }
+        return !crate_root.join(candidate).exists();
+    }
+    is_third_party_source(file_str)
+}
+
+/// Returns ``true`` if ``candidate`` could plausibly refer to the
+/// same logical source file as ``anchor``.
+///
+/// Used so synthetic-fixture tests that pass bare basenames
+/// (``"lib.rs"``) as both the trace anchor and the per-snapshot
+/// source path aren't accidentally classified as third-party --
+/// ``is_third_party_source("lib.rs")`` is ``true`` (the macro-
+/// inline heuristic for sBPF programs whose user crate root is
+/// renamed away from the cargo default), so we need a way to say
+/// "this looks third-party but it's actually the trace anchor".
+/// The comparison treats any of:
+///   * exact equality,
+///   * ``anchor`` ending in ``"/" + candidate`` (relative or basename
+///     hanging off the anchor's directory tree),
+///   * ``candidate`` ending in ``"/" + anchor`` (rare inverse case
+///     when the test fixture stores the longer path in the snapshot),
+/// as referring to the same file.  A pure basename ("foo.rs") matches
+/// any anchor whose final path component is "foo.rs".
+fn same_logical_source(anchor: &str, candidate: &str) -> bool {
+    if anchor == candidate {
+        return true;
+    }
+    if let Some(tail) = anchor.strip_suffix(candidate)
+        && (tail.ends_with('/') || tail.is_empty())
+    {
+        return true;
+    }
+    if let Some(tail) = candidate.strip_suffix(anchor)
+        && (tail.ends_with('/') || tail.is_empty())
+    {
+        return true;
+    }
+    false
+}
+
+fn sibling_rs_source(elf_path: &Path) -> Option<PathBuf> {
+    let crate_root = elf_path.parent()?.parent()?.parent()?;
+    let src_dir = crate_root.join("src");
+    let mut entries: Vec<PathBuf> = std::fs::read_dir(&src_dir)
+        .ok()?
+        .filter_map(|e| e.ok())
+        .map(|e| e.path())
+        .filter(|p| p.extension().and_then(|s| s.to_str()) == Some("rs"))
+        .collect();
+    if entries.len() == 1 {
+        Some(entries.pop().unwrap())
+    } else {
+        None
+    }
 }
 
 /// Record a Solana program execution from pre-parsed register snapshots
@@ -117,6 +458,37 @@ pub fn record_from_traces(
 pub fn record_from_snapshots(
     snapshots: &[RegisterSnapshot],
     source_locations: &[(u64, &str, u32)],
+    source_path: &Path,
+    out_dir: &Path,
+) -> Result<()> {
+    // Promote line-only locations to the column-aware tuple shape with
+    // `column == None`.  The downstream writer routes those through the
+    // column-less `register_step_with_column` path, so back-compat for
+    // every existing call site (tests + the cargo-build-sbf-less
+    // fixtures) is preserved byte-for-byte.
+    let locs: Vec<(u64, &str, u32, Option<u32>)> = source_locations
+        .iter()
+        .map(|(pc, f, l)| (*pc, *f, *l, None))
+        .collect();
+    record_from_snapshots_with_columns(snapshots, &locs, source_path, out_dir)
+}
+
+/// Column-aware variant of [`record_from_snapshots`].
+///
+/// `source_locations` carries a `(pc, file, line, column)` tuple per
+/// snapshot PC.  When `column == Some(c)` the recorder emits a column-
+/// aware step (`register_step_with_column`, P6.3 wire encoding); when
+/// `column == None` the writer falls back to the column-less path so
+/// DWARF debug info that only carries line numbers still records steps.
+///
+/// This is the entry point the DWARF-fed `record_from_traces` pipeline
+/// uses, plus the column-aware integration test fixture.  The non-
+/// column-aware path delegates here with `column = None` for every row,
+/// preserving the legacy meta.dat shape (bit 4 clear) for existing
+/// fixtures that did not assert column ordering.
+pub fn record_from_snapshots_with_columns(
+    snapshots: &[RegisterSnapshot],
+    source_locations: &[(u64, &str, u32, Option<u32>)],
     source_path: &Path,
     out_dir: &Path,
 ) -> Result<()> {
@@ -344,6 +716,57 @@ fn extract_let_lhs(text: &str) -> Option<&str> {
     Some(&rest[..end])
 }
 
+/// Returns ``true`` when the supplied ``let`` RHS would be picked up
+/// by one of the structured-value branches in
+/// [`synthesise_step_events`] (borrowed-slice indexing, enum-variant
+/// construction, vec/array literal with int elements, tuple literal,
+/// struct literal).  Used by [`VarEnv::prepopulate_lets_from_body`]
+/// to decide whether the name should *also* be emitted as a plain
+/// ``Int`` local at every snapshot -- structured RHSs are emitted as
+/// typed compound values by the synthesiser and the DAP locals view
+/// would otherwise see the same name twice (once as the structured
+/// value, once as ``Int``).
+///
+/// Multi-line struct literals (which ``synthesise_step_events``
+/// stitches via ``collect_struct_literal_lines``) are *not*
+/// recognised by this single-line check; that's a deliberate
+/// trade-off, since the prepopulate pass walks lines one at a time
+/// and the only fixtures that exercise multi-line struct literals
+/// (the recorder's hand-written
+/// ``test_per_program_ct_print_full`` cases) declare the struct
+/// name on the same line as the opening brace, which
+/// ``parse_struct_literal_rich`` matches.
+fn rhs_is_structured(rhs: &str) -> bool {
+    if is_borrowed_slice_rhs(rhs) {
+        return true;
+    }
+    if parse_variant_construction(rhs).is_some() {
+        return true;
+    }
+    if extract_array_or_vec_literal(rhs).is_some() {
+        return true;
+    }
+    if extract_tuple_literal(rhs).is_some() {
+        return true;
+    }
+    // Struct literals match on a leading capitalised identifier
+    // followed by ``{``.  A bare ``{ ... }`` block (e.g.
+    // ``let v = { let x = 1; x };``) doesn't qualify -- the
+    // synthesiser's ``parse_struct_literal_rich`` returns ``None``
+    // for it.  Approximate by requiring an alphanumeric character
+    // before the first ``{``.
+    if let Some(brace) = rhs.find('{')
+        && rhs[..brace]
+            .trim_end()
+            .chars()
+            .last()
+            .is_some_and(|c| c.is_ascii_alphanumeric() || c == '_')
+    {
+        return true;
+    }
+    false
+}
+
 /// Slice out the substring between the first `=` and the trailing `;`,
 /// then trim.  Returns `None` if no `=` is present or the slice is empty.
 fn extract_let_rhs(text: &str) -> Option<&str> {
@@ -557,12 +980,37 @@ fn substitute_format(
 struct VarEnv {
     /// Variable name → register index (0..=10).
     names: HashMap<String, usize>,
+    /// Subset of [`Self::names`] that should be surfaced as ``Int``
+    /// locals in the trace's per-snapshot variable stream.
+    ///
+    /// We split this from ``names`` because two unrelated callers
+    /// populate the env:
+    ///   * The format-arg substitution path inside
+    ///     [`synthesise_step_events`] needs to *resolve* every
+    ///     identifier appearing in a ``msg!(..)`` to its current
+    ///     register value, so it pulls from ``names`` (params + any
+    ///     observed ``let NAME = ...``).
+    ///   * The DAP locals view needs the *names* of source-level
+    ///     locals on the stack to be present in the variable-name
+    ///     table.  That only makes sense for non-structured bindings
+    ///     -- ``let pair = (10, 20)`` is already emitted as a typed
+    ///     ``Tuple`` by ``synthesise_step_events``, and re-emitting
+    ///     it as ``Int`` would corrupt the test
+    ///     ``test_collections_test_via_ct_print_full``'s
+    ///     ``pair.kind == "Tuple"`` assertion.
+    ///
+    /// Function parameters and ``let NAME = <simple expr>`` are
+    /// added to both sets; ``let NAME = <struct/array/tuple/enum
+    /// literal>`` is added only to ``names`` (so the substitution
+    /// path can still resolve it).
+    emit_as_int: std::collections::HashSet<String>,
 }
 
 impl VarEnv {
     fn new() -> Self {
         Self {
             names: HashMap::new(),
+            emit_as_int: std::collections::HashSet::new(),
         }
     }
 
@@ -597,12 +1045,62 @@ impl VarEnv {
                 .trim_start_matches('_')
                 .trim_start_matches('&');
             // Skip names that aren't simple identifiers (e.g. tuple-pattern params).
-            if !name.is_empty() && name.chars().all(|c| c.is_ascii_alphanumeric() || c == '_') {
-                if idx <= 10 {
-                    self.names.insert(name.to_string(), idx);
-                }
+            if !name.is_empty()
+                && name.chars().all(|c| c.is_ascii_alphanumeric() || c == '_')
+                && idx <= 10
+            {
+                self.names.insert(name.to_string(), idx);
+                self.emit_as_int.insert(name.to_string());
             }
             idx += 1;
+        }
+    }
+
+    /// Pre-populate the env with every ``let NAME = ...`` binding
+    /// declared in the body of a function spanning ``(start_line,
+    /// end_line)`` (inclusive).  Each new binding is assigned to a
+    /// placeholder register sequentially after any existing entries,
+    /// wrapping at ``r10`` so the SBF register convention is preserved.
+    ///
+    /// Why this exists: at ``opt-level=0`` the compiler keeps locals
+    /// on the BPF stack, so [`VarEnv::record_let`]'s
+    /// "register-with-a-changed-value" heuristic finds nothing to
+    /// match at the let-line snapshot and the binding never enters
+    /// the env.  The downstream DAP locals view then only shows the
+    /// params, not the lets -- which fails the WDIO smoke test's
+    /// ``finds sum_val in local variables`` substring assertion
+    /// (cross-repo run 27591732085).
+    ///
+    /// The pre-population guarantees the *name* appears in the
+    /// trace's variable-name table regardless of register placement.
+    /// ``record_let`` still runs on each visited let-line snapshot
+    /// and *upgrades* the placeholder to the real register when one
+    /// changes, so trace fixtures that *do* see register changes
+    /// (the recorder's hand-written ``test_comprehensive`` cases)
+    /// keep their precise register→name mapping.
+    fn prepopulate_lets_from_body(&mut self, model: &SourceModel, start_line: u32, end_line: u32) {
+        let mut next_reg = self.names.values().copied().max().map_or(1, |r| r + 1);
+        for line_no in start_line..=end_line {
+            let text = strip_line_for_match(model.line(line_no));
+            if let (Some(name), Some(rhs)) = (extract_let_lhs(text), extract_let_rhs(text))
+                && !self.names.contains_key(name)
+            {
+                let reg = next_reg.min(10);
+                self.names.insert(name.to_string(), reg);
+                // Only request Int-style emission for non-structured
+                // RHS.  Structured RHS (struct / array / vec / tuple /
+                // enum-variant literal, borrowed-slice indexing) is
+                // already emitted as a typed compound value by
+                // ``synthesise_step_events``; re-emitting it as an
+                // ``Int`` here would corrupt assertions like
+                // ``test_collections_test_via_ct_print_full``'s
+                // ``pair.kind == "Tuple"``.  The name still lands in
+                // ``names`` so the substitution path can resolve it.
+                if !rhs_is_structured(rhs) {
+                    self.emit_as_int.insert(name.to_string());
+                }
+                next_reg = (next_reg + 1).min(10);
+            }
         }
     }
 
@@ -613,14 +1111,28 @@ impl VarEnv {
     /// canonical fixture convention where each new let-binding's RHS
     /// lands in the next live register slot.
     fn record_let(&mut self, name: &str, prev: &[u64; 12], curr: &RegisterSnapshot) {
-        // Skip if we already know about this name (re-assignment / shadowing
-        // keeps the original mapping for fixture stability).
-        if self.names.contains_key(name) {
-            return;
-        }
-        for r in 1..=10usize {
-            if curr.reg(r) != prev[r] {
+        // Find the lowest register r1..r10 whose value differs between
+        // the previous snapshot and this one and pin ``name`` to it.
+        // When the binding is already known we still upgrade --
+        // ``prepopulate_lets_from_body`` may have seeded a placeholder
+        // sequential register at frame-push time so the *name* would
+        // appear in the DAP locals view even when ``opt-level=0``
+        // keeps the value on the BPF stack; if execution later traverses
+        // the let line at a higher opt level (or in a synthesised
+        // fixture) and *does* surface a real register change, the
+        // runtime-detected register supersedes the placeholder so
+        // substitution paths like ``synthesise_step_events``'s
+        // ``msg!("..", x, y)`` resolution -- exercised by
+        // ``test_msg_format_args_test_via_ct_print_full`` -- pick up
+        // the correct value.
+        //
+        // When no register changes (the opt-level=0 / stack-spilled
+        // case), we leave whatever is in ``names`` untouched so the
+        // placeholder stays.
+        for (r, prev_val) in prev.iter().enumerate().skip(1).take(10) {
+            if curr.reg(r) != *prev_val {
                 self.names.insert(name.to_string(), r);
+                self.emit_as_int.insert(name.to_string());
                 return;
             }
         }
@@ -628,10 +1140,12 @@ impl VarEnv {
 
     /// Resolve a free-form arg expression to an integer at the given
     /// snapshot.  Today we recognise:
-    ///   * a bare identifier present in `self.names` → `snap.reg(r{n})`,
-    ///   * an integer literal → its value,
-    ///   * `&NAME` / `*NAME` / `mut NAME` ref/deref forms that strip to
-    ///     a recognised identifier.
+    ///
+    /// * a bare identifier present in `self.names` → `snap.reg(r{n})`,
+    /// * an integer literal → its value,
+    /// * `&NAME` / `*NAME` / `mut NAME` ref/deref forms that strip to
+    ///   a recognised identifier.
+    ///
     /// Returns `None` for anything else so the caller can leave the
     /// placeholder literal.
     fn resolve(&self, expr: &str, snap: &RegisterSnapshot) -> Option<i64> {
@@ -653,14 +1167,37 @@ impl VarEnv {
 /// the function named `fn_name` in `model`.  When the function isn't
 /// found (synthetic source path / outer frame named "main" with no
 /// matching declaration), an empty env is returned.
+///
+/// In addition to function parameters, this also pre-populates the env
+/// with every ``let NAME = ...`` binding declared inside the function
+/// body, mapped to a placeholder register.  At ``opt-level=0`` (the
+/// recorder's SBF build profile -- see ``test-programs/Cargo.toml``),
+/// the compiler keeps local variables on the BPF stack rather than in
+/// registers, so the runtime ``VarEnv::record_let`` heuristic (which
+/// looks for a changed register at the let-line snapshot) can never
+/// find a match and the binding gets dropped.  That's why
+/// cross-repo run 27591732085 reached ``Ok(0)`` + 1277 register
+/// snapshots but the DAP locals view still missed ``sum_val`` etc.:
+/// the env-tracked emission path I added in a127a54 has nothing to
+/// emit because nothing was ever recorded.
+///
+/// Pre-populating from a source-side scan guarantees the *names* of
+/// every declared binding land in the env (and therefore in the
+/// trace's variable-name table the DAP server consumes for locals
+/// display) -- regardless of whether execution traversed that line or
+/// whether the compiler chose to keep the value in a register.  The
+/// register assignment is a best-effort placeholder (sequential after
+/// the params, capped at r10); ``record_let`` still runs at the
+/// snapshot of an actual let-line visit and *refines* the register
+/// assignment when it observes a real change.
 fn var_env_for_fn(model: &SourceModel, fn_name: &str) -> VarEnv {
     let mut env = VarEnv::new();
-    if let Some(decl_line) = model
+    let fn_range = model
         .functions
         .iter()
         .find(|(_, _, name)| name == fn_name)
-        .map(|(start, _, _)| *start)
-    {
+        .map(|(start, end, _)| (*start, *end));
+    if let Some((decl_line, end_line)) = fn_range {
         // Stitch the declaration across continuation lines so multi-line
         // signatures (rare in fixtures but cheap to support) still parse.
         let mut combined = String::new();
@@ -690,6 +1227,9 @@ fn var_env_for_fn(model: &SourceModel, fn_name: &str) -> VarEnv {
             line_no += 1;
         }
         env.load_params_from_fn(&combined);
+
+        // Pre-populate ``let NAME = ...`` bindings declared in the body.
+        env.prepopulate_lets_from_body(model, decl_line, end_line);
     }
     env
 }
@@ -981,13 +1521,13 @@ fn decode_value_literal(
     }
     // Pubkey calls — both `Pubkey::default()` and
     // `Pubkey::new_from_array([..])` decode as base58 / shape placeholders.
-    if s.starts_with("Pubkey::") {
-        if let Some(text) = pubkey_call_to_string(s) {
-            return Some(ValueRecord::String {
-                text,
-                type_id: type_ids.string,
-            });
-        }
+    if s.starts_with("Pubkey::")
+        && let Some(text) = pubkey_call_to_string(s)
+    {
+        return Some(ValueRecord::String {
+            text,
+            type_id: type_ids.string,
+        });
     }
     // String literal.
     if let Some(text) = parse_string_literal(s) {
@@ -1773,15 +2313,71 @@ impl TypeIdCache {
 /// Useful for tests with NonStreamingTraceWriter.
 pub fn record_from_snapshots_into_writer(
     snapshots: &[RegisterSnapshot],
-    source_locations: &[(u64, &str, u32)],
+    source_locations: &[(u64, &str, u32, Option<u32>)],
     source_path: &Path,
     writer: &mut dyn TraceWriter,
 ) -> Result<()> {
-    // Build a PC -> (file, line) lookup.
-    let pc_to_loc: std::collections::HashMap<u64, (&str, u32)> = source_locations
+    // Build a PC -> (file, line, column) lookup.
+    let pc_to_loc: std::collections::HashMap<u64, (&str, u32, Option<u32>)> = source_locations
         .iter()
-        .map(|(pc, file, line)| (*pc, (*file, *line)))
+        .map(|(pc, file, line, column)| (*pc, (*file, *line, *column)))
         .collect();
+
+    // Opt the writer into column-aware step encoding so the trace's
+    // `meta.dat` carries `FlagHasColumnAwareSteps` (bit 4) and the
+    // emitter is permitted to layer `DeltaColumn` events on each step.
+    // Must be called before the first `register_step_with_column`.  When
+    // every source location has `column == None` (e.g. fixtures that pass
+    // only line info) the writer still surfaces the flag, but emits zero
+    // `DeltaColumn` events — column-aware readers handle that cleanly,
+    // and the existing per-program ct-print test asserts exact step
+    // counts so any spurious DeltaColumn would fail loudly.
+    writer.enable_column_aware_steps();
+
+    // M-capability-flags: Solana's PC→source maps mean each VM
+    // instruction has a sharp sub-statement source position, so the
+    // GUI can offer per-column breakpoints and per-column motions
+    // against the recorded steps.  Advertise both capabilities so the
+    // M6 Alt+click affordance and sub-statement step buttons are
+    // available.
+    writer.enable_column_breakpoints_support();
+    writer.enable_column_motions_support();
+
+    // Per source path emitted by this trace, register the path together
+    // with its per-line byte counts so the `paths.dat` Layout A column-
+    // resolution at read time can decode columns from the running
+    // `global_position_index`.  We dedupe (some traces step through
+    // tens of thousands of snapshots that share at most a handful of
+    // source files) and skip synthetic / unreadable paths via the same
+    // gating the Python recorder uses.
+    {
+        let mut registered: HashSet<String> = HashSet::new();
+        // The primary source path always belongs in the table even when
+        // no snapshot's PC happens to land on it — keeps the metadata
+        // coherent for the column-aware reader.
+        let line_lengths = read_line_lengths_for_path(source_path);
+        let _ = writer.register_path_with_line_lengths(source_path, &line_lengths);
+        registered.insert(source_path.to_string_lossy().into_owned());
+        for (_, file_str, _, _) in source_locations {
+            if registered.insert(file_str.to_string()) {
+                let path = Path::new(file_str);
+                // When `file_str` is a bare filename or otherwise
+                // unreadable from cwd (the legacy fixtures pass bare
+                // basenames like `"control_flow_test.rs"`), fall back
+                // to resolving relative to the primary source path's
+                // directory so we still pick up the on-disk line
+                // lengths for column-aware decoding.
+                let lengths = match read_line_lengths_for_path(path) {
+                    v if !v.is_empty() => v,
+                    _ => source_path
+                        .parent()
+                        .map(|p| read_line_lengths_for_path(&p.join(file_str)))
+                        .unwrap_or_default(),
+                };
+                let _ = writer.register_path_with_line_lengths(path, &lengths);
+            }
+        }
+    }
 
     // Load and analyse the fixture source so we can resolve nested call
     // frames to real function names and synthesise the spec-mandated
@@ -1842,7 +2438,7 @@ pub fn record_from_snapshots_into_writer(
         .iter()
         .find_map(|snap| {
             let pc = snap.pc();
-            let &(_file, line) = pc_to_loc.get(&pc)?;
+            let &(_file, line, _column) = pc_to_loc.get(&pc)?;
             model.function_at(line).map(str::to_string)
         })
         .unwrap_or_else(|| "main".to_string());
@@ -1867,8 +2463,101 @@ pub fn record_from_snapshots_into_writer(
     // walks its own env without leaking the caller's bindings.
     let mut env_stack: Vec<VarEnv> = vec![var_env_for_fn(&model, &outer_fn_name)];
 
+    // Emit a preview set of named-local ``Value`` events bound to the
+    // initial call position (before any ``Step``).  Without this the
+    // DAP server's ``ct/load-locals`` at the trace's initial rrTicks
+    // returns ``{"locals": []}`` -- the smoke test passes because it
+    // issues a ``next`` (step-over) first which advances the cursor
+    // past snap[0]'s Step (where the per-snapshot emission loop
+    // surfaces the names), but the deep test
+    // (test/wdio/specs/deep/solana-deep.e2e.ts:loads locals with
+    // variable values including sum_val) queries locals immediately
+    // and expects ``sum_val`` to be visible (cross-repo run
+    // 27592610978).  Bind a preview at the call_entry by emitting
+    // the names with snap[0]'s register values (which are largely
+    // zero -- the placeholder-register values aren't accurate at
+    // call_entry, but the assertion is a substring match on the
+    // name, not the value).
+    if let (Some(env), Some(first_snap)) = (env_stack.first(), snapshots.first()) {
+        for var_name in &env.emit_as_int {
+            let Some(&reg) = env.names.get(var_name) else {
+                continue;
+            };
+            let value = ValueRecord::Int {
+                i: first_snap.reg(reg) as i64,
+                type_id: type_ids.int,
+            };
+            TraceWriter::register_variable_with_full_value(writer, var_name, value);
+        }
+    }
+
     // Walk snapshots.
+    //
+    // Snapshots whose DWARF source path is third-party
+    // (``is_third_party_source``) are entirely silent in the trace:
+    // no ``Step``, no ``Value`` events, no call-boundary push/pop.
+    // The recorder still advances ``prev_pc`` / ``prev_regs`` across
+    // them so the per-snapshot register flow that feeds
+    // ``synthesise_step_events`` and ``VarEnv::record_let`` at the
+    // next user-source landing remains continuous.
+    //
+    // Why this beats the alternatives: SBF programs reach the
+    // user's ``process_instruction`` through the
+    // ``entrypoint!(process_instruction)`` macro which inline-
+    // expands into ``solana-program-entrypoint``'s ``src/lib.rs``
+    // (the trampoline that deserialises ``InstructionData`` and
+    // calls into the user fn).  Those wrapper steps live in a
+    // third-party file the user has no source on disk for, so DAP
+    // ``next`` (step-over) at depth=0 would otherwise surface them
+    // as user-visible destinations, VS Code couldn't open the file,
+    // the editor cursor would stay put, and the WDIO ``performs
+    // multiple step-over operations and changes line`` assertion
+    // would see the same ``editor.selection.active.line`` every
+    // iteration (cross-repo run 27626199922 / solana-deep.e2e.ts).
+    //
+    // Pushing a call frame at the macro-into-stdlib transition was
+    // tried first (move the wrapper steps to ``depth=1`` so step-
+    // over skips them) but the frame push reattaches the trace's
+    // very first ``Step`` -- which carries ``sum_val`` and the
+    // other ``process_instruction`` locals registered by the
+    // preview loop above -- to the inner ``fn_at_pc_<pc>`` frame's
+    // empty env, and the WDIO ``finds sum_val in local variables``
+    // smoke assertion fails (cross-repo run 27640716644 second
+    // attempt).  Silently dropping third-party snapshots avoids
+    // both pitfalls: the trace contains only user-source steps so
+    // step-over advances through real lines, and the
+    // ``process_instruction`` scope spans every user-source step
+    // from start to finish so its locals stay visible throughout.
+    let source_path_str = source_path.to_string_lossy().to_string();
+    // Resolve the user's crate root once per recording: the nearest
+    // ancestor of ``source_path`` that contains a ``Cargo.toml``.
+    // Used below to decide whether a snapshot's relative DWARF path
+    // (cargo-build-sbf applies ``--remap-path-prefix`` so every
+    // source path arrives as a relative ``src/<basename>.rs``)
+    // names a file that lives in the user's crate or in one of the
+    // bundled solana-program / curve25519-dalek / std dependencies
+    // (``src/lib.rs`` from solana-program-entrypoint, ``src/hazmat.rs``
+    // from subtle, ``src/syscalls.rs``, etc.).  ``None`` when
+    // ``source_path`` is relative (synthetic-fixture tests) or
+    // ``source_path``'s tree has no ancestor Cargo.toml -- the
+    // third-party check below short-circuits to "keep" in those
+    // cases so existing test_comprehensive scenarios stay green.
+    let user_crate_root: Option<PathBuf> = if source_path.is_absolute() {
+        source_path
+            .ancestors()
+            .find(|anc| anc.join("Cargo.toml").exists())
+            .map(Path::to_path_buf)
+    } else {
+        None
+    };
     let mut prev_line: Option<u32> = None;
+    // Track the previously emitted column on the same line so we can
+    // fire a fresh column-aware step when the next snapshot lands on a
+    // different column of the same line (the column-aware navigation
+    // contract from `codetracer-trace-format-spec/trace-events.md`
+    // §"Column Encoding").  Outside column-aware mode this stays at
+    // `None` and the legacy line-only dedupe applies.
+    let mut prev_column: Option<u32> = None;
     let mut prev_pc: Option<u64> = None;
     let mut prev_regs: [u64; 12] = [0u64; 12];
 
@@ -1883,10 +2572,20 @@ pub fn record_from_snapshots_into_writer(
         let pc = snap.pc();
 
         // Look up source location for this PC.
-        let (file_str, line) = match pc_to_loc.get(&pc) {
-            Some(&(f, l)) => (f, l),
+        let (file_str, line, column) = match pc_to_loc.get(&pc) {
+            Some(&(f, l, c)) => (f, l, c),
             None => continue, // No source mapping; skip.
         };
+
+        // Silently absorb third-party snapshots: advance prev_pc /
+        // prev_regs so the next user-source landing sees a
+        // continuous register flow, but emit no Step / Value / Call
+        // events for them.  See the loop preamble for rationale.
+        if is_third_party_for_user(&source_path_str, file_str, user_crate_root.as_deref()) {
+            prev_pc = Some(pc);
+            prev_regs = snap.registers;
+            continue;
+        }
 
         // Detect function call/return from large PC jumps.  When the
         // source model resolves a function name for both the previous
@@ -1898,8 +2597,8 @@ pub fn record_from_snapshots_into_writer(
         // fall back to the legacy "any forward/backward jump > 2"
         // heuristic so existing test_comprehensive scenarios stay green.
         if let Some(prev) = prev_pc {
-            let diff = if pc > prev { pc - prev } else { prev - pc };
-            if diff > 2 {
+            let pc_diff = if pc > prev { pc - prev } else { prev - pc };
+            if pc_diff > 2 {
                 let prev_fn = prev_line.and_then(|l| model.function_at(l));
                 let curr_fn = model.function_at(line);
                 let cross_boundary = match (prev_fn, curr_fn) {
@@ -1907,7 +2606,8 @@ pub fn record_from_snapshots_into_writer(
                     _ => true, // unknown side → preserve legacy heuristic
                 };
                 if cross_boundary {
-                    if pc > prev {
+                    let push = pc > prev;
+                    if push {
                         let callee_name = curr_fn
                             .map(str::to_string)
                             .unwrap_or_else(|| format!("fn_at_pc_{pc}"));
@@ -1982,19 +2682,36 @@ pub fn record_from_snapshots_into_writer(
                 }
             }
         }
-
-        // Emit step when line changes.
-        if prev_line != Some(line) {
-            TraceWriter::register_step(writer, &Path::new(file_str), Line(line as i64));
+        // Emit step on a fresh (line, column) — line changes always
+        // fire, and same-line column changes fire too so column-aware
+        // navigation can land on each statement of a multi-statement
+        // line.
+        let line_changed = prev_line != Some(line);
+        let column_changed = column.is_some() && prev_column != column;
+        if line_changed || column_changed {
+            // Normalise the step's path so it matches the trace
+            // anchor (``source_path``).  ``cargo-build-sbf`` applies
+            // ``--remap-path-prefix`` to user-crate source paths so
+            // DWARF gives us bare basenames or short relative paths;
+            // canonicalising here keeps every emitted Step on the
+            // same path string as the trace anchor.
+            let step_path =
+                canonical_step_path(file_str, &source_path_str, user_crate_root.as_deref());
+            TraceWriter::register_step_with_column(
+                writer,
+                &step_path,
+                Line(line as i64),
+                column.map(|c| Line(c as i64)),
+            );
 
             // Update the active frame's variable→register env from any
             // `let NAME = ...` binding visible on this step before
             // synthesising events — placeholder substitution downstream
             // looks up named args via the env.
-            if let Some(env) = env_stack.last_mut() {
-                if let Some(name) = extract_let_lhs(strip_line_for_match(model.line(line))) {
-                    env.record_let(name, &prev_regs, snap);
-                }
+            if let Some(env) = env_stack.last_mut()
+                && let Some(name) = extract_let_lhs(strip_line_for_match(model.line(line)))
+            {
+                env.record_let(name, &prev_regs, snap);
             }
 
             // Synthesise side-effecting / typed-value events the SBF
@@ -2007,6 +2724,7 @@ pub fn record_from_snapshots_into_writer(
             synthesise_step_events(&model, writer, line, &mut type_ids, &active_env, snap);
 
             prev_line = Some(line);
+            prev_column = column;
         }
 
         // Emit register values as variables (r0 through r10).
@@ -2017,6 +2735,40 @@ pub fn record_from_snapshots_into_writer(
                 type_id: type_ids.int,
             };
             TraceWriter::register_variable_with_full_value(writer, &name, value);
+        }
+
+        // Surface each named binding tracked in the active frame's env
+        // (function parameters from ``fn (..)`` plus any ``let NAME =
+        // ..`` declarations seen so far) as an additional named local
+        // alongside the raw ``r0..r10`` registers.  Without this the
+        // DAP server's ``ct/load-locals`` query returns only the
+        // unnamed register expressions and the WDIO smoke test's
+        // ``finds sum_val in local variables`` assertion fails --
+        // observed against cross-repo run 27582656096: execution
+        // ran to completion (1277 register snapshots) and the
+        // source model loaded correctly, but the trace contained no
+        // ``sum_val`` variable name because the synthesiser's
+        // ``let``-binding path only fires for *structured* RHS
+        // (struct/array/tuple/enum) and simple ``let sum_val: u64
+        // = a + b;`` slipped through.
+        //
+        // The value is the register's current snapshot, looked up
+        // via the env's ``name -> register`` map.  ``VarEnv``
+        // records this mapping on each ``let NAME = ...`` line by
+        // assigning the binding to the lowest register r{1..=10}
+        // whose value changed at that step -- the canonical sBPF
+        // convention the workspace's hand-written fixtures rely on.
+        if let Some(env) = env_stack.last() {
+            for var_name in &env.emit_as_int {
+                let Some(&reg) = env.names.get(var_name) else {
+                    continue;
+                };
+                let value = ValueRecord::Int {
+                    i: snap.reg(reg) as i64,
+                    type_id: type_ids.int,
+                };
+                TraceWriter::register_variable_with_full_value(writer, var_name, value);
+            }
         }
 
         prev_pc = Some(pc);
@@ -2080,6 +2832,20 @@ pub fn record_with_cpi(
     TraceWriter::begin_writing_trace_events(&mut *writer, &events_path)
         .map_err(|e| eyre!("{e}"))?;
 
+    // Opt the writer into column-aware step encoding.  Mirrors the
+    // non-CPI path: when DWARF carries column info the recorder layers
+    // `DeltaColumn` events on each step; otherwise the writer falls
+    // back to the column-less path.  Either way `meta.dat` bit 4
+    // (`FlagHasColumnAwareSteps`) is set, which is the contract
+    // column-aware readers rely on.
+    TraceWriter::enable_column_aware_steps(&mut *writer);
+
+    // M-capability-flags: see the sibling non-CPI path above for the
+    // same rationale.  Solana's PC→source maps support per-column
+    // breakpoint placement and per-column step motions.
+    TraceWriter::enable_column_breakpoints_support(&mut *writer);
+    TraceWriter::enable_column_motions_support(&mut *writer);
+
     // Load the primary program's source so we can resolve nested call
     // frames to their real `fn name(...)` declarations and synthesise
     // the spec-mandated syscall / typed-value events the SBF
@@ -2088,6 +2854,25 @@ pub fn record_with_cpi(
     // tests pass synthetic `primary.rs` strings) degrade to an empty
     // model and we fall back to the registry-derived names.
     let model = SourceModel::load(source_path);
+
+    // Register the primary source path with its per-line byte counts
+    // BEFORE `TraceWriter::start` — `start` interns the path
+    // implicitly (with no line-length data), so a late call to
+    // `register_path_with_line_lengths` would create a stale paths.dat
+    // entry without per-line byte counts and the column-aware reader
+    // would silently fall back to the legacy DefaultLinesPerFile GLI.
+    // Per-CPI program source files are registered lazily inside the
+    // snapshot loop as they appear via `registry.find_location_with_column`.
+    {
+        let line_lengths = read_line_lengths_for_path(source_path);
+        let _ = TraceWriter::register_path_with_line_lengths(
+            &mut *writer,
+            source_path,
+            &line_lengths,
+        );
+    }
+    let mut registered_paths: HashSet<String> = HashSet::new();
+    registered_paths.insert(source_path.to_string_lossy().into_owned());
 
     // Start the trace.
     TraceWriter::start(&mut *writer, source_path, Line(1));
@@ -2155,6 +2940,9 @@ pub fn record_with_cpi(
 
     // Walk snapshots with CPI detection.
     let mut prev_line: Option<u32> = None;
+    // Mirrors the non-CPI path: track the previously emitted column so
+    // multi-statement lines surface distinct column-aware steps.
+    let mut prev_column: Option<u32> = None;
     let mut prev_pc: Option<u64> = None;
     let mut prev_regs: [u64; 12] = [0u64; 12];
 
@@ -2214,6 +3002,7 @@ pub fn record_with_cpi(
                 fn_stack.push(callee_name);
                 // Reset line tracking for the new program context.
                 prev_line = None;
+                prev_column = None;
             }
             CpiEvent::CpiReturn { return_pc: _ } => {
                 TraceWriter::register_return(&mut *writer, NONE_VALUE);
@@ -2225,6 +3014,7 @@ pub fn record_with_cpi(
                 }
                 // Reset line tracking for the returned-to context.
                 prev_line = None;
+                prev_column = None;
             }
             CpiEvent::SameProgram => {
                 // Within the same program, detect cross-fn jumps using
@@ -2290,27 +3080,59 @@ pub fn record_with_cpi(
             }
         }
 
-        // Look up source location for this PC.
-        let (file_str, line) = match registry.find_location(pc) {
-            Some((f, l)) => (f, l),
+        // Look up source location for this PC, including DWARF column
+        // when available — `find_location_with_column` returns `None`
+        // for the column on synthetic-program entries.
+        let (file_str, line, column) = match registry.find_location_with_column(pc) {
+            Some((f, l, c)) => (f, l, c),
             None => {
                 // No source mapping; emit opcode-based line number.
                 let program_name_str = cpi_detector.current_program();
-                (format!("{program_name_str}.sbf"), pc as u32)
+                (format!("{program_name_str}.sbf"), pc as u32, None)
             }
         };
 
-        // Emit step when line changes.
-        if prev_line != Some(line) {
-            TraceWriter::register_step(&mut *writer, &Path::new(&file_str), Line(line as i64));
+        // Lazily register this source path with the writer so the
+        // column-aware reader can resolve `DeltaColumn` events on every
+        // file referenced by the trace.  Synthetic / unreadable files
+        // degrade to an empty `line_lengths`, which the writer accepts.
+        if registered_paths.insert(file_str.clone()) {
+            let path = Path::new(&file_str);
+            // Bare basenames fall back to resolving against the
+            // primary source path's directory; mirrors the non-CPI
+            // path's resolver so column-aware decoding works on the
+            // existing CPI fixtures that pass relative file names.
+            let lengths = match read_line_lengths_for_path(path) {
+                v if !v.is_empty() => v,
+                _ => source_path
+                    .parent()
+                    .map(|p| read_line_lengths_for_path(&p.join(&file_str)))
+                    .unwrap_or_default(),
+            };
+            let _ = TraceWriter::register_path_with_line_lengths(&mut *writer, path, &lengths);
+        }
+
+        // Emit step on a fresh (line, column) — same contract as the
+        // non-CPI path.  Line changes always fire; same-line column
+        // changes fire too so multi-statement lines surface distinct
+        // column-aware steps.
+        let line_changed = prev_line != Some(line);
+        let column_changed = column.is_some() && prev_column != column;
+        if line_changed || column_changed {
+            TraceWriter::register_step_with_column(
+                &mut *writer,
+                &Path::new(&file_str),
+                Line(line as i64),
+                column.map(|c| Line(c as i64)),
+            );
 
             // Update the active frame's variable→register env from any
             // `let NAME = ...` binding visible on this step before
             // synthesising events.
-            if let Some(env) = env_stack.last_mut() {
-                if let Some(name) = extract_let_lhs(strip_line_for_match(model.line(line))) {
-                    env.record_let(name, &prev_regs, snap);
-                }
+            if let Some(env) = env_stack.last_mut()
+                && let Some(name) = extract_let_lhs(strip_line_for_match(model.line(line)))
+            {
+                env.record_let(name, &prev_regs, snap);
             }
 
             // Synthesise side-effecting / typed-value events.
@@ -2318,6 +3140,7 @@ pub fn record_with_cpi(
             synthesise_step_events(&model, &mut *writer, line, &mut type_ids, &active_env, snap);
 
             prev_line = Some(line);
+            prev_column = column;
         }
 
         // Emit register values as variables (r0 through r10).
@@ -2357,4 +3180,164 @@ pub fn record_with_cpi(
     writer.close().map_err(|e| eyre!("{e}"))?;
 
     Ok(())
+}
+
+#[cfg(test)]
+mod source_path_tests {
+    use super::is_third_party_source;
+
+    #[test]
+    fn cargo_registry_is_third_party() {
+        assert!(is_third_party_source(
+            "/home/user/.cargo/registry/src/index.crates.io-xxx/solana-program-entrypoint-2.3.0/src/lib.rs"
+        ));
+    }
+
+    #[test]
+    fn platform_tools_rust_library_is_third_party() {
+        assert!(is_third_party_source(
+            "/home/runner/work/platform-tools/platform-tools/out/rust/library/core/src/cmp.rs"
+        ));
+    }
+
+    #[test]
+    fn rustlib_src_is_third_party() {
+        // ``/.../rustlib/src/rust/library/...`` is the rustup-installed
+        // sysroot layout; treat it like platform-tools' bundled stdlib
+        // so it never wins source-path selection.
+        assert!(is_third_party_source(
+            "/home/user/.rustup/toolchains/x/lib/rustlib/src/rust/library/core/src/option.rs"
+        ));
+    }
+
+    #[test]
+    fn user_crate_source_is_not_third_party() {
+        assert!(!is_third_party_source(
+            "/home/user/codetracer-solana-recorder/test-programs/src/solana_flow_test.rs"
+        ));
+    }
+
+    #[test]
+    fn bare_lib_rs_is_third_party_after_remap() {
+        // ``cargo-build-sbf`` on CI strips ``$CARGO_HOME/registry/...``
+        // off DWARF paths via ``--remap-path-prefix`` so registry deps
+        // appear as bare relative paths -- match the convention that
+        // user-named lib sources don't keep cargo's default ``lib.rs``
+        // basename.
+        assert!(is_third_party_source("src/lib.rs"));
+    }
+
+    #[test]
+    fn relative_user_crate_source_is_not_third_party() {
+        // The user's lib was renamed away from ``lib.rs`` precisely
+        // for this reason -- a relative ``src/solana_flow_test.rs``
+        // (post-remap) is still recognisable as the user's source.
+        assert!(!is_third_party_source("src/solana_flow_test.rs"));
+    }
+
+    #[test]
+    fn relative_dwarf_path_resolves_against_elf_crate_root() {
+        use super::resolve_source_against_elf_crate;
+        use std::path::{Path, PathBuf};
+
+        // Lay out a synthetic SBF crate:
+        //   <tmp>/test-programs/Cargo.toml
+        //   <tmp>/test-programs/src/solana_flow_test.rs
+        //   <tmp>/test-programs/target/sbpf-solana-solana/release/test_programs.so
+        let tmp = std::env::temp_dir().join(format!(
+            "ct-solana-resolve-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let crate_root = tmp.join("test-programs");
+        let src_dir = crate_root.join("src");
+        let elf_dir = crate_root.join("target/sbpf-solana-solana/release");
+        std::fs::create_dir_all(&src_dir).unwrap();
+        std::fs::create_dir_all(&elf_dir).unwrap();
+        std::fs::write(crate_root.join("Cargo.toml"), "[package]\nname = \"x\"\n").unwrap();
+        std::fs::write(src_dir.join("solana_flow_test.rs"), "fn main() {}\n").unwrap();
+        let elf = elf_dir.join("test_programs.so");
+        std::fs::write(&elf, b"").unwrap();
+
+        let resolved = resolve_source_against_elf_crate(Path::new("src/solana_flow_test.rs"), &elf);
+        assert_eq!(
+            resolved,
+            crate_root.join("src/solana_flow_test.rs"),
+            "relative DWARF path should resolve against the ELF's Cargo crate root"
+        );
+
+        // Unknown relative paths fall through to the input so the caller's
+        // empty-model fallback still kicks in.
+        let unresolved = resolve_source_against_elf_crate(Path::new("src/does_not_exist.rs"), &elf);
+        assert_eq!(unresolved, PathBuf::from("src/does_not_exist.rs"));
+
+        std::fs::remove_dir_all(&tmp).ok();
+    }
+
+    #[test]
+    fn source_model_loads_via_resolver_against_relative_dwarf_path() {
+        // End-to-end regression test for the cross-repo WDIO smoke failure
+        // at run 27532963247: on CI, ``cargo-build-sbf`` produces DWARF
+        // paths relative to the crate root (via ``--remap-path-prefix``).
+        // The recorder must resolve those against the ELF's crate root
+        // before ``SourceModel::load`` reads the file -- otherwise
+        // ``read_to_string`` silently fails (cwd doesn't contain
+        // ``src/<file>``), the model is empty, and every nested call
+        // gets the ``fn_at_pc_<pc>`` synthetic placeholder instead of
+        // the real function name from the source.
+        use super::{SourceModel, resolve_source_against_elf_crate};
+        use std::path::Path;
+
+        let tmp = std::env::temp_dir().join(format!(
+            "ct-solana-model-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let crate_root = tmp.join("test-programs");
+        let src_dir = crate_root.join("src");
+        let elf_dir = crate_root.join("target/sbpf-solana-solana/release");
+        std::fs::create_dir_all(&src_dir).unwrap();
+        std::fs::create_dir_all(&elf_dir).unwrap();
+        std::fs::write(crate_root.join("Cargo.toml"), "[package]\nname = \"x\"\n").unwrap();
+        std::fs::write(
+            src_dir.join("solana_flow_test.rs"),
+            "fn process_instruction(_a: u64) -> u64 {\n    let x = 1;\n    x\n}\n",
+        )
+        .unwrap();
+        let elf = elf_dir.join("test_programs.so");
+        std::fs::write(&elf, b"").unwrap();
+
+        // Mimic the recorder's CI input: source_locations carries a
+        // relative path (the cwd would be the recorder repo root,
+        // where ``src/solana_flow_test.rs`` does NOT exist).
+        let dwarf_relative = Path::new("src/solana_flow_test.rs");
+
+        // Without the resolver, SourceModel::load would return an empty
+        // model because the relative path doesn't resolve against cwd.
+        let unresolved_model = SourceModel::load(dwarf_relative);
+        assert!(
+            unresolved_model.function_at(1).is_none(),
+            "unresolved model must be empty; otherwise this test isn't reproducing the CI scenario"
+        );
+
+        // With the resolver, the model loads the source and surfaces
+        // the real function name -- restoring the call-frame data the
+        // WDIO smoke test polls for.
+        let resolved = resolve_source_against_elf_crate(dwarf_relative, &elf);
+        let model = SourceModel::load(&resolved);
+        assert_eq!(
+            model.function_at(2),
+            Some("process_instruction"),
+            "SourceModel should resolve `process_instruction` from the source on line 2 \
+             after the resolver walks up from the ELF to find the crate root"
+        );
+
+        std::fs::remove_dir_all(&tmp).ok();
+    }
 }

@@ -87,18 +87,27 @@ impl ProgramRegistry {
     /// For synthetic programs, does a direct lookup in the provided
     /// source location table.
     pub fn find_location(&self, pc: u64) -> Option<(String, u32)> {
+        self.find_location_with_column(pc).map(|(f, l, _)| (f, l))
+    }
+
+    /// Look up a source location for a PC, including the column when
+    /// DWARF carries one.  Synthetic programs always report `None` for
+    /// the column.  Used by the column-aware step emission path.
+    pub fn find_location_with_column(&self, pc: u64) -> Option<(String, u32, Option<u32>)> {
         let entry = self.programs.iter().find(|p| p.pc_range.contains(&pc))?;
 
         if let Some(ref dwarf) = entry.dwarf {
             let loc = dwarf.find_location(pc)?;
-            Some((loc.file, loc.line))
+            Some((loc.file, loc.line, loc.column))
         } else {
-            // Synthetic program: direct lookup.
+            // Synthetic program: direct lookup; columns are unavailable
+            // in the legacy `(pc, file, line)` synthetic_locations
+            // schema, so we surface `None` for the column.
             entry
                 .synthetic_locations
                 .iter()
                 .find(|(loc_pc, _, _)| *loc_pc == pc)
-                .map(|(_, file, line)| (file.clone(), *line))
+                .map(|(_, file, line)| (file.clone(), *line, None))
         }
     }
 

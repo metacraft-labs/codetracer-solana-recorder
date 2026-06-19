@@ -91,10 +91,21 @@ pub struct CodeTracerTracer {
     u64_type_id: Option<codetracer_trace_types::TypeId>,
     /// Previous source line (for dedup).
     prev_line: Option<u32>,
+    /// Previous source column (for column-aware same-line dedup).
+    /// Tracks the last column emitted on `prev_line` so multi-statement
+    /// lines surface a fresh step on each column change, matching the
+    /// column-aware navigation contract from the JS recorder fixture
+    /// (`codetracer-js-recorder/tests/integration/column-aware.test.ts`).
+    prev_column: Option<u32>,
     /// Previous PC (for call/return heuristic).
     prev_pc: Option<u64>,
-    /// Source location table: (pc, file, line).
-    source_locations: std::collections::HashMap<u64, (String, u32)>,
+    /// Source location table: pc -> (file, line, optional column).
+    /// The column is `None` for DWARF entries that only carry line info
+    /// and for legacy callers that pass the line-only `(pc, file, line)`
+    /// tuple shape via [`Self::new`].  When `Some`, the recorder emits a
+    /// column-aware step (`register_step_with_column`) so column-aware
+    /// readers can navigate to the exact statement on the line.
+    source_locations: std::collections::HashMap<u64, (String, u32, Option<u32>)>,
     /// Output directory (kept for reference).
     _out_dir: std::path::PathBuf,
     /// Whether `on_start` has been called.
@@ -119,6 +130,29 @@ impl CodeTracerTracer {
         out_dir: &Path,
         source_locations: Vec<(u64, String, u32)>,
     ) -> Result<Self> {
+        // Promote line-only callers to the column-aware tuple shape
+        // with `column == None`.  Existing fixtures keep working
+        // byte-for-byte (the writer falls back to the column-less step
+        // path when `column` is `None`).
+        let with_cols: Vec<(u64, String, u32, Option<u32>)> = source_locations
+            .into_iter()
+            .map(|(pc, f, l)| (pc, f, l, None))
+            .collect();
+        Self::new_with_columns(source_path, out_dir, with_cols)
+    }
+
+    /// Column-aware variant of [`Self::new`].
+    ///
+    /// `source_locations` carries a `(pc, file, line, column)` tuple
+    /// per PC.  When `column == Some(c)` the tracer emits a column-
+    /// aware step on transitions to that line, so column-aware readers
+    /// (e.g. `ct-print --full`) can resolve the exact statement.  When
+    /// `column == None` the writer falls back to the column-less path.
+    pub fn new_with_columns(
+        source_path: &Path,
+        out_dir: &Path,
+        source_locations: Vec<(u64, String, u32, Option<u32>)>,
+    ) -> Result<Self> {
         std::fs::create_dir_all(out_dir).map_err(|e| eyre!("cannot create output dir: {e}"))?;
 
         let program_name = source_path.to_string_lossy();
@@ -130,6 +164,49 @@ impl CodeTracerTracer {
         TraceWriter::begin_writing_trace_events(&mut *writer, &events_path)
             .map_err(|e| eyre!("{e}"))?;
 
+        // Opt the writer into column-aware step encoding before any
+        // step is emitted.  `meta.dat` bit 4 (`FlagHasColumnAwareSteps`)
+        // is set unconditionally; readers that only understand the
+        // legacy line-only encoding reject the trace cleanly via the
+        // reserved-bits check.
+        TraceWriter::enable_column_aware_steps(&mut *writer);
+
+        // M-capability-flags: the Solana recorder ships sbpf/RBPF PC
+        // → source maps that resolve each VM instruction to a single
+        // sub-statement on the source line, so both per-column
+        // breakpoints and per-column motions are well-defined.
+        // Advertise both capabilities to the GUI.
+        TraceWriter::enable_column_breakpoints_support(&mut *writer);
+        TraceWriter::enable_column_motions_support(&mut *writer);
+
+        // Pre-register every distinct source path together with its
+        // per-line byte counts BEFORE `TraceWriter::start` — `start`
+        // implicitly interns the primary path with no line-length
+        // data, so calling `register_path_with_line_lengths` after
+        // `start` would create a paths.dat entry without per-line
+        // counts and the column-aware reader would silently fall back
+        // to the legacy DefaultLinesPerFile GLI.
+        let mut registered: std::collections::HashSet<String> = std::collections::HashSet::new();
+        registered.insert(source_path.to_string_lossy().into_owned());
+        {
+            let line_lengths = crate::recorder::read_line_lengths_for_path(source_path);
+            let _ = TraceWriter::register_path_with_line_lengths(
+                &mut *writer,
+                source_path,
+                &line_lengths,
+            );
+        }
+        let mut loc_map: std::collections::HashMap<u64, (String, u32, Option<u32>)> =
+            std::collections::HashMap::with_capacity(source_locations.len());
+        for (pc, file, line, column) in source_locations {
+            if registered.insert(file.clone()) {
+                let p = Path::new(&file);
+                let lengths = crate::recorder::read_line_lengths_for_path(p);
+                let _ = TraceWriter::register_path_with_line_lengths(&mut *writer, p, &lengths);
+            }
+            loc_map.insert(pc, (file, line, column));
+        }
+
         TraceWriter::start(&mut *writer, source_path, Line(1));
 
         let u64_type_id = TraceWriter::ensure_type_id(&mut *writer, TypeKind::Int, "u64");
@@ -138,15 +215,11 @@ impl CodeTracerTracer {
             TraceWriter::ensure_function_id(&mut *writer, "main", source_path, Line(1));
         TraceWriter::register_call(&mut *writer, main_fn_id, vec![]);
 
-        let loc_map = source_locations
-            .into_iter()
-            .map(|(pc, file, line)| (pc, (file, line)))
-            .collect();
-
         Ok(Self {
             writer,
             u64_type_id: Some(u64_type_id),
             prev_line: None,
+            prev_column: None,
             prev_pc: None,
             source_locations: loc_map,
             _out_dir: out_dir.to_path_buf(),
@@ -178,8 +251,8 @@ impl SbpfTracer for CodeTracerTracer {
             return;
         }
 
-        let (file_str, line) = match self.source_locations.get(&pc) {
-            Some((f, l)) => (f.clone(), *l),
+        let (file_str, line, column) = match self.source_locations.get(&pc) {
+            Some((f, l, c)) => (f.clone(), *l, *c),
             None => return,
         };
 
@@ -199,10 +272,21 @@ impl SbpfTracer for CodeTracerTracer {
             }
         }
 
-        // Emit step on line change.
-        if self.prev_line != Some(line) {
-            TraceWriter::register_step(&mut *self.writer, &Path::new(&file_str), Line(line as i64));
+        // Emit step on fresh (line, column).  Line changes always
+        // fire; same-line column changes fire too so multi-statement
+        // lines surface distinct steps.  When `column` is `None` the
+        // wrapper falls back to the column-less `register_step` path.
+        let line_changed = self.prev_line != Some(line);
+        let column_changed = column.is_some() && self.prev_column != column;
+        if line_changed || column_changed {
+            TraceWriter::register_step_with_column(
+                &mut *self.writer,
+                &Path::new(&file_str),
+                Line(line as i64),
+                column.map(|c| Line(c as i64)),
+            );
             self.prev_line = Some(line);
+            self.prev_column = column;
         }
 
         // Emit register values.

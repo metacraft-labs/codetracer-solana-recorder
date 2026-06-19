@@ -211,7 +211,7 @@ impl<'a> BorshDecoder<'a> {
 
     /// Read a single `u8`.
     pub fn read_u8(&mut self) -> Result<u8> {
-        ensure!(self.pos + 1 <= self.data.len(), "not enough data for u8");
+        ensure!(self.pos < self.data.len(), "not enough data for u8");
         let v = self.data[self.pos];
         self.pos += 1;
         Ok(v)
