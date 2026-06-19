@@ -48,24 +48,30 @@ jobs:
           env-flavor: nix
           gh-token: ${{ secrets.GITHUB_TOKEN }}
 
-      - name: Build Nim trace writer library + ct-print
-        # solana's tests/test_comprehensive.rs shells out to
-        # ../codetracer-trace-format-nim/ct-print for golden
-        # CTFS-decode assertions; build both the FFI static lib
-        # AND the ct-print binary via the dev shell.
-        # TODO: replace with `direnv exec ../codetracer-trace-format-nim
-        # just build-trace-writer-lib build-ct-print` once the
-        # sibling repo ships those targets -- per
-        # cross-repo-builds.md.
+      - name: Build Nim trace writer artifacts (sibling)
         run: |
-          dev-exec bash -c '
-            set -euo pipefail
-            cd "${GITHUB_WORKSPACE}/../codetracer-trace-format-nim"
-            nimble install -y stew results
-            nim c --app:staticlib --mm:arc --noMain -d:release -p:src \
-              -o:libcodetracer_trace_writer.a src/codetracer_trace_writer_ffi.nim
-            nim c -d:release -p:src -o:ct-print src/codetracer_ct_print.nim
-          '
+          nix develop --accept-flake-config --impure --expr '
+            let
+              flake = builtins.getFlake (toString ./.);
+              pkgs = import flake.inputs.nixpkgs { system = builtins.currentSystem; };
+            in
+              pkgs.mkShell {
+                packages = [
+                  pkgs.nim
+                  pkgs.nimble
+                  pkgs.zstd
+                  pkgs.gcc
+                ];
+              }
+          ' -c bash -c '
+              set -euo pipefail
+              cd "${GITHUB_WORKSPACE}/../codetracer-trace-format-nim"
+              nimble install -y --depsOnly
+              nimble buildStaticLib
+              nimble buildCtPrint
+              test -f libcodetracer_trace_writer.a
+              test -x ct-print
+            '
           echo "CODETRACER_NIM_LIB_DIR=${GITHUB_WORKSPACE}/../codetracer-trace-format-nim" >> "$GITHUB_ENV"
 
       - name: Lint
