@@ -3,12 +3,10 @@
 
   nixConfig = {
     extra-substituters = [
-      "https://mcl-blockchain-packages.cachix.org"
-      "https://nix-blockchain-development.cachix.org"
+      "https://cache.metacraft-labs.com/metacraft-public"
     ];
     extra-trusted-public-keys = [
-      "mcl-blockchain-packages.cachix.org-1:qoEiUyBgNXmgJTThjbjO//XA9/6tCmx/OohHHt9hWVY="
-      "nix-blockchain-development.cachix.org-1:Ekei3RuW3Se+P/UIo6Q/oAgor/fVhFuuuX5jR8K/cdg="
+      "metacraft-public:UtS6PK+p0uZaJK3i/jD2DQOjTpddhQUQmNQDQih5N4Q="
     ];
   };
 
