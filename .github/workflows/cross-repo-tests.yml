@@ -277,6 +277,218 @@ jobs:
           git clone "https://x-access-token:${GH_TOKEN}@github.com/metacraft-labs/codetracer-trace-format.git" "$DEST"
           git -C "$DEST" checkout "$TF_REF"
 
+      - name: Clone codetracer-trace-format-nim into codetracer/libs (CI override)
+        env:
+          GH_TOKEN: ${{ steps.app-token.outputs.token }}
+        # The overridden trace-format build.rs resolves the Nim FFI
+        # repo as a sibling of its source root.  With the override above,
+        # that means codetracer/libs/codetracer-trace-format-nim, not only
+        # the recorder-level sibling checkout.
+        run: |
+          PINS="$GITHUB_WORKSPACE/.github/sibling-pins"
+          TFN_REF="$(grep '^codetracer-trace-format-nim ' "$PINS" | cut -d' ' -f2)"
+          DEST="$GITHUB_WORKSPACE/../codetracer/libs/codetracer-trace-format-nim"
+          rm -rf "$DEST"
+          git clone "https://x-access-token:${GH_TOKEN}@github.com/metacraft-labs/codetracer-trace-format-nim.git" "$DEST"
+          git -C "$DEST" checkout --detach "$TFN_REF"
+
+      - name: Patch codetracer Nix trace-format-nim sibling
+        # The CodeTracer db-backend Nix derivation copies the overridden
+        # codetracer-trace-format source into the build sandbox at
+        # $sourceRoot/../codetracer-trace-format. codetracer_trace_writer_nim's
+        # build.rs then resolves codetracer-trace-format-nim as the sibling
+        # $sourceRoot/../codetracer-trace-format-nim, so the workspace clone
+        # under codetracer/libs is not enough by itself.
+        run: |
+          FLAKE_NIX="$GITHUB_WORKSPACE/../codetracer/flake.nix"
+          DEFAULT_NIX="$GITHUB_WORKSPACE/../codetracer/nix/packages/default.nix"
+          INPUT_MARKER="codetracer-trace-format-nim-ci-input"
+          MARKER="codetracer-trace-format-nim-ci-sibling"
+          NEEDLE="cp -r \${inputs.codetracer-trace-format} \$sourceRoot/../codetracer-trace-format"
+
+          brace_delta() {
+            local line="${1%%#*}"
+            local delta=0
+            local i ch
+            for ((i = 0; i < ${#line}; i++)); do
+              ch="${line:i:1}"
+              if [ "$ch" = "{" ]; then
+                delta=$((delta + 1))
+              elif [ "$ch" = "}" ]; then
+                delta=$((delta - 1))
+              fi
+            done
+            printf '%s\n' "$delta"
+          }
+
+          trim_leading_space() {
+            local line="$1"
+            printf '%s\n' "${line#"${line%%[![:space:]]*}"}"
+          }
+
+          is_trace_format_nim_attr() {
+            local line attr name
+            line="$(trim_leading_space "$1")"
+            attr='([A-Za-z_][A-Za-z0-9_-]*|"[^"]+")'
+            name='(codetracer-trace-format-nim|"codetracer-trace-format-nim")'
+            [[ "$line" =~ ^$name([.]$attr)*[[:space:]]*= ]]
+          }
+
+          is_trace_format_nim_dotted_input_attr() {
+            local line attr name
+            line="$(trim_leading_space "$1")"
+            attr='([A-Za-z_][A-Za-z0-9_-]*|"[^"]+")'
+            name='(codetracer-trace-format-nim|"codetracer-trace-format-nim")'
+            [[ "$line" =~ ^inputs[.]$name([.]$attr)*[[:space:]]*= ]]
+          }
+
+          has_trace_format_nim_input() {
+            local line in_inputs=0 depth=0 top_depth=0 line_depth delta
+            while IFS= read -r line; do
+              if [[ "$line" =~ ^[[:space:]]*# ]]; then
+                continue
+              fi
+
+              delta="$(brace_delta "$line")"
+              line_depth="$top_depth"
+
+              if [ "$line_depth" -eq 1 ] && is_trace_format_nim_dotted_input_attr "$line"; then
+                return 0
+              fi
+
+              if [ "$in_inputs" = 0 ] &&
+                [ "$line_depth" -eq 1 ] &&
+                [[ "$line" =~ ^[[:space:]]*inputs[[:space:]]*=[[:space:]]*\{ ]]; then
+                in_inputs=1
+                depth="$delta"
+              elif [ "$in_inputs" = 1 ] &&
+                [ "$depth" -eq 1 ] &&
+                is_trace_format_nim_attr "$line"; then
+                return 0
+              fi
+
+              if [ "$in_inputs" = 1 ]; then
+                if ! [[ "$line" =~ ^[[:space:]]*inputs[[:space:]]*=[[:space:]]*\{ ]]; then
+                  depth=$((depth + delta))
+                fi
+                if [ "$depth" -le 0 ]; then
+                  in_inputs=0
+                fi
+              fi
+
+              top_depth=$((top_depth + delta))
+            done < "$FLAKE_NIX"
+
+            return 1
+          }
+
+          has_trace_format_nim_materialization() {
+            local line code materialized_path
+            materialized_path="\$sourceRoot/../codetracer-trace-format-nim"
+            while IFS= read -r line; do
+              if [[ "$line" =~ ^[[:space:]]*# ]]; then
+                continue
+              fi
+              code="${line%%#*}"
+              if [[ "$code" =~ ^[[:space:]]*cp[[:space:]] ]] &&
+                [[ "$code" == *codetracer-trace-format-nim* ]] &&
+                [[ "$code" == *"$materialized_path"* ]]; then
+                return 0
+              fi
+            done < "$DEFAULT_NIX"
+
+            return 1
+          }
+
+          if has_trace_format_nim_input; then
+            echo "codetracer flake already defines codetracer-trace-format-nim; keeping upstream input"
+          elif ! grep -F "$INPUT_MARKER" "$FLAKE_NIX" >/dev/null; then
+            tmp="$(mktemp)"
+            in_inputs=0
+            depth=0
+            top_depth=0
+            inserted=0
+            while IFS= read -r line; do
+              delta="$(brace_delta "$line")"
+              line_depth="$top_depth"
+
+              if [ "$in_inputs" = 0 ] &&
+                [ "$line_depth" -eq 1 ] &&
+                [[ "$line" =~ ^[[:space:]]*inputs[[:space:]]*=[[:space:]]*\{ ]]; then
+                in_inputs=1
+                depth="$delta"
+                printf '%s\n' "$line" >> "$tmp"
+                top_depth=$((top_depth + delta))
+                continue
+              fi
+
+              if [ "$in_inputs" = 1 ]; then
+                next_depth=$((depth + delta))
+                if [ "$next_depth" -le 0 ] && [[ "$line" =~ ^[[:space:]]*\}\;[[:space:]]*$ ]]; then
+                  cat >> "$tmp" <<PATCH
+
+              # $INPUT_MARKER: CI-only input patched by
+              # recorder workflows so db-backend's Nix build can materialize the
+              # Nim FFI sibling at the path codetracer_trace_writer_nim/build.rs derives.
+              codetracer-trace-format-nim = {
+                url = "path:./libs/codetracer-trace-format-nim";
+                flake = false;
+              };
+          PATCH
+                  inserted=1
+                  in_inputs=0
+                  depth=0
+                  printf '%s\n' "$line" >> "$tmp"
+                  top_depth=$((top_depth + delta))
+                  continue
+                fi
+                depth="$next_depth"
+              fi
+
+              printf '%s\n' "$line" >> "$tmp"
+              top_depth=$((top_depth + delta))
+            done < "$FLAKE_NIX"
+
+            if [ "$inserted" != 1 ]; then
+              rm -f "$tmp"
+              echo "::error::failed to patch $FLAKE_NIX with trace-format-nim input"
+              exit 1
+            fi
+
+            mv "$tmp" "$FLAKE_NIX"
+          fi
+
+          if ! has_trace_format_nim_input; then
+            echo "::error::failed to ensure $FLAKE_NIX has a trace-format-nim input"
+            exit 1
+          fi
+
+          if has_trace_format_nim_materialization; then
+            echo "codetracer default.nix already materializes codetracer-trace-format-nim"
+          elif ! grep -F "$MARKER" "$DEFAULT_NIX" >/dev/null; then
+            tmp="$(mktemp)"
+            while IFS= read -r line; do
+              printf '%s\n' "$line" >> "$tmp"
+              code="${line%%#*}"
+              if [[ "$code" =~ ^[[:space:]]*cp[[:space:]] ]] &&
+                [[ "$code" == *"$NEEDLE"* ]]; then
+                cat >> "$tmp" <<'PATCH'
+                        # codetracer-trace-format-nim-ci-sibling: materialize the
+                        # pinned Nim FFI checkout next to the copied trace-format source
+                        # at the path codetracer_trace_writer_nim/build.rs derives.
+                        cp -r ${inputs.codetracer-trace-format-nim} $sourceRoot/../codetracer-trace-format-nim
+                        chmod -R u+w $sourceRoot/../codetracer-trace-format-nim
+          PATCH
+              fi
+            done < "$DEFAULT_NIX"
+            mv "$tmp" "$DEFAULT_NIX"
+          fi
+
+          if ! has_trace_format_nim_materialization; then
+            echo "::error::failed to patch $DEFAULT_NIX with trace-format-nim sibling materialization"
+            exit 1
+          fi
+
       - name: Build codetracer
         run: |
           cd "$GITHUB_WORKSPACE/../codetracer"
@@ -290,8 +502,8 @@ jobs:
           # ``db-backend`` link fails with ``undefined reference to
           # ct_reader_supports_column_motions`` (cross-repo run
           # 27755553496 step ``Build codetracer``).
-          OVERRIDE="--override-input codetracer-trace-format path:./libs/codetracer-trace-format \
-                    --override-input codetracer-trace-format-nim path:$GITHUB_WORKSPACE/../codetracer-trace-format-nim"
+          OVERRIDE="--override-input codetracer-trace-format path:./libs/codetracer-trace-format"
+          OVERRIDE_NIM="--override-input codetracer-trace-format-nim path:./libs/codetracer-trace-format-nim"
           # ``metacraft-labs-codetracer.cachix.org`` serves a stale
           # narinfo for the noir flake input keyed under a NAR-hash
           # that no longer matches the lockfile, so the build aborts
@@ -309,8 +521,8 @@ jobs:
           # entry, so the cached narHash gets replaced by what
           # upstream currently serves.
           REFRESH="--refresh"
-          nix build $SUBST_OVERRIDE $REFRESH -L ".?submodules=1#codetracer" $OVERRIDE -o result-ct
-          nix build $SUBST_OVERRIDE -L ".?submodules=1#db-backend" $OVERRIDE -o result-db
+          nix build $SUBST_OVERRIDE $REFRESH -L ".?submodules=1#codetracer" $OVERRIDE $OVERRIDE_NIM -o result-ct
+          nix build $SUBST_OVERRIDE -L ".?submodules=1#db-backend" $OVERRIDE $OVERRIDE_NIM -o result-db
           # Merge both outputs into a single bin directory so the extension
           # can find both ct and db-backend via a single runnablePath.
           mkdir -p combined-bin
