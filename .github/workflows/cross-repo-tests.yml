@@ -140,6 +140,22 @@ jobs:
           git clone --depth 1 \
             "https://x-access-token:${GH_TOKEN}@github.com/metacraft-labs/codetracer.git" \
             "$DEST"
+          if [ "$CT_REF" != "main" ]; then
+            git -C "$DEST" \
+              -c fetch.recurseSubmodules=false \
+              fetch --no-recurse-submodules origin "$CT_REF"
+            # Use FETCH_HEAD so the checkout works for both SHAs and
+            # branch names.  ``git checkout <branch>`` would fail with
+            # ``pathspec '<branch>' did not match any file(s) known to
+            # git`` because the initial ``--depth 1`` clone above
+            # doesn't track remote branches; ``FETCH_HEAD`` is the
+            # ref that ``git fetch origin <ref>`` always populates.
+            # The vscode-extension clone block (below) already uses
+            # this pattern -- this brings codetracer into line.
+            git -C "$DEST" \
+              -c submodule.recurse=false \
+              checkout --no-recurse-submodules FETCH_HEAD
+          fi
           cd "$DEST"
           git submodule init
           # Rewrite submodule URLs with auth token for private repos
@@ -169,19 +185,6 @@ jobs:
             fi
           done
           set -e
-          cd -
-          if [ "$CT_REF" != "main" ]; then
-            git -C "$DEST" fetch origin "$CT_REF"
-            # Use FETCH_HEAD so the checkout works for both SHAs and
-            # branch names.  ``git checkout <branch>`` would fail with
-            # ``pathspec '<branch>' did not match any file(s) known to
-            # git`` because the initial ``--depth 1`` clone above
-            # doesn't track remote branches; ``FETCH_HEAD`` is the
-            # ref that ``git fetch origin <ref>`` always populates.
-            # The vscode-extension clone block (below) already uses
-            # this pattern -- this brings codetracer into line.
-            git -C "$DEST" checkout FETCH_HEAD
-          fi
 
       - name: Clone codetracer-vscode-extension
         env:
