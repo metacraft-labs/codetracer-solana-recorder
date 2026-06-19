@@ -58,11 +58,19 @@ jobs:
             "https://github.com/metacraft-labs/codetracer-trace-format-nim.git" \
             "${GITHUB_WORKSPACE}/../codetracer-trace-format-nim"
 
+      - name: Generate CI token
+        id: app-token
+        uses: actions/create-github-app-token@v1
+        with:
+          app-id: ${{ secrets.CI_TOKEN_PROVIDER_APP_ID }}
+          private-key: ${{ secrets.CI_TOKEN_PROVIDER_PRIVATE_KEY }}
+          owner: metacraft-labs
+
       - name: Setup dev env (reprobuild flavor)
         uses: metacraft-labs/metacraft-github-actions/setup-dev-env@main
         with:
           env-flavor: reprobuild
-          gh-token: ${{ secrets.GITHUB_TOKEN }}
+          gh-token: ${{ steps.app-token.outputs.token }}
 
       - name: repro build
         # Builds the conventional `build` collection declared in
