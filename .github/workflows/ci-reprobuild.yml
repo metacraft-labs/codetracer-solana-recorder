@@ -28,6 +28,9 @@ jobs:
       matrix:
         os: [ubuntu-latest, macos-latest, windows-latest]
     runs-on: ${{ matrix.os }}
+    env:
+      CODETRACER_TRACE_FORMAT_NIM_SKIP_NIMBLE_INSTALL: "1"
+      CODETRACER_TRACE_FORMAT_NIM_EXTRA_PATHS: "../../${{ github.event.repository.name }}/.reprobuild-src/libs/results/src:../../${{ github.event.repository.name }}/.reprobuild-src/libs/nim-stew:../../${{ github.event.repository.name }}/reprobuild/libs/results/src:../../${{ github.event.repository.name }}/reprobuild/libs/nim-stew"
     steps:
       - uses: actions/checkout@v4
 
