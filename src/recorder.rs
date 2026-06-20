@@ -2865,11 +2865,8 @@ pub fn record_with_cpi(
     // snapshot loop as they appear via `registry.find_location_with_column`.
     {
         let line_lengths = read_line_lengths_for_path(source_path);
-        let _ = TraceWriter::register_path_with_line_lengths(
-            &mut *writer,
-            source_path,
-            &line_lengths,
-        );
+        let _ =
+            TraceWriter::register_path_with_line_lengths(&mut *writer, source_path, &line_lengths);
     }
     let mut registered_paths: HashSet<String> = HashSet::new();
     registered_paths.insert(source_path.to_string_lossy().into_owned());
