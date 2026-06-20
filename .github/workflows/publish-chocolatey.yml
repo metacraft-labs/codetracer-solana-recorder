@@ -28,6 +28,7 @@ on:
 
 jobs:
   build-and-publish:
+    # TODO: migrate to self-hosted Windows runner once provisioned.
     runs-on: windows-latest
     name: build + push codetracer-solana-recorder.<version>.nupkg
     environment: chocolatey

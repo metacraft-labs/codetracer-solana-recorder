@@ -23,7 +23,7 @@ on:
 
 jobs:
   push-aur:
-    runs-on: ubuntu-latest
+    runs-on: [self-hosted, nixos]
     name: aur.archlinux.org push
     environment: aur
     steps:

@@ -26,7 +26,7 @@ on:
 
 jobs:
   refresh-manifest:
-    runs-on: ubuntu-latest
+    runs-on: [self-hosted, nixos]
     name: refresh codetracer-solana-recorder.json
     environment: scoop
     steps:
