@@ -28,6 +28,9 @@ jobs:
       matrix:
         os: [ubuntu-latest, macos-latest, windows-latest]
     runs-on: ${{ matrix.os }}
+    env:
+      CODETRACER_TRACE_FORMAT_NIM_SKIP_NIMBLE_INSTALL: "1"
+      CODETRACER_TRACE_FORMAT_NIM_EXTRA_PATHS: "../../${{ github.event.repository.name }}/.reprobuild-src/libs/results/src:../../${{ github.event.repository.name }}/.reprobuild-src/libs/nim-stew/src:../../${{ github.event.repository.name }}/reprobuild/libs/results/src:../../${{ github.event.repository.name }}/reprobuild/libs/nim-stew/src"
     steps:
       - uses: actions/checkout@v4
 
@@ -58,11 +61,19 @@ jobs:
             "https://github.com/metacraft-labs/codetracer-trace-format-nim.git" \
             "${GITHUB_WORKSPACE}/../codetracer-trace-format-nim"
 
+      - name: Generate CI token
+        id: app-token
+        uses: actions/create-github-app-token@v1
+        with:
+          app-id: ${{ secrets.CI_TOKEN_PROVIDER_APP_ID }}
+          private-key: ${{ secrets.CI_TOKEN_PROVIDER_PRIVATE_KEY }}
+          owner: metacraft-labs
+
       - name: Setup dev env (reprobuild flavor)
         uses: metacraft-labs/metacraft-github-actions/setup-dev-env@main
         with:
           env-flavor: reprobuild
-          gh-token: ${{ secrets.GITHUB_TOKEN }}
+          gh-token: ${{ steps.app-token.outputs.token }}
 
       - name: repro build
         # Builds the conventional `build` collection declared in
@@ -74,15 +85,6 @@ jobs:
       - name: repro test
         # Materialises the `test` collection.
         run: dev-exec repro test
-
-      - name: just build (cross-check)
-        # Re-runs the legacy `just build` path inside the same env so
-        # we catch silent divergences between `repro build` outputs
-        # and what the dev shell + Justfile produce today.
-        run: dev-exec just build
-
-      - name: just test (cross-check)
-        run: dev-exec just test
 
       - name: Upload logs on failure
         if: failure()

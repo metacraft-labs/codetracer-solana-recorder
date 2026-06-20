@@ -70,6 +70,15 @@ package codetracer_solana_recorder:
     const binarySuffix = (when defined(windows): ".exe" else: "")
     const recorderBinary =
       "target/release/codetracer-solana-recorder" & binarySuffix
+    const traceFormatNimExtraPaths =
+      "../../codetracer-solana-recorder/.reprobuild-src/libs/results/src:" &
+      "../../codetracer-solana-recorder/.reprobuild-src/libs/nim-stew/src:" &
+      "../../codetracer-solana-recorder/reprobuild/libs/results/src:" &
+      "../../codetracer-solana-recorder/reprobuild/libs/nim-stew/src"
+    let traceFormatNimEnv = @[
+      ("CODETRACER_TRACE_FORMAT_NIM_SKIP_NIMBLE_INSTALL", "1"),
+      ("CODETRACER_TRACE_FORMAT_NIM_EXTRA_PATHS", traceFormatNimExtraPaths)
+    ]
 
     let recorderBuild = cargo.build(
       locked = true,
@@ -79,7 +88,8 @@ package codetracer_solana_recorder:
         "Cargo.toml", "Cargo.lock",
         "src", "build.rs"
       ],
-      extraOutputs = @[recorderBinary])
+      extraOutputs = @[recorderBinary],
+      extraEnv = traceFormatNimEnv)
     discard collect("default", @[recorderBuild])
 
     # ---- Test-binary build + run edges (the `test` collection) -------
@@ -107,7 +117,8 @@ package codetracer_solana_recorder:
         "Cargo.toml", "Cargo.lock",
         "src", "build.rs", "tests"
       ],
-      extraOutputs = @["target/debug/deps"])
+      extraOutputs = @["target/debug/deps"],
+      extraEnv = traceFormatNimEnv)
 
     let testsRun = cargo.test(
       locked = true,
@@ -117,6 +128,7 @@ package codetracer_solana_recorder:
         "Cargo.toml", "Cargo.lock",
         "src", "tests",
         "target/debug/deps"
-      ])
+      ],
+      extraEnv = traceFormatNimEnv)
 
     discard collect("test", @[testsRun.action])
