@@ -72,9 +72,9 @@ package codetracer_solana_recorder:
       "target/release/codetracer-solana-recorder" & binarySuffix
     const traceFormatNimExtraPaths =
       "../../codetracer-solana-recorder/.reprobuild-src/libs/results/src:" &
-      "../../codetracer-solana-recorder/.reprobuild-src/libs/nim-stew:" &
+      "../../codetracer-solana-recorder/.reprobuild-src/libs/nim-stew/src:" &
       "../../codetracer-solana-recorder/reprobuild/libs/results/src:" &
-      "../../codetracer-solana-recorder/reprobuild/libs/nim-stew"
+      "../../codetracer-solana-recorder/reprobuild/libs/nim-stew/src"
     let traceFormatNimEnv = @[
       ("CODETRACER_TRACE_FORMAT_NIM_SKIP_NIMBLE_INSTALL", "1"),
       ("CODETRACER_TRACE_FORMAT_NIM_EXTRA_PATHS", traceFormatNimExtraPaths)
