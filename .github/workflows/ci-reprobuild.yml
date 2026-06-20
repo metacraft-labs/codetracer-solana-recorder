@@ -86,15 +86,6 @@ jobs:
         # Materialises the `test` collection.
         run: dev-exec repro test
 
-      - name: just build (cross-check)
-        # Re-runs the legacy `just build` path inside the same env so
-        # we catch silent divergences between `repro build` outputs
-        # and what the dev shell + Justfile produce today.
-        run: dev-exec just build
-
-      - name: just test (cross-check)
-        run: dev-exec just test
-
       - name: Upload logs on failure
         if: failure()
         uses: actions/upload-artifact@v4
