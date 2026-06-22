@@ -66,8 +66,6 @@ jobs:
       - name: Install Nix
         uses: metacraft-labs/metacraft-github-actions/setup-nix@main
         with:
-          cachix-auth-token: ${{ secrets.CACHIX_AUTH_TOKEN }}
-          cachix-cache: ''
           trusted-public-keys: ''
           substituters: ''
           gh-token: ${{ steps.app-token.outputs.token }}
@@ -290,7 +288,7 @@ jobs:
           # 27755553496 step ``Build codetracer``).
           OVERRIDE="--override-input codetracer-trace-format path:./libs/codetracer-trace-format \
                     --override-input codetracer-trace-format-nim path:$GITHUB_WORKSPACE/../codetracer-trace-format-nim"
-          # ``metacraft-labs-codetracer.cachix.org`` serves a stale
+          # ``cache.metacraft-labs.com/metacraft-codetracer`` serves a stale
           # narinfo for the noir flake input keyed under a NAR-hash
           # that no longer matches the lockfile, so the build aborts
           # with ``NAR hash mismatch in input git+https://...noir...``.
