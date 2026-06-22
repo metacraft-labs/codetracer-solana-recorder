@@ -63,235 +63,36 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
 
-      - name: Install Nix
-        uses: metacraft-labs/metacraft-github-actions/setup-nix@main
+      - name: Setup dev env
+        # Installs nix and clones the cross-repo siblings adjacent to this
+        # checkout at workspace-lock-pinned revisions. workflow_dispatch /
+        # repository_dispatch ref inputs override the locked revision for
+        # codetracer + the extension (empty => lock). nix-blockchain-development
+        # is cloned bare (no override) for the recorder_exec mcl-blockchain
+        # flake override patched in below.
+        uses: metacraft-labs/metacraft-github-actions/setup-dev-env@main
         with:
-          trusted-public-keys: ''
-          substituters: ''
+          env-flavor: nix
           gh-token: ${{ steps.app-token.outputs.token }}
+          siblings: |
+            codetracer=${{ github.event.inputs.codetracer_ref || github.event.client_payload.codetracer_ref }}
+            codetracer-vscode-extension=${{ github.event.inputs.vscode_extension_ref || github.event.client_payload.vscode_extension_ref }}
+            codetracer-trace-format
+            codetracer-trace-format-nim
+            nix-blockchain-development
 
-      - name: Install just
-        uses: extractions/setup-just@v2
-
-      - name: Checkout metacraft-manifests (workspace locks)
-        uses: actions/checkout@v5
-        with:
-          repository: metacraft-labs/metacraft-manifests
-          ref: latest
-          path: _manifests
-          token: ${{ steps.app-token.outputs.token }}
-
-      - name: Resolve cross-repo workspace-lock SHA
-        shell: bash
-        run: |
-          case "${{ github.event_name }}" in
-            pull_request) CANDS="${{ github.event.pull_request.base.sha }}" ;;
-            push) CANDS="${{ github.sha }} ${{ github.event.before }}" ;;
-            *) CANDS="${{ github.sha }}" ;;
-          esac
-          LOCK_SHA=""
-          for c in $CANDS; do
-            [ -z "$c" ] && continue
-            [ "$c" = "0000000000000000000000000000000000000000" ] && continue
-            if "${{ github.workspace }}/scripts/resolve-sibling-rev.sh" \
-                 --repo codetracer-solana-recorder --sibling codetracer \
-                 --manifest-dir "${{ github.workspace }}/_manifests" \
-                 --sha "$c" --no-walk >/dev/null 2>&1; then
-              LOCK_SHA="$c"; break
-            fi
-          done
-          if [ -z "$LOCK_SHA" ]; then
-            echo "::error::No repo-workspaces workspace lock for codetracer-solana-recorder (candidates: $CANDS). The commit must be published through the workspace tooling (pre-push hook / 'workspace lock')."
-            exit 1
-          fi
-          echo "CT_MANIFEST_DIR=${{ github.workspace }}/_manifests" >> "$GITHUB_ENV"
-          echo "CT_LOCK_SHA=$LOCK_SHA" >> "$GITHUB_ENV"
-          echo "Resolved cross-repo lock SHA for codetracer-solana-recorder: $LOCK_SHA"
-
-      # Resolve sibling refs using priority cascade:
-      #   1. workflow_dispatch input (manual override)
-      #   2. repository_dispatch payload (bidirectional trigger)
-      #   3. repo-workspaces workspace lock (resolver, pinned SHA)
-      - name: Resolve sibling refs
-        id: resolve-refs
-        run: |
-          resolve_ref() {
-            local name="$1" dispatch_input="$2" payload_field="$3"
-
-            if [ -n "$dispatch_input" ]; then
-              echo "$dispatch_input"; return
-            fi
-            if [ -n "$payload_field" ]; then
-              echo "$payload_field"; return
-            fi
-            "${{ github.workspace }}/scripts/resolve-sibling-rev.sh" \
-              --repo codetracer-solana-recorder --sibling "${name}" \
-              --manifest-dir "$CT_MANIFEST_DIR" --sha "$CT_LOCK_SHA" --no-walk
-          }
-
-          CT_REF=$(resolve_ref codetracer \
-            "${{ github.event.inputs.codetracer_ref }}" \
-            "${{ github.event.client_payload.codetracer_ref }}")
-          EXT_REF=$(resolve_ref codetracer-vscode-extension \
-            "${{ github.event.inputs.vscode_extension_ref }}" \
-            "${{ github.event.client_payload.vscode_extension_ref }}")
-
-          resolve_branch() {
-            # The workspace lock pins an exact SHA; return it so clones fetch
-            # the pinned commit directly (more precise than a branch tip).
-            local name="$1"
-            "${{ github.workspace }}/scripts/resolve-sibling-rev.sh" \
-              --repo codetracer-solana-recorder --sibling "${name}" \
-              --manifest-dir "$CT_MANIFEST_DIR" --sha "$CT_LOCK_SHA" --no-walk
-          }
-
-          echo "codetracer_ref=$CT_REF" >> "$GITHUB_OUTPUT"
-          echo "vscode_extension_ref=$EXT_REF" >> "$GITHUB_OUTPUT"
-          EXT_BRANCH=$(resolve_branch codetracer-vscode-extension)
-          echo "vscode_extension_branch=$EXT_BRANCH" >> "$GITHUB_OUTPUT"
-          echo "Resolved refs: codetracer=$CT_REF, vscode-extension=$EXT_REF (branch=$EXT_BRANCH)"
-
-      - name: Clone codetracer
-        env:
-          GH_TOKEN: ${{ steps.app-token.outputs.token }}
-        run: |
-          CT_REF="${{ steps.resolve-refs.outputs.codetracer_ref }}"
-          DEST="$GITHUB_WORKSPACE/../codetracer"
-          rm -rf "$DEST"
-          # Clone without submodules first, then init them individually.
-          # --recurse-submodules fails when submodule SHAs are unreachable
-          # (force-pushed or rebased upstream). Individual init+update is
-          # more resilient: we can skip submodules that fail.
-          git clone --depth 1 \
-            "https://x-access-token:${GH_TOKEN}@github.com/metacraft-labs/codetracer.git" \
-            "$DEST"
-          cd "$DEST"
-          git submodule init
-          # Rewrite submodule URLs with auth token for private repos
-          for url in $(git config --get-regexp '^submodule\..*\.url$' \
-                       | grep -E 'git@github\.com:|https://github\.com/' \
-                       | cut -d' ' -f1); do
-            old_url=$(git config --get "$url")
-            new_url=$(echo "$old_url" \
-              | sed "s|git@github.com:|https://x-access-token:${GH_TOKEN}@github.com/|" \
-              | sed "s|https://github.com/|https://x-access-token:${GH_TOKEN}@github.com/|")
-            git config "$url" "$new_url"
-          done
-          # Update submodules one by one, skipping failures (some pinned
-          # SHAs may be unreachable). The critical submodule for WDIO tests
-          # is tree-sitter-nim; others are optional.
-          # Temporarily disable errexit so failed submodule clones don't
-          # abort the entire step.
-          set +e
-          git config --get-regexp '^submodule\..*\.url$' | cut -d. -f2 | while read -r mod; do
-            echo "Updating submodule: $mod"
-            git \
-              -c "url.https://x-access-token:${GH_TOKEN}@github.com/.insteadOf=https://github.com/" \
-              submodule update --init --recursive --depth 1 -- "$mod" 2>&1
-            rc=$?
-            if [ $rc -ne 0 ]; then
-              echo "::warning::submodule $mod failed to update (rc=$rc, non-fatal)"
-            fi
-          done
-          set -e
-          cd -
-          if [ "$CT_REF" != "main" ]; then
-            git -C "$DEST" fetch origin "$CT_REF"
-            # Use FETCH_HEAD so the checkout works for both SHAs and
-            # branch names.  ``git checkout <branch>`` would fail with
-            # ``pathspec '<branch>' did not match any file(s) known to
-            # git`` because the initial ``--depth 1`` clone above
-            # doesn't track remote branches; ``FETCH_HEAD`` is the
-            # ref that ``git fetch origin <ref>`` always populates.
-            # The vscode-extension clone block (below) already uses
-            # this pattern -- this brings codetracer into line.
-            git -C "$DEST" checkout FETCH_HEAD
-          fi
-
-      - name: Clone codetracer-vscode-extension
-        env:
-          GH_TOKEN: ${{ steps.app-token.outputs.token }}
-        run: |
-          EXT_REF="${{ steps.resolve-refs.outputs.vscode_extension_ref }}"
-          EXT_BRANCH="${{ steps.resolve-refs.outputs.vscode_extension_branch }}"
-          DEST="$GITHUB_WORKSPACE/../codetracer-vscode-extension"
-          rm -rf "$DEST"
-          git clone --depth 1 \
-            "https://x-access-token:${GH_TOKEN}@github.com/metacraft-labs/codetracer-vscode-extension.git" \
-            "$DEST"
-          if [ "$EXT_BRANCH" != "main" ]; then
-            git -C "$DEST" fetch origin "$EXT_BRANCH"
-            git -C "$DEST" checkout FETCH_HEAD
-          fi
-
-      - name: Clone nix-blockchain-development
-        env:
-          GH_TOKEN: ${{ steps.app-token.outputs.token }}
-        run: |
-          DEST="$GITHUB_WORKSPACE/../nix-blockchain-development"
-          rm -rf "$DEST"
-          git clone --depth 1 \
-            "https://x-access-token:${GH_TOKEN}@github.com/metacraft-labs/nix-blockchain-development.git" \
-            "$DEST"
-
-
-      - name: Clone codetracer-trace-format as recorder Cargo sibling
-        env:
-          GH_TOKEN: ${{ steps.app-token.outputs.token }}
-        # The recorder's Cargo.toml declares
-        # `codetracer_trace_types` / `codetracer_trace_writer_nim` as
-        # path deps at `../codetracer-trace-format/...`.  Any step
-        # that runs `cargo` against this checkout (the fixture-
-        # recording step shells out to the recorder's nix shell
-        # via `recorder_exec`, which cargo-builds the recorder)
-        # needs the sibling on disk at the same level as the
-        # recorder.
-        run: |
-          TF_REF="$("$GITHUB_WORKSPACE/scripts/resolve-sibling-rev.sh" \
-            --repo codetracer-solana-recorder --sibling codetracer-trace-format \
-            --manifest-dir "$CT_MANIFEST_DIR" --sha "$CT_LOCK_SHA" --no-walk)"
-          DEST="$GITHUB_WORKSPACE/../codetracer-trace-format"
-          rm -rf "$DEST"
-          git clone "https://x-access-token:${GH_TOKEN}@github.com/metacraft-labs/codetracer-trace-format.git" "$DEST"
-          git -C "$DEST" fetch origin "$TF_REF"
-          git -C "$DEST" checkout FETCH_HEAD
-
-      - name: Clone codetracer-trace-format-nim as recorder sibling
-        env:
-          GH_TOKEN: ${{ steps.app-token.outputs.token }}
-        # codetracer_trace_writer_nim's build.rs reads the FFI
-        # entry point at
-        # `../codetracer-trace-format-nim/src/codetracer_trace_writer_ffi.nim`.
-        # The fixture-recording step's recorder_exec cargo-builds
-        # the recorder, which compiles codetracer_trace_writer_nim,
-        # which panics without this sibling on disk.
-        run: |
-          TFN_REF="$("$GITHUB_WORKSPACE/scripts/resolve-sibling-rev.sh" \
-            --repo codetracer-solana-recorder --sibling codetracer-trace-format-nim \
-            --manifest-dir "$CT_MANIFEST_DIR" --sha "$CT_LOCK_SHA" --no-walk)"
-          DEST="$GITHUB_WORKSPACE/../codetracer-trace-format-nim"
-          rm -rf "$DEST"
-          git clone "https://x-access-token:${GH_TOKEN}@github.com/metacraft-labs/codetracer-trace-format-nim.git" "$DEST"
-          git -C "$DEST" fetch origin "$TFN_REF" 2>/dev/null || true
-          git -C "$DEST" checkout FETCH_HEAD 2>/dev/null || true
-
-      - name: Clone codetracer-trace-format into codetracer/libs (CI override)
-        env:
-          GH_TOKEN: ${{ steps.app-token.outputs.token }}
+      - name: Provide codetracer-trace-format into codetracer/libs (CI override)
         # The codetracer Build step below uses
         # ``--override-input codetracer-trace-format
         # path:./libs/codetracer-trace-format``.  The codetracer
-        # checkout doesn't ship that directory, so we clone the
-        # sibling pin into the expected path before nix build.
+        # checkout doesn't ship that directory, so we copy the
+        # sibling (already cloned at the lock-pinned revision by
+        # setup-dev-env) into the expected path before nix build.
         run: |
-          TF_REF="$("$GITHUB_WORKSPACE/scripts/resolve-sibling-rev.sh" \
-            --repo codetracer-solana-recorder --sibling codetracer-trace-format \
-            --manifest-dir "$CT_MANIFEST_DIR" --sha "$CT_LOCK_SHA" --no-walk)"
+          SRC="$GITHUB_WORKSPACE/../codetracer-trace-format"
           DEST="$GITHUB_WORKSPACE/../codetracer/libs/codetracer-trace-format"
           rm -rf "$DEST"
-          git clone "https://x-access-token:${GH_TOKEN}@github.com/metacraft-labs/codetracer-trace-format.git" "$DEST"
-          git -C "$DEST" fetch origin "$TF_REF"
-          git -C "$DEST" checkout FETCH_HEAD
+          cp -a "$SRC" "$DEST"
 
       - name: Build codetracer
         run: |
