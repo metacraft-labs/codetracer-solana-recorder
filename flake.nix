@@ -3,12 +3,10 @@
 
   nixConfig = {
     extra-substituters = [
-      "https://mcl-blockchain-packages.cachix.org"
-      "https://nix-blockchain-development.cachix.org"
+      "https://cache.metacraft-labs.com/metacraft-public"
     ];
     extra-trusted-public-keys = [
-      "mcl-blockchain-packages.cachix.org-1:qoEiUyBgNXmgJTThjbjO//XA9/6tCmx/OohHHt9hWVY="
-      "nix-blockchain-development.cachix.org-1:Ekei3RuW3Se+P/UIo6Q/oAgor/fVhFuuuX5jR8K/cdg="
+      "metacraft-public:UtS6PK+p0uZaJK3i/jD2DQOjTpddhQUQmNQDQih5N4Q="
     ];
   };
 
@@ -38,7 +36,7 @@
             pkgs.zstd # required by libcodetracer_trace_writer (Nim FFI)
             # Declare the toolchain explicitly so CI's dev shell
             # mirrors local dev exactly.  Cached mcl-blockchain
-            # devShells on cachix sometimes drop nim/nimble from
+            # devShells from Attic sometimes drop nim/nimble from
             # PATH on resolution; declaring them here keeps the
             # contract visible in flake.nix.
             pkgs.nim
