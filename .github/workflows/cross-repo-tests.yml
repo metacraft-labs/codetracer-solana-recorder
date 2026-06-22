@@ -73,11 +73,45 @@ jobs:
       - name: Install just
         uses: extractions/setup-just@v2
 
+      - name: Checkout metacraft-manifests (workspace locks)
+        uses: actions/checkout@v5
+        with:
+          repository: metacraft-labs/metacraft-manifests
+          ref: latest
+          path: _manifests
+          token: ${{ steps.app-token.outputs.token }}
+
+      - name: Resolve cross-repo workspace-lock SHA
+        shell: bash
+        run: |
+          case "${{ github.event_name }}" in
+            pull_request) CANDS="${{ github.event.pull_request.base.sha }}" ;;
+            push) CANDS="${{ github.sha }} ${{ github.event.before }}" ;;
+            *) CANDS="${{ github.sha }}" ;;
+          esac
+          LOCK_SHA=""
+          for c in $CANDS; do
+            [ -z "$c" ] && continue
+            [ "$c" = "0000000000000000000000000000000000000000" ] && continue
+            if "${{ github.workspace }}/scripts/resolve-sibling-rev.sh" \
+                 --repo codetracer-solana-recorder --sibling codetracer \
+                 --manifest-dir "${{ github.workspace }}/_manifests" \
+                 --sha "$c" --no-walk >/dev/null 2>&1; then
+              LOCK_SHA="$c"; break
+            fi
+          done
+          if [ -z "$LOCK_SHA" ]; then
+            echo "::error::No repo-workspaces workspace lock for codetracer-solana-recorder (candidates: $CANDS). The commit must be published through the workspace tooling (pre-push hook / 'workspace lock')."
+            exit 1
+          fi
+          echo "CT_MANIFEST_DIR=${{ github.workspace }}/_manifests" >> "$GITHUB_ENV"
+          echo "CT_LOCK_SHA=$LOCK_SHA" >> "$GITHUB_ENV"
+          echo "Resolved cross-repo lock SHA for codetracer-solana-recorder: $LOCK_SHA"
+
       # Resolve sibling refs using priority cascade:
       #   1. workflow_dispatch input (manual override)
       #   2. repository_dispatch payload (bidirectional trigger)
-      #   3. .github/sibling-pins (pinned SHAs)
-      #   4. Fallback to main
+      #   3. repo-workspaces workspace lock (resolver, pinned SHA)
       - name: Resolve sibling refs
         id: resolve-refs
         run: |
@@ -90,14 +124,9 @@ jobs:
             if [ -n "$payload_field" ]; then
               echo "$payload_field"; return
             fi
-            if [ -f .github/sibling-pins ]; then
-              local ref
-              ref="$(grep "^${name} " .github/sibling-pins | cut -d' ' -f2)" || true
-              if [ -n "$ref" ]; then
-                echo "$ref"; return
-              fi
-            fi
-            echo "main"
+            "${{ github.workspace }}/scripts/resolve-sibling-rev.sh" \
+              --repo codetracer-solana-recorder --sibling "${name}" \
+              --manifest-dir "$CT_MANIFEST_DIR" --sha "$CT_LOCK_SHA" --no-walk
           }
 
           CT_REF=$(resolve_ref codetracer \
@@ -108,15 +137,12 @@ jobs:
             "${{ github.event.client_payload.vscode_extension_ref }}")
 
           resolve_branch() {
+            # The workspace lock pins an exact SHA; return it so clones fetch
+            # the pinned commit directly (more precise than a branch tip).
             local name="$1"
-            if [ -f .github/sibling-pins ]; then
-              local branch
-              branch="$(grep "^${name} " .github/sibling-pins | cut -d' ' -f3)" || true
-              if [ -n "$branch" ]; then
-                echo "$branch"; return
-              fi
-            fi
-            echo "main"
+            "${{ github.workspace }}/scripts/resolve-sibling-rev.sh" \
+              --repo codetracer-solana-recorder --sibling "${name}" \
+              --manifest-dir "$CT_MANIFEST_DIR" --sha "$CT_LOCK_SHA" --no-walk
           }
 
           echo "codetracer_ref=$CT_REF" >> "$GITHUB_OUTPUT"
@@ -221,16 +247,14 @@ jobs:
         # needs the sibling on disk at the same level as the
         # recorder.
         run: |
-          PINS="$GITHUB_WORKSPACE/.github/sibling-pins"
-          TF_REF="main"
-          if [ -f "$PINS" ]; then
-            PIN_REF="$(grep '^codetracer-trace-format ' "$PINS" | cut -d' ' -f2)" || true
-            [ -n "$PIN_REF" ] && TF_REF="$PIN_REF"
-          fi
+          TF_REF="$("$GITHUB_WORKSPACE/scripts/resolve-sibling-rev.sh" \
+            --repo codetracer-solana-recorder --sibling codetracer-trace-format \
+            --manifest-dir "$CT_MANIFEST_DIR" --sha "$CT_LOCK_SHA" --no-walk)"
           DEST="$GITHUB_WORKSPACE/../codetracer-trace-format"
           rm -rf "$DEST"
           git clone "https://x-access-token:${GH_TOKEN}@github.com/metacraft-labs/codetracer-trace-format.git" "$DEST"
-          git -C "$DEST" checkout "$TF_REF"
+          git -C "$DEST" fetch origin "$TF_REF"
+          git -C "$DEST" checkout FETCH_HEAD
 
       - name: Clone codetracer-trace-format-nim as recorder sibling
         env:
@@ -242,16 +266,14 @@ jobs:
         # the recorder, which compiles codetracer_trace_writer_nim,
         # which panics without this sibling on disk.
         run: |
-          PINS="$GITHUB_WORKSPACE/.github/sibling-pins"
-          TFN_REF="main"
-          if [ -f "$PINS" ]; then
-            PIN_REF="$(grep '^codetracer-trace-format-nim ' "$PINS" | cut -d' ' -f2)" || true
-            [ -n "$PIN_REF" ] && TFN_REF="$PIN_REF"
-          fi
+          TFN_REF="$("$GITHUB_WORKSPACE/scripts/resolve-sibling-rev.sh" \
+            --repo codetracer-solana-recorder --sibling codetracer-trace-format-nim \
+            --manifest-dir "$CT_MANIFEST_DIR" --sha "$CT_LOCK_SHA" --no-walk)"
           DEST="$GITHUB_WORKSPACE/../codetracer-trace-format-nim"
           rm -rf "$DEST"
           git clone "https://x-access-token:${GH_TOKEN}@github.com/metacraft-labs/codetracer-trace-format-nim.git" "$DEST"
-          git -C "$DEST" checkout "$TFN_REF" 2>/dev/null || true
+          git -C "$DEST" fetch origin "$TFN_REF" 2>/dev/null || true
+          git -C "$DEST" checkout FETCH_HEAD 2>/dev/null || true
 
       - name: Clone codetracer-trace-format into codetracer/libs (CI override)
         env:
@@ -262,16 +284,14 @@ jobs:
         # checkout doesn't ship that directory, so we clone the
         # sibling pin into the expected path before nix build.
         run: |
-          PINS="$GITHUB_WORKSPACE/.github/sibling-pins"
-          TF_REF="main"
-          if [ -f "$PINS" ]; then
-            PIN_REF="$(grep '^codetracer-trace-format ' "$PINS" | cut -d' ' -f2)" || true
-            [ -n "$PIN_REF" ] && TF_REF="$PIN_REF"
-          fi
+          TF_REF="$("$GITHUB_WORKSPACE/scripts/resolve-sibling-rev.sh" \
+            --repo codetracer-solana-recorder --sibling codetracer-trace-format \
+            --manifest-dir "$CT_MANIFEST_DIR" --sha "$CT_LOCK_SHA" --no-walk)"
           DEST="$GITHUB_WORKSPACE/../codetracer/libs/codetracer-trace-format"
           rm -rf "$DEST"
           git clone "https://x-access-token:${GH_TOKEN}@github.com/metacraft-labs/codetracer-trace-format.git" "$DEST"
-          git -C "$DEST" checkout "$TF_REF"
+          git -C "$DEST" fetch origin "$TF_REF"
+          git -C "$DEST" checkout FETCH_HEAD
 
       - name: Build codetracer
         run: |
