@@ -46,7 +46,7 @@ on:
 
 jobs:
   build-and-publish-rpm:
-    runs-on: ubuntu-latest
+    runs-on: [self-hosted, nixos]
     name: rpm / ${{ inputs.arch }}
     environment: rpm
     steps:
