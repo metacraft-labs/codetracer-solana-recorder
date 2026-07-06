@@ -656,24 +656,18 @@ fn test_nested_calls_test_via_ct_print_full() {
          (compute → outer → middle → inner)"
     );
 
-    // ----- Call exit order: entry-key order -------------------------------
-    // After upstream codetracer-trace-format-nim eec665b
-    // ("CTFS-M-CallKeyOrder: allocate call_key at call entry"),
-    // call_exit events are emitted in call-entry-key order rather than
-    // inverse-LIFO.  Here `middle` and `inner` swap relative to the
-    // previous LIFO-pinned ordering because the multi-frame unwind
-    // (backward jump 403→206 closes both `inner` and `middle`) emits
-    // the exits in entry-key order.
+    // ----- Call exit order: unwind order ----------------------------------
+    // The multi-frame unwind (backward jump 403→206 closes both `inner` and
+    // `middle`) emits the exits in the same order the frames are closed.
     assert_eq!(
         observed_exit_sequence(&doc),
         vec![
-            "middle".to_string(),
             "inner".to_string(),
+            "middle".to_string(),
             "outer".to_string(),
             "compute".to_string(),
         ],
-        "call_exit events follow call-entry-key order after \
-         trace-format-nim eec665b"
+        "call_exit events follow frame unwind order"
     );
 
     // ----- r0 (return) surfaces 113 on the final snapshot -----------------
@@ -723,13 +717,12 @@ fn test_nested_calls_test_call_names_resolved_via_dwarf() {
             "inner".to_string(),
         ],
     );
-    // call_exit ordering is entry-key order after upstream
-    // codetracer-trace-format-nim eec665b.
+    // call_exit ordering follows frame unwind order.
     assert_eq!(
         observed_exit_sequence(&doc),
         vec![
-            "middle".to_string(),
             "inner".to_string(),
+            "middle".to_string(),
             "outer".to_string(),
             "compute".to_string(),
         ],
