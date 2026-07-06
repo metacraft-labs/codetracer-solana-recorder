@@ -29,11 +29,9 @@ REPO_ROOT="$(cd "${SCRIPT_DIR}/.." && pwd)"
 # script stays focused on verification results.
 ( cd "${REPO_ROOT}" && cargo build --locked --quiet )
 
-BIN="${REPO_ROOT}/target/debug/codetracer-solana-recorder"
-if [[ ! -x "${BIN}" ]]; then
-  echo "ERROR: recorder binary not found at ${BIN}" >&2
-  exit 1
-fi
+recorder() {
+  ( cd "${REPO_ROOT}" && cargo run --locked --quiet -- "$@" )
+}
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -73,7 +71,7 @@ assert_present() {
 # Top-level --help
 # ---------------------------------------------------------------------------
 
-TOP_HELP="$("${BIN}" --help)"
+TOP_HELP="$(recorder --help)"
 
 assert_absent "--format" "top-level --help" "${TOP_HELP}"
 assert_absent "CODETRACER_FORMAT" "top-level --help" "${TOP_HELP}"
@@ -85,7 +83,7 @@ assert_present "ct print" "top-level --help" "${TOP_HELP}"
 # `record` subcommand --help
 # ---------------------------------------------------------------------------
 
-RECORD_HELP="$("${BIN}" record --help)"
+RECORD_HELP="$(recorder record --help)"
 
 assert_absent "--format" "record --help" "${RECORD_HELP}"
 assert_absent "CODETRACER_FORMAT" "record --help" "${RECORD_HELP}"
@@ -95,7 +93,7 @@ assert_present "--out-dir" "record --help" "${RECORD_HELP}"
 # `replay` subcommand --help
 # ---------------------------------------------------------------------------
 
-REPLAY_HELP="$("${BIN}" replay --help)"
+REPLAY_HELP="$(recorder replay --help)"
 
 assert_absent "--format" "replay --help" "${REPLAY_HELP}"
 assert_absent "CODETRACER_FORMAT" "replay --help" "${REPLAY_HELP}"
@@ -105,7 +103,7 @@ assert_present "--out-dir" "replay --help" "${REPLAY_HELP}"
 # --version output
 # ---------------------------------------------------------------------------
 
-VERSION_OUT="$("${BIN}" --version)"
+VERSION_OUT="$(recorder --version)"
 assert_present "codetracer-solana-recorder" "--version output" "${VERSION_OUT}"
 
 # ---------------------------------------------------------------------------
