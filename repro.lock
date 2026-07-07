@@ -1,0 +1,9 @@
+schema = "reprobuild.solved-graph-lock.v2"
+
+[lock]
+platform = "amd64-linux"
+optimal = false
+inputs_digest = "fnv1a64:3c4e7bf45a81482d"
+variants = []
+packages = [{ name = "capnp", version = "1.0.0", source = "capnp" }, { name = "cargo", version = "1.85.0", source = "cargo" }, { name = "codetracer_solana_recorder", version = "0.1.0", source = "codetracer_solana_recorder" }, { name = "nim", version = "2.2.0", source = "nim" }, { name = "nimble", version = "1.0.0", source = "nimble" }, { name = "openssl", version = "1.0.0", source = "openssl" }, { name = "pkg-config", version = "1.0.0", source = "pkg-config" }, { name = "rustc", version = "1.85.0", source = "rustc" }, { name = "zstd", version = "1.0.0", source = "zstd" }]
+deps = [{ name = "codetracer-solana-recorder", path = ".", coord_kind = "vcs", url = "https://github.com/metacraft-labs/codetracer-solana-recorder", ref = "mcr-stege0-and-fixes", revision = "94dcce33103a46e008acb4f9bb4791df830070c7", integrity = "git-sha1:94dcce33103a46e008acb4f9bb4791df830070c7", version = "", visibility = "public", participation = "", depends = "", groups = "" }]
