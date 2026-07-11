@@ -12,8 +12,12 @@ on:
 
 jobs:
   lint-and-test:
-    name: Lint and test
-    runs-on: [self-hosted, nixos]
+    name: Lint and test (${{ matrix.runner }})
+    strategy:
+      fail-fast: false
+      matrix:
+        runner: [incus, tart-linux-arm, macos-tart]
+    runs-on: ${{ matrix.runner }}
     steps:
       - uses: actions/checkout@v4
 
@@ -69,6 +73,6 @@ jobs:
         if: failure()
         uses: actions/upload-artifact@v4
         with:
-          name: test-logs
+          name: test-logs-${{ matrix.runner }}
           path: target/
           retention-days: 7
