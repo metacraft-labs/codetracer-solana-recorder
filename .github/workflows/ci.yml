@@ -16,7 +16,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        runner: [incus, tart-linux-arm, macos-tart]
+        runner: [eph-linux-x64, eph-linux-arm64, eph-macos-arm64]
     runs-on: ${{ matrix.runner }}
     steps:
       - uses: actions/checkout@v4
