@@ -1,15 +1,6 @@
 {
   description = "CodeTracer Solana Recorder";
 
-  nixConfig = {
-    extra-substituters = [
-      "https://cache.metacraft-labs.com/metacraft-public"
-    ];
-    extra-trusted-public-keys = [
-      "metacraft-public:UtS6PK+p0uZaJK3i/jD2DQOjTpddhQUQmNQDQih5N4Q="
-    ];
-  };
-
   inputs = {
     mcl-blockchain.url = "github:metacraft-labs/nix-blockchain-development";
     nixpkgs.follows = "mcl-blockchain/nixpkgs";

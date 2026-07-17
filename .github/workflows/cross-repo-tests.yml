@@ -114,14 +114,10 @@ jobs:
           # 27755553496 step ``Build codetracer``).
           OVERRIDE="--override-input codetracer-trace-format path:./libs/codetracer-trace-format \
                     --override-input codetracer-trace-format-nim path:$GITHUB_WORKSPACE/../codetracer-trace-format-nim"
-          # ``cache.metacraft-labs.com/metacraft-codetracer`` serves a stale
-          # narinfo for the noir flake input keyed under a NAR-hash
-          # that no longer matches the lockfile, so the build aborts
-          # with ``NAR hash mismatch in input git+https://...noir...``.
-          # Force-skip every non-default substituter (``cache.nixos.org``
-          # alone is plenty for the standard nixpkgs paths) so nix
-          # fetches the noir source from origin and computes the
-          # correct hash itself.  Documented as CI-stabilization §4.
+          # Force-skip every non-default substituter so nix fetches
+          # the noir source from origin and computes the correct hash
+          # itself. cache.nixos.org alone is sufficient for the
+          # standard nixpkgs paths in this build.
           SUBST_OVERRIDE="--option accept-flake-config false --option substituters https://cache.nixos.org"
           # The runner's per-user fetcher cache
           # (~/.cache/nix/fetcher-cache-v2.sqlite) holds a stale
