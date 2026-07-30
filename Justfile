@@ -31,6 +31,26 @@ format:
   cargo fmt
 
 fmt: format
+
+# Recorder-specific CI prep, run by the shared reusable-recorder-ci workflow
+# (nixos-modules) after setup-dev-env, before lint/test. Builds the Nim
+# trace-writer sibling static lib + ct-print (golden-trace decode) via the dev
+# env and exports CODETRACER_NIM_LIB_DIR to later steps under GitHub Actions.
+# Shebang recipe so shell state persists across lines.
+# TODO: replace with `../codetracer-trace-format-nim` just build-trace-writer-lib
+# build-ct-print once it ships those targets (cross-repo-builds.md).
+prepare-ci:
+  #!/usr/bin/env bash
+  set -euo pipefail
+  (
+    cd "${GITHUB_WORKSPACE}/../codetracer-trace-format-nim"
+    nimble install -y stew results
+    nim c --app:staticlib --mm:arc --noMain -d:release -p:src \
+      -o:libcodetracer_trace_writer.a src/codetracer_trace_writer_ffi.nim
+    nim c -d:release -p:src -o:ct-print src/codetracer_ct_print.nim
+  )
+  echo "CODETRACER_NIM_LIB_DIR=${GITHUB_WORKSPACE}/../codetracer-trace-format-nim" >> "${GITHUB_ENV:-/dev/null}"
+
 # --- M13: Packaging UX Standardization ---
 # These recipes implement Repo-Requirements.md §2.8. The OS-packaged
 # recorders share a uniform packaging surface: `bump-version` rewrites
