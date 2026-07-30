@@ -1,8 +1,13 @@
 name: CI
 
-# Re-plays the project's deterministic dev env on the runner.
+# Re-plays the project's deterministic dev env on the runner via the shared
+# reusable recorder-CI workflow (nixos-modules). Recorder-specific prep lives in
+# the `prepare-ci` just recipe; the shared workflow runs it after setup-dev-env
+# and before lint/test, then uploads logs to GitHub (short retention) and
+# mirrors them to the in-house S3 artifact store. Runs on the CIP-3 eph-3-class
+# runner matrix (the reusable workflow's default).
 # See:
-#   https://github.com/metacraft-labs/metacraft-dev-guidelines/blob/latest/policies/ci-shared-dev-env.md
+#   https://github.com/metacraft-labs/metacraft-dev-guidelines/blob/latest/policies/ci-workflow-standards.md
 
 on:
   push:
@@ -11,68 +16,8 @@ on:
     branches: [main, dev, stable]
 
 jobs:
-  lint-and-test:
-    name: Lint and test (${{ matrix.runner }})
-    strategy:
-      fail-fast: false
-      matrix:
-        runner: [eph-linux-x64, eph-linux-arm64, eph-macos-arm64]
-    runs-on: ${{ matrix.runner }}
-    steps:
-      - uses: actions/checkout@v4
-
-      - name: Generate CI token
-        id: app-token
-        uses: actions/create-github-app-token@v2
-        with:
-          app-id: ${{ secrets.CI_TOKEN_PROVIDER_APP_ID }}
-          private-key: ${{ secrets.CI_TOKEN_PROVIDER_PRIVATE_KEY }}
-          owner: metacraft-labs
-
-      - name: Setup dev env
-        # setup-dev-env clones the siblings listed in .github/sibling-repos
-        # (codetracer-trace-format, codetracer-trace-format-nim) at the
-        # workspace-lock-pinned revisions before materialising the nix env.
-        uses: metacraft-labs/metacraft-github-actions/setup-dev-env@main
-        with:
-          env-flavor: nix
-          gh-token: ${{ steps.app-token.outputs.token }}
-          substituters: ${{ vars.SUBSTITUTERS }}
-          trusted-public-keys: ${{ vars.TRUSTED_PUBLIC_KEYS }}
-          attic-token: ${{ secrets.ATTIC_TOKEN }}
-          attic-cache: ${{ vars.ATTIC_CACHE }}
-          attic-endpoint: ${{ vars.ATTIC_ENDPOINT }}
-
-      - name: Build Nim trace writer library + ct-print
-        # solana's tests/test_comprehensive.rs shells out to
-        # ../codetracer-trace-format-nim/ct-print for golden
-        # CTFS-decode assertions; build both the FFI static lib
-        # AND the ct-print binary via the dev shell.
-        # TODO: replace with `direnv exec ../codetracer-trace-format-nim
-        # just build-trace-writer-lib build-ct-print` once the
-        # sibling repo ships those targets -- per
-        # cross-repo-builds.md.
-        run: |
-          dev-exec bash -c '
-            set -euo pipefail
-            cd "${GITHUB_WORKSPACE}/../codetracer-trace-format-nim"
-            nimble install -y stew results
-            nim c --app:staticlib --mm:arc --noMain -d:release -p:src \
-              -o:libcodetracer_trace_writer.a src/codetracer_trace_writer_ffi.nim
-            nim c -d:release -p:src -o:ct-print src/codetracer_ct_print.nim
-          '
-          echo "CODETRACER_NIM_LIB_DIR=${GITHUB_WORKSPACE}/../codetracer-trace-format-nim" >> "$GITHUB_ENV"
-
-      - name: Lint
-        run: dev-exec just lint
-
-      - name: Test
-        run: dev-exec just test
-
-      - name: Upload test logs on failure
-        if: failure()
-        uses: actions/upload-artifact@v4
-        with:
-          name: test-logs-${{ matrix.runner }}
-          path: target/
-          retention-days: 7
+  ci:
+    uses: metacraft-labs/nixos-modules/.github/workflows/reusable-recorder-ci.yml@main
+    with:
+      prepare-recipe: prepare-ci
+    secrets: inherit
