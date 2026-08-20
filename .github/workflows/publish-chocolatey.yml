@@ -28,7 +28,10 @@ on:
 
 jobs:
   build-and-publish:
-    # TODO: migrate to self-hosted Windows runner once provisioned.
+    # Runs on the org's persistent reprobuild-managed Windows runners
+    # (win-ci-bare-001 / win-ci-vm-001). `dev-env-ready` means the host can
+    # enter a reprobuild dev env; `choco` itself comes from THIS repo's
+    # repro.nim `uses:` block, not from the runner.
     runs-on: [self-hosted, Windows, X64, dev-env-ready]
     name: build + push codetracer-solana-recorder.<version>.nupkg
     environment: chocolatey
