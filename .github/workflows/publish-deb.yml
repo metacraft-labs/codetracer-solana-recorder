@@ -45,10 +45,33 @@ on:
 jobs:
   build-and-publish-deb:
     runs-on: [self-hosted, nixos]
-    name: deb / ${{ inputs.arch }}
+    name: deb / ${{ inputs.arch || 'amd64' }}
     environment: deb
+    env:
+      ARCH: ${{ inputs.arch || 'amd64' }}
     steps:
       - uses: actions/checkout@v4
+
+      - name: Resolve the version
+        id: version
+        env:
+          INPUT_VERSION: ${{ inputs.version }}
+        run: |
+          set -euo pipefail
+          # The `inputs` context is populated only for workflow_dispatch. On a
+          # `push: tags` run it is empty, so take the version from the tag
+          # instead, and fail loudly rather than publishing an empty version.
+          if [ "${GITHUB_REF}" != "${GITHUB_REF#refs/tags/v}" ]; then
+            version="${GITHUB_REF#refs/tags/v}"
+          else
+            version="${INPUT_VERSION}"
+          fi
+          if [ -z "${version}" ]; then
+            echo "::error::Cannot resolve a version: this run is neither a refs/tags/v* push nor a workflow_dispatch supplying inputs.version." >&2
+            exit 1
+          fi
+          echo "Resolved version: ${version}"
+          echo "version=${version}" >> "$GITHUB_OUTPUT"
 
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@stable
@@ -61,14 +84,14 @@ jobs:
         run: |
           sudo apt-get update
           sudo apt-get install -y dpkg-dev xz-utils gnupg
-          if [[ "${{ inputs.arch }}" == "arm64" ]]; then
+          if [[ "$ARCH" == "arm64" ]]; then
             sudo apt-get install -y gcc-aarch64-linux-gnu
           fi
 
       - name: Build recorder binary
         run: |
           set -euo pipefail
-          if [[ "${{ inputs.arch }}" == "arm64" ]]; then
+          if [[ "$ARCH" == "arm64" ]]; then
             export CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER=aarch64-linux-gnu-gcc
             cargo build --release --locked \
               --target aarch64-unknown-linux-gnu \
@@ -81,6 +104,8 @@ jobs:
           fi
 
       - name: Build .deb
+        env:
+          VERSION: ${{ steps.version.outputs.version }}
         run: |
           mkdir -p out
           bash packaging/deb/build.sh \
@@ -88,9 +113,9 @@ jobs:
             "${{ env.binary }}" \
             out \
             codetracer-solana-recorder \
-            "${{ inputs.version }}" \
+            "$VERSION" \
             codetracer-solana-recorder \
-            "${{ inputs.arch }}"
+            "$ARCH"
 
       - name: Import GPG key
         if: ${{ inputs.dry_run == false }}
@@ -101,9 +126,11 @@ jobs:
 
       - name: Sign .deb
         if: ${{ inputs.dry_run == false }}
+        env:
+          VERSION: ${{ steps.version.outputs.version }}
         run: |
           set -euo pipefail
-          deb="out/codetracer-solana-recorder_${{ inputs.version }}_${{ inputs.arch }}.deb"
+          deb="out/codetracer-solana-recorder_${VERSION}_${ARCH}.deb"
           gpg --armor --detach-sign "$deb"
 
       - name: Upload .deb to deb.codetracer.com (R2)
@@ -112,6 +139,7 @@ jobs:
           AWS_ACCESS_KEY_ID:     ${{ secrets.CODETRACER_DEB_BUCKET_ACCESS_KEY_ID }}
           AWS_SECRET_ACCESS_KEY: ${{ secrets.CODETRACER_DEB_BUCKET_ACCESS_KEY }}
           AWS_SESSION_TOKEN:     ${{ secrets.CODETRACER_DEB_BUCKET_TOKEN }}
+          VERSION: ${{ steps.version.outputs.version }}
         run: |
           set -euo pipefail
           if [[ -z "$AWS_ACCESS_KEY_ID" ]]; then
@@ -122,7 +150,7 @@ jobs:
           # codetracer main repo uses inside its Nix dev shell.
           python3 -m pip install --user awscli
           export PATH="$HOME/.local/bin:$PATH"
-          deb="out/codetracer-solana-recorder_${{ inputs.version }}_${{ inputs.arch }}.deb"
+          deb="out/codetracer-solana-recorder_${VERSION}_${ARCH}.deb"
           asc="$deb.asc"
           bucket_name="${{ vars.R2_CODETRACER_BUCKET_NAME }}"
           endpoint="${{ secrets.CODETRACER_DEB_BUCKET_S3_URL }}"
@@ -138,6 +166,6 @@ jobs:
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: codetracer-solana-recorder-${{ inputs.version }}-${{ inputs.arch }}.deb
+          name: codetracer-solana-recorder-${{ steps.version.outputs.version }}-${{ env.ARCH }}.deb
           path: out/*.deb
           if-no-files-found: error

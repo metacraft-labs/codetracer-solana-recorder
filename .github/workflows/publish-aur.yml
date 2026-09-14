@@ -29,10 +29,31 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
+      - name: Resolve the version
+        id: version
+        env:
+          INPUT_VERSION: ${{ inputs.version }}
+        run: |
+          set -euo pipefail
+          # The `inputs` context is populated only for workflow_dispatch. On a
+          # `push: tags` run it is empty, so take the version from the tag
+          # instead, and fail loudly rather than publishing an empty version.
+          if [ "${GITHUB_REF}" != "${GITHUB_REF#refs/tags/v}" ]; then
+            version="${GITHUB_REF#refs/tags/v}"
+          else
+            version="${INPUT_VERSION}"
+          fi
+          if [ -z "${version}" ]; then
+            echo "::error::Cannot resolve a version: this run is neither a refs/tags/v* push nor a workflow_dispatch supplying inputs.version." >&2
+            exit 1
+          fi
+          echo "Resolved version: ${version}"
+          echo "version=${version}" >> "$GITHUB_OUTPUT"
+
       - name: Compute source-tarball sha256
         id: hashes
         env:
-          VERSION: ${{ inputs.version }}
+          VERSION: ${{ steps.version.outputs.version }}
         run: |
           set -euo pipefail
           url="https://github.com/metacraft-labs/codetracer-solana-recorder/archive/refs/tags/v${VERSION}.tar.gz"
@@ -41,7 +62,7 @@ jobs:
 
       - name: Rewrite PKGBUILD + .SRCINFO with real version + sha
         env:
-          VERSION: ${{ inputs.version }}
+          VERSION: ${{ steps.version.outputs.version }}
           SOURCE_SHA: ${{ steps.hashes.outputs.source_sha }}
         run: |
           set -euo pipefail
@@ -65,7 +86,7 @@ jobs:
       - name: Push to AUR
         env:
           AUR_SSH_KEY: ${{ secrets.CODETRACER_AUR_SSH_PRIVATE_KEY }}
-          VERSION: ${{ inputs.version }}
+          VERSION: ${{ steps.version.outputs.version }}
         run: |
           set -euo pipefail
           if [[ -z "$AUR_SSH_KEY" ]]; then

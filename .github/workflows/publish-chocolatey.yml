@@ -38,11 +38,33 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
+      - name: Resolve the version
+        id: version
+        shell: pwsh
+        env:
+          INPUT_VERSION: ${{ inputs.version }}
+        run: |
+          # The `inputs` context is populated only for workflow_dispatch. On a
+          # `push: tags` run it is empty, so take the version from the tag
+          # instead, and fail loudly rather than publishing an empty version.
+          $prefix = 'refs/tags/v'
+          if ($Env:GITHUB_REF -and $Env:GITHUB_REF.StartsWith($prefix)) {
+            $version = $Env:GITHUB_REF.Substring($prefix.Length)
+          } else {
+            $version = $Env:INPUT_VERSION
+          }
+          if ([string]::IsNullOrEmpty($version)) {
+            Write-Output "::error::Cannot resolve a version: this run is neither a refs/tags/v* push nor a workflow_dispatch supplying inputs.version."
+            exit 1
+          }
+          Write-Output "Resolved version: $version"
+          "version=$version" | Out-File -FilePath $Env:GITHUB_OUTPUT -Append -Encoding ascii
+
       - name: Fetch sha256 for the windows-x86_64 zip
         id: hash
         shell: pwsh
         env:
-          VERSION: ${{ inputs.version }}
+          VERSION: ${{ steps.version.outputs.version }}
         run: |
           $url = "https://github.com/metacraft-labs/codetracer-solana-recorder/releases/download/v$Env:VERSION/codetracer-solana-recorder-$Env:VERSION-windows-x86_64.zip"
           $tmp = New-TemporaryFile
@@ -53,7 +75,7 @@ jobs:
       - name: Rewrite NuSpec + install script
         shell: pwsh
         env:
-          VERSION: ${{ inputs.version }}
+          VERSION: ${{ steps.version.outputs.version }}
           SHA_WINDOWS_X86_64: ${{ steps.hash.outputs.windows-x86_64 }}
         run: |
           $nuspec = 'packaging/chocolatey/codetracer-solana-recorder.nuspec'
@@ -83,7 +105,7 @@ jobs:
         shell: pwsh
         env:
           API_KEY: ${{ secrets.CHOCOLATEY_API_KEY }}
-          VERSION: ${{ inputs.version }}
+          VERSION: ${{ steps.version.outputs.version }}
         run: |
           if (-not $Env:API_KEY) {
             Write-Warning 'CHOCOLATEY_API_KEY not set; skipping push.'

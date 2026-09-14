@@ -47,10 +47,33 @@ on:
 jobs:
   build-and-publish-rpm:
     runs-on: [self-hosted, nixos]
-    name: rpm / ${{ inputs.arch }}
+    name: rpm / ${{ inputs.arch || 'x86_64' }}
     environment: rpm
+    env:
+      ARCH: ${{ inputs.arch || 'x86_64' }}
     steps:
       - uses: actions/checkout@v4
+
+      - name: Resolve the version
+        id: version
+        env:
+          INPUT_VERSION: ${{ inputs.version }}
+        run: |
+          set -euo pipefail
+          # The `inputs` context is populated only for workflow_dispatch. On a
+          # `push: tags` run it is empty, so take the version from the tag
+          # instead, and fail loudly rather than publishing an empty version.
+          if [ "${GITHUB_REF}" != "${GITHUB_REF#refs/tags/v}" ]; then
+            version="${GITHUB_REF#refs/tags/v}"
+          else
+            version="${INPUT_VERSION}"
+          fi
+          if [ -z "${version}" ]; then
+            echo "::error::Cannot resolve a version: this run is neither a refs/tags/v* push nor a workflow_dispatch supplying inputs.version." >&2
+            exit 1
+          fi
+          echo "Resolved version: ${version}"
+          echo "version=${version}" >> "$GITHUB_OUTPUT"
 
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@stable
@@ -63,14 +86,14 @@ jobs:
         run: |
           sudo apt-get update
           sudo apt-get install -y rpm xz-utils gnupg
-          if [[ "${{ inputs.arch }}" == "aarch64" ]]; then
+          if [[ "$ARCH" == "aarch64" ]]; then
             sudo apt-get install -y gcc-aarch64-linux-gnu
           fi
 
       - name: Build recorder binary
         run: |
           set -euo pipefail
-          if [[ "${{ inputs.arch }}" == "aarch64" ]]; then
+          if [[ "$ARCH" == "aarch64" ]]; then
             export CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER=aarch64-linux-gnu-gcc
             cargo build --release --locked \
               --target aarch64-unknown-linux-gnu \
@@ -83,6 +106,8 @@ jobs:
           fi
 
       - name: Build .rpm
+        env:
+          VERSION: ${{ steps.version.outputs.version }}
         run: |
           mkdir -p out
           bash packaging/rpm/build.sh \
@@ -90,9 +115,9 @@ jobs:
             "${{ env.binary }}" \
             out \
             codetracer-solana-recorder \
-            "${{ inputs.version }}" \
+            "$VERSION" \
             codetracer-solana-recorder \
-            "${{ inputs.arch }}"
+            "$ARCH"
 
       - name: Import GPG key
         if: ${{ inputs.dry_run == false }}
@@ -137,6 +162,6 @@ jobs:
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: codetracer-solana-recorder-${{ inputs.version }}-${{ inputs.arch }}.rpm
+          name: codetracer-solana-recorder-${{ steps.version.outputs.version }}-${{ env.ARCH }}.rpm
           path: out/*.rpm
           if-no-files-found: error
