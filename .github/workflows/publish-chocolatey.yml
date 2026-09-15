@@ -26,6 +26,12 @@ on:
         type: boolean
         default: false
 
+# Least privilege. The only GITHUB_TOKEN use in this workflow is the
+# release-assets preflight gate below, which only reads releases; the
+# push to the tap/bucket repo uses a deploy key, not this token.
+permissions:
+  contents: read
+
 jobs:
   build-and-publish:
     # Runs on the org's persistent reprobuild-managed Windows runners
@@ -59,6 +65,99 @@ jobs:
           }
           Write-Output "Resolved version: $version"
           "version=$version" | Out-File -FilePath $Env:GITHUB_OUTPUT -Append -Encoding ascii
+
+      # --- release-assets preflight gate -----------------------------
+      # Every step after this one fetches
+      #   https://github.com/<repo>/releases/download/v<version>/<asset>
+      # which resolves only when a PUBLISHED (non-draft) GitHub release
+      # for this tag already carries those exact asset names. On a
+      # `push: tags` run nothing guarantees that: this workflow CONSUMES
+      # release assets, it does not produce them, and it is not ordered
+      # after anything that does.
+      #
+      # Measured: without this step a missing asset surfaces as exactly
+      # 50 bytes -- `curl: (22) The requested URL returned error: 404`
+      # -- from the hash loop below. Quick, but it names neither the
+      # repo, the tag, the asset, nor which cause applies. This step
+      # costs one API call and names all four, telling the three causes
+      # apart because each needs a different fix:
+      #   * no release exists for the tag  -> cut one / add a producer
+      #   * a release exists but is a DRAFT -> publish it; draft assets
+      #     are NOT served at releases/download/ (both release workflows
+      #     in this fleet -- codetracer-native-recorder's release.yml and
+      #     codetracer-wasm-recorder's release.yaml -- cut drafts today)
+      #   * the release is published but lacks a name we fetch
+      #
+      # Deliberately one check, not a poll. For 47 of these 48 channels
+      # the asset is not late, it is never built (see the fleet audit in
+      # the commit message), so a wait-for-assets loop would convert a
+      # 1-second named red into a timeout-length anonymous one.
+      # `{v}` in REQUIRED_ASSETS is replaced with the version resolved
+      # above.
+      # ---------------------------------------------------------------
+      - name: Require a published release carrying the expected assets
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_REPO: metacraft-labs/codetracer-solana-recorder
+          CHANNEL: publish-chocolatey
+          VERSION: ${{ steps.version.outputs.version }}
+          REQUIRED_ASSETS: |
+            codetracer-solana-recorder-{v}-windows-x86_64.zip
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $tag = "v$Env:VERSION"
+          $api = "https://api.github.com/repos/$Env:RELEASE_REPO"
+          $headers = @{
+              'Accept'               = 'application/vnd.github+json'
+              'Authorization'        = "Bearer $Env:GH_TOKEN"
+              'X-GitHub-Api-Version' = '2022-11-28'
+          }
+
+          # Resolve the asset-name templates ({v} -> the version) up front, so every
+          # message below names the real file names this run needs.
+          $wanted = @()
+          foreach ($tpl in ($Env:REQUIRED_ASSETS -split "`n")) {
+              $t = $tpl.Trim()
+              if (-not $t) { continue }
+              $wanted += $t.Replace('{v}', $Env:VERSION)
+          }
+
+          $rel = $null
+          try {
+              $rel = Invoke-RestMethod -Uri "$api/releases/tags/$tag" -Headers $headers
+          } catch {
+              $status = 0
+              if ($_.Exception.Response) {
+                  $status = [int]$_.Exception.Response.StatusCode
+              }
+              if ($status -eq 404) {
+                  # GET /releases/tags/<tag> never matches a DRAFT: a draft carries no
+                  # tag association until it is published. List releases to tell the
+                  # two cases apart, because they need different fixes.
+                  $isDraft = $false
+                  try {
+                      $all = Invoke-RestMethod -Uri "$api/releases?per_page=100" -Headers $headers
+                      $isDraft = [bool]($all | Where-Object { $_.tag_name -eq $tag })
+                  } catch { $isDraft = $false }
+                  if ($isDraft) {
+                      Write-Output "::error title=${Env:CHANNEL}: release $tag is a DRAFT::$Env:RELEASE_REPO has a release for $tag, but it is a DRAFT. A draft's assets are NOT served at /releases/download/$tag/ , so every fetch below would 404. Publish (un-draft) the release, then re-run this workflow via workflow_dispatch with version=$Env:VERSION. Needs: $($wanted -join ' ')"
+                  } else {
+                      Write-Output "::error title=${Env:CHANNEL}: no release for $tag::$Env:RELEASE_REPO has no GitHub release for $tag, so /releases/download/$tag/ serves nothing. This workflow CONSUMES release assets; it does not produce them. Cut the release first, then re-run via workflow_dispatch with version=$Env:VERSION. Needs: $($wanted -join ' ')"
+                  }
+              } else {
+                  Write-Output "::error title=${Env:CHANNEL}: cannot query releases::GET $api/releases/tags/$tag failed with HTTP $status. Refusing to fetch assets blind."
+              }
+              exit 1
+          }
+
+          $present = @($rel.assets | ForEach-Object { $_.name })
+          $missing = @($wanted | Where-Object { $present -notcontains $_ })
+          if ($missing.Count -gt 0) {
+              Write-Output "::error title=${Env:CHANNEL}: release $tag is missing assets::Release $tag is published but does not carry: $($missing -join ' '). It carries: $($present -join ' '). The next step fetches each missing name by URL and would 404."
+              exit 1
+          }
+          Write-Output "Release $tag is published and carries every required asset: $($wanted -join ' ')"
 
       - name: Fetch sha256 for the windows-x86_64 zip
         id: hash

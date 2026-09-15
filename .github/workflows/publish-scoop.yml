@@ -24,6 +24,12 @@ on:
         required: true
         default: '0.1.0'
 
+# Least privilege. The only GITHUB_TOKEN use in this workflow is the
+# release-assets preflight gate below, which only reads releases; the
+# push to the tap/bucket repo uses a deploy key, not this token.
+permissions:
+  contents: read
+
 jobs:
   refresh-manifest:
     runs-on: [self-hosted, nixos]
@@ -52,6 +58,96 @@ jobs:
           fi
           echo "Resolved version: ${version}"
           echo "version=${version}" >> "$GITHUB_OUTPUT"
+
+      # --- release-assets preflight gate -----------------------------
+      # Every step after this one fetches
+      #   https://github.com/<repo>/releases/download/v<version>/<asset>
+      # which resolves only when a PUBLISHED (non-draft) GitHub release
+      # for this tag already carries those exact asset names. On a
+      # `push: tags` run nothing guarantees that: this workflow CONSUMES
+      # release assets, it does not produce them, and it is not ordered
+      # after anything that does.
+      #
+      # Measured: without this step a missing asset surfaces as exactly
+      # 50 bytes -- `curl: (22) The requested URL returned error: 404`
+      # -- from the hash loop below. Quick, but it names neither the
+      # repo, the tag, the asset, nor which cause applies. This step
+      # costs one API call and names all four, telling the three causes
+      # apart because each needs a different fix:
+      #   * no release exists for the tag  -> cut one / add a producer
+      #   * a release exists but is a DRAFT -> publish it; draft assets
+      #     are NOT served at releases/download/ (both release workflows
+      #     in this fleet -- codetracer-native-recorder's release.yml and
+      #     codetracer-wasm-recorder's release.yaml -- cut drafts today)
+      #   * the release is published but lacks a name we fetch
+      #
+      # Deliberately one check, not a poll. For 47 of these 48 channels
+      # the asset is not late, it is never built (see the fleet audit in
+      # the commit message), so a wait-for-assets loop would convert a
+      # 1-second named red into a timeout-length anonymous one.
+      # `{v}` in REQUIRED_ASSETS is replaced with the version resolved
+      # above.
+      # ---------------------------------------------------------------
+      - name: Require a published release carrying the expected assets
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_REPO: metacraft-labs/codetracer-solana-recorder
+          CHANNEL: publish-scoop
+          VERSION: ${{ steps.version.outputs.version }}
+          REQUIRED_ASSETS: |
+            codetracer-solana-recorder-{v}-windows-x86_64.zip
+        run: |
+          set -uo pipefail
+          tag="v${VERSION}"
+          api="https://api.github.com/repos/${RELEASE_REPO}"
+          accept="Accept: application/vnd.github+json"
+          auth="Authorization: Bearer ${GH_TOKEN}"
+
+          # Resolve the asset-name templates ({v} -> the version) up front, so every
+          # message below names the real file names this run needs.
+          wanted=""
+          while IFS= read -r tpl; do
+            [ -n "${tpl}" ] || continue
+            wanted="${wanted}${tpl//\{v\}/${VERSION}}"$'\n'
+          done <<< "${REQUIRED_ASSETS}"
+          wanted_1line="$(printf '%s' "${wanted}" | tr '\n' ' ')"
+
+          body="$(mktemp)"
+          code="$(curl -sS -o "${body}" -w '%{http_code}' -H "${accept}" -H "${auth}" "${api}/releases/tags/${tag}")" || code="000"
+
+          if [ "${code}" = "404" ]; then
+            # GET /releases/tags/<tag> never matches a DRAFT: a draft carries no tag
+            # association until it is published. List releases to tell the two cases
+            # apart, because they need different fixes.
+            list="$(mktemp)"
+            curl -sS -o "${list}" -H "${accept}" -H "${auth}" "${api}/releases?per_page=100" || true
+            if grep -q "\"tag_name\": *\"${tag}\"" "${list}"; then
+              echo "::error title=${CHANNEL}: release ${tag} is a DRAFT::${RELEASE_REPO} has a release for ${tag}, but it is a DRAFT. A draft's assets are NOT served at /releases/download/${tag}/ , so every fetch below would 404. Publish (un-draft) the release, then re-run this workflow via workflow_dispatch with version=${VERSION}. Needs: ${wanted_1line}"
+            else
+              echo "::error title=${CHANNEL}: no release for ${tag}::${RELEASE_REPO} has no GitHub release for ${tag}, so /releases/download/${tag}/ serves nothing. This workflow CONSUMES release assets; it does not produce them. Cut the release first, then re-run via workflow_dispatch with version=${VERSION}. Needs: ${wanted_1line}"
+            fi
+            exit 1
+          fi
+
+          if [ "${code}" != "200" ]; then
+            echo "::error title=${CHANNEL}: cannot query releases::GET ${api}/releases/tags/${tag} returned HTTP ${code}. Refusing to fetch assets blind."
+            exit 1
+          fi
+
+          # Exactly one "browser_download_url" per attached asset, and that key appears
+          # nowhere else in a release object -- so no JSON parser is needed on the runner.
+          present="$(sed -n 's/.*"browser_download_url": *"\([^"]*\)".*/\1/p' "${body}" | sed 's|.*/||')"
+          missing=""
+          while IFS= read -r want; do
+            [ -n "${want}" ] || continue
+            printf '%s\n' "${present}" | grep -qxF -- "${want}" || missing="${missing} ${want}"
+          done <<< "${wanted}"
+
+          if [ -n "${missing}" ]; then
+            echo "::error title=${CHANNEL}: release ${tag} is missing assets::Release ${tag} is published but does not carry:${missing} . It carries: $(printf '%s' "${present}" | tr '\n' ' '). The next step fetches each missing name by URL and would 404."
+            exit 1
+          fi
+          echo "Release ${tag} is published and carries every required asset: ${wanted_1line}"
 
       - name: Fetch sha256 for the windows-x86_64 zip
         id: hash
