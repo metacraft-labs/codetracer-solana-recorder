@@ -41,7 +41,7 @@ codetracer-solana-recorder replay --signature <SIG> \
 
 The recorder always writes traces in the canonical CodeTracer CTFS
 multi-stream format (see
-[`Recorder-CLI-Conventions.md`](https://github.com/metacraft-labs/codetracer-specs)
+`Recorder-CLI-Conventions.md`
 §4). To convert a recorded `.ct` bundle to JSON or text for
 inspection, use `ct print` (shipped with
 [`codetracer-trace-format-nim`](https://github.com/metacraft-labs/codetracer-trace-format-nim)).
