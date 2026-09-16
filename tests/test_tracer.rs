@@ -356,9 +356,12 @@ fn test_sbpf_step_events() {
 
     // 1 implicit start step at line 1 + 7 line-changes (5..=11) = 8 step events.
     assert_eq!(step_count, 8);
-    // 1 outer "main" frame -> 1 call_entry, 1 call_exit.
-    assert_eq!(call_count, 1);
-    assert_eq!(return_count, 1);
+    // 2 frames: `<toplevel>`, the call tree's root that `start` opens at
+    // depth 0 (trace-events.md, "Recorder Integration — Starting a
+    // Recording"), and the outer "main" frame.  Each opens once and
+    // closes once.
+    assert_eq!(call_count, 2);
+    assert_eq!(return_count, 2);
 
     // Path table is exactly the single fixture file.
     let paths: Vec<&Path> = events

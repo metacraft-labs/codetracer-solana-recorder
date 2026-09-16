@@ -11,7 +11,8 @@
 //! This validates:
 //! - DwarfParser correctly resolves PCs to source locations
 //! - record_from_traces feeds those locations into the trace writer
-//! - The output JSON contains Step events matching the DWARF-resolved lines
+//! - The decoded `.ct` container contains Step events matching the
+//!   DWARF-resolved lines
 //! - Register values appear as variables in the trace
 //!
 //! The ELF/DWARF source is the committed `test-programs/cpi_fixture.elf`
@@ -44,6 +45,57 @@ fn load_recorder_elf() -> Vec<u8> {
         .join("cpi_fixture.elf");
     std::fs::read(&path)
         .unwrap_or_else(|e| panic!("should be able to read ELF fixture {}: {e}", path.display()))
+}
+
+/// Locate the `.ct` container the recorder wrote into `out_dir` and decode it
+/// in process.
+///
+/// Decoding happens here rather than by shelling out to `ct-print` so that a
+/// missing binary cannot turn these assertions into a silent pass.  A container
+/// that decodes to no events is a failure, named by path — never an empty list
+/// handed back to the caller.
+fn read_recorded_events(out_dir: &Path) -> Vec<TraceLowLevelEvent> {
+    let ct_files: Vec<_> = std::fs::read_dir(out_dir)
+        .unwrap_or_else(|e| {
+            panic!(
+                "recorder output directory {} should be readable: {e}",
+                out_dir.display()
+            )
+        })
+        .filter_map(|e| e.ok())
+        .map(|e| e.path())
+        .filter(|p| p.extension().is_some_and(|ext| ext == "ct"))
+        .collect();
+    assert!(
+        !ct_files.is_empty(),
+        "expected a .ct container in {}",
+        out_dir.display()
+    );
+
+    let ct_path = &ct_files[0];
+    let content = std::fs::read(ct_path)
+        .unwrap_or_else(|e| panic!("should be able to read {}: {e}", ct_path.display()));
+    assert!(
+        content.len() >= 5 && content[..5] == [0xC0, 0xDE, 0x72, 0xAC, 0xE2],
+        "{} should start with the CTFS magic bytes",
+        ct_path.display()
+    );
+
+    let events = codetracer_trace_reader::ctfs_reader::read_trace_from_ctfs(ct_path)
+        .unwrap_or_else(|error| {
+            panic!(
+                "read back {} — the recorder wrote it, so this reader must be able to \
+                 decode it: {error}",
+                ct_path.display()
+            )
+        });
+    assert!(
+        !events.is_empty(),
+        "the recorder produced {} but it decoded to no events at all",
+        ct_path.display()
+    );
+
+    events
 }
 
 /// Build a .regs binary blob from a list of (pc, register_values) pairs.
@@ -116,7 +168,6 @@ fn find_distinct_rs_locations(parser: &DwarfParser, count: usize) -> Vec<(u64, S
 /// contains Step events with the correct source file paths and line numbers
 /// as determined by DWARF debug info.
 #[test]
-#[allow(unreachable_code, unused_variables)]
 fn test_real_elf_dwarf_source_mapping_pipeline() {
     let elf_data = load_recorder_elf();
     let parser = DwarfParser::new(&elf_data).expect("ELF should parse");
@@ -160,21 +211,7 @@ fn test_real_elf_dwarf_source_mapping_pipeline() {
         result.err()
     );
 
-    // Verify .ct output.
-    let ct_files: Vec<_> = std::fs::read_dir(tmp.path())
-        .unwrap()
-        .filter_map(|e| e.ok())
-        .map(|e| e.path())
-        .filter(|p| p.extension().is_some_and(|ext| ext == "ct"))
-        .collect();
-    assert!(!ct_files.is_empty(), "expected .ct file");
-    let ct_content = std::fs::read(&ct_files[0]).unwrap();
-    assert!(ct_content.len() >= 5 && ct_content[..5] == [0xC0, 0xDE, 0x72, 0xAC, 0xE2]);
-    // CTFS: event-level checks deferred.
-    let events: Vec<TraceLowLevelEvent> = vec![];
-    if events.is_empty() {
-        return;
-    }
+    let events = read_recorded_events(tmp.path());
 
     // --- Verify Step events ---
     let step_events: Vec<_> = events
@@ -275,7 +312,6 @@ fn test_real_elf_dwarf_source_mapping_pipeline() {
 /// with source locations, and that register snapshots traversing different
 /// functions produce Call/Return events in the trace.
 #[test]
-#[allow(unreachable_code, unused_variables)]
 fn test_real_elf_function_boundaries_in_trace() {
     let elf_data = load_recorder_elf();
     let parser = DwarfParser::new(&elf_data).expect("ELF should parse");
@@ -328,22 +364,7 @@ fn test_real_elf_function_boundaries_in_trace() {
         result.err()
     );
 
-    // Parse trace output.
-    // Verify .ct output and skip event checks.
-    let ct_files2: Vec<_> = std::fs::read_dir(tmp.path())
-        .unwrap()
-        .filter_map(|e| e.ok())
-        .map(|e| e.path())
-        .filter(|p| p.extension().is_some_and(|ext| ext == "ct"))
-        .collect();
-    assert!(!ct_files2.is_empty(), "expected .ct file");
-    // CTFS: event-level checks deferred.
-    let content = String::new();
-    let events: Vec<TraceLowLevelEvent> = vec![];
-    if events.is_empty() {
-        return;
-    }
-    let events: Vec<TraceLowLevelEvent> = serde_json::from_str(&content).expect("valid JSON");
+    let events = read_recorded_events(tmp.path());
 
     // Count event types.
     let call_count = events
@@ -388,7 +409,6 @@ fn test_real_elf_function_boundaries_in_trace() {
 /// exactly that line number. This is a stricter version of test 1 that
 /// checks each location individually.
 #[test]
-#[allow(unreachable_code, unused_variables)]
 fn test_dwarf_line_fidelity_per_location() {
     let elf_data = load_recorder_elf();
     let parser = DwarfParser::new(&elf_data).expect("ELF should parse");
@@ -414,21 +434,7 @@ fn test_dwarf_line_fidelity_per_location() {
         );
         assert!(result.is_ok(), "recording should succeed for PC {pc}");
 
-        // Verify .ct output and skip event checks.
-        let ct_files2: Vec<_> = std::fs::read_dir(tmp.path())
-            .unwrap()
-            .filter_map(|e| e.ok())
-            .map(|e| e.path())
-            .filter(|p| p.extension().is_some_and(|ext| ext == "ct"))
-            .collect();
-        assert!(!ct_files2.is_empty(), "expected .ct file");
-        // CTFS: event-level checks deferred.
-        let content = String::new();
-        let events: Vec<TraceLowLevelEvent> = vec![];
-        if events.is_empty() {
-            return;
-        }
-        let events: Vec<TraceLowLevelEvent> = serde_json::from_str(&content).expect("valid JSON");
+        let events = read_recorded_events(tmp.path());
 
         let step_events: Vec<_> = events
             .iter()
@@ -464,7 +470,6 @@ fn test_dwarf_line_fidelity_per_location() {
 /// and verifies consistency: the same PCs that DWARF maps to source locations
 /// should produce steps in the trace.
 #[test]
-#[allow(unreachable_code, unused_variables)]
 fn test_register_trace_roundtrip_with_dwarf() {
     use codetracer_solana_recorder::register_trace::parse_regs_file;
 
@@ -523,21 +528,7 @@ fn test_register_trace_roundtrip_with_dwarf() {
     )
     .unwrap();
 
-    // Verify .ct output and skip event checks.
-    let ct_files2: Vec<_> = std::fs::read_dir(tmp.path())
-        .unwrap()
-        .filter_map(|e| e.ok())
-        .map(|e| e.path())
-        .filter(|p| p.extension().is_some_and(|ext| ext == "ct"))
-        .collect();
-    assert!(!ct_files2.is_empty(), "expected .ct file");
-    // CTFS: event-level checks deferred.
-    let content = String::new();
-    let events: Vec<TraceLowLevelEvent> = vec![];
-    if events.is_empty() {
-        return;
-    }
-    let events: Vec<TraceLowLevelEvent> = serde_json::from_str(&content).expect("valid JSON");
+    let events = read_recorded_events(tmp.path());
 
     // Count steps -- should be at least as many as distinct source locations.
     let step_count = events

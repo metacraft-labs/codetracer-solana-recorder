@@ -112,6 +112,15 @@ pub struct CodeTracerTracer {
     started: bool,
     /// Accumulated syscall names for later inspection in tests.
     recorded_syscalls: Vec<String>,
+    /// Source paths whose per-line length table is non-empty.
+    ///
+    /// A column is only addressable in a file the writer sized from its own
+    /// line table; a file registered without one is sized by the line-only
+    /// fallback, where one address is one line and a column delta would name a
+    /// later LINE instead. DWARF paths routinely do not resolve on the
+    /// recording machine — a build on another host, or `--remap-path-prefix` —
+    /// so this is the normal case, not an edge one.
+    tabled_paths: std::collections::HashSet<String>,
 }
 
 impl CodeTracerTracer {
@@ -187,9 +196,13 @@ impl CodeTracerTracer {
         // counts and the column-aware reader would silently fall back
         // to the legacy DefaultLinesPerFile GLI.
         let mut registered: std::collections::HashSet<String> = std::collections::HashSet::new();
+        let mut tabled_paths: std::collections::HashSet<String> = std::collections::HashSet::new();
         registered.insert(source_path.to_string_lossy().into_owned());
         {
             let line_lengths = crate::recorder::read_line_lengths_for_path(source_path);
+            if !line_lengths.is_empty() {
+                tabled_paths.insert(source_path.to_string_lossy().into_owned());
+            }
             let _ = TraceWriter::register_path_with_line_lengths(
                 &mut *writer,
                 source_path,
@@ -202,6 +215,9 @@ impl CodeTracerTracer {
             if registered.insert(file.clone()) {
                 let p = Path::new(&file);
                 let lengths = crate::recorder::read_line_lengths_for_path(p);
+                if !lengths.is_empty() {
+                    tabled_paths.insert(file.clone());
+                }
                 let _ = TraceWriter::register_path_with_line_lengths(&mut *writer, p, &lengths);
             }
             loc_map.insert(pc, (file, line, column));
@@ -225,6 +241,7 @@ impl CodeTracerTracer {
             _out_dir: out_dir.to_path_buf(),
             started: true,
             recorded_syscalls: Vec::new(),
+            tabled_paths,
         })
     }
 
@@ -276,6 +293,14 @@ impl SbpfTracer for CodeTracerTracer {
         // fire; same-line column changes fire too so multi-statement
         // lines surface distinct steps.  When `column` is `None` the
         // wrapper falls back to the column-less `register_step` path.
+        // Offer the column only for a file the writer can address one in. For
+        // any other file the position space is line-only, so a column would be
+        // folded into the address and read back as a different line.
+        let column = if self.tabled_paths.contains(&file_str) {
+            column
+        } else {
+            None
+        };
         let line_changed = self.prev_line != Some(line);
         let column_changed = column.is_some() && self.prev_column != column;
         if line_changed || column_changed {

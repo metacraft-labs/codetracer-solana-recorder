@@ -563,18 +563,27 @@ fn test_function_call_return_pc_jumps() {
 
     // 2 calls: main (outermost) + the synthesised fn_at_pc_100 frame.
     let calls = call_events(&events);
-    assert_eq!(calls.len(), 2);
+    // The `<toplevel>` frame counts as a call: `start` opens it at depth 0
+    // as the call tree's root, before any call the recorder makes
+    // (trace-events.md, "Recorder Integration — Starting a Recording").
+    assert_eq!(calls.len(), 3);
 
     // 2 returns: callee return + main return.
     let returns = return_events(&events);
-    assert_eq!(returns.len(), 2);
+    // The `<toplevel>` frame returns too: it is the call tree's root that
+    // `start` opens at depth 0, and it closes last
+    // (trace-events.md, "Recorder Integration — Starting a Recording").
+    assert_eq!(returns.len(), 3);
 
     // Function table is exactly the two resolved names, in registration order.
     let func_names: Vec<&str> = function_events(&events)
         .iter()
         .map(|f| f.name.as_str())
         .collect();
-    assert_eq!(func_names, vec!["main", "fn_at_pc_100"]);
+    // `<toplevel>` heads the table: it is the call tree's root, which
+    // `start` registers before any function the recorder resolves
+    // (trace-events.md, "Recorder Integration — Starting a Recording").
+    assert_eq!(func_names, vec!["<toplevel>", "main", "fn_at_pc_100"]);
 
     // Path table is exactly the two source files, in registration order.
     let paths: Vec<&Path> = path_events(&events);
@@ -734,14 +743,23 @@ fn test_nested_function_calls() {
 
     // 3 calls: main + foo (PC 100 forward jump) + bar (PC 200 forward jump).
     let calls = call_events(&events);
-    assert_eq!(calls.len(), 3);
+    // The `<toplevel>` frame counts as a call: `start` opens it at depth 0
+    // as the call tree's root, before any call the recorder makes
+    // (trace-events.md, "Recorder Integration — Starting a Recording").
+    assert_eq!(calls.len(), 4);
 
     // Function table in registration order.
     let func_names: Vec<&str> = function_events(&events)
         .iter()
         .map(|f| f.name.as_str())
         .collect();
-    assert_eq!(func_names, vec!["main", "fn_at_pc_100", "fn_at_pc_200"]);
+    // `<toplevel>` heads the table: it is the call tree's root, which
+    // `start` registers before any function the recorder resolves
+    // (trace-events.md, "Recorder Integration — Starting a Recording").
+    assert_eq!(
+        func_names,
+        vec!["<toplevel>", "main", "fn_at_pc_100", "fn_at_pc_200"]
+    );
 }
 
 // ===========================================================================
@@ -794,15 +812,24 @@ fn test_cpi_single_call_to_system_program() {
         .iter()
         .map(|f| f.name.as_str())
         .collect();
-    assert_eq!(func_names, vec!["main", "system_program"]);
+    // `<toplevel>` heads the table: it is the call tree's root, which
+    // `start` registers before any function the recorder resolves
+    // (trace-events.md, "Recorder Integration — Starting a Recording").
+    assert_eq!(func_names, vec!["<toplevel>", "main", "system_program"]);
 
     // 2 calls: main (outermost) + system_program (CPI).
     let calls = call_events(&events);
-    assert_eq!(calls.len(), 2);
+    // The `<toplevel>` frame counts as a call: `start` opens it at depth 0
+    // as the call tree's root, before any call the recorder makes
+    // (trace-events.md, "Recorder Integration — Starting a Recording").
+    assert_eq!(calls.len(), 3);
 
     // 2 returns: CPI return + main return.
     let returns = return_events(&events);
-    assert_eq!(returns.len(), 2);
+    // The `<toplevel>` frame returns too: it is the call tree's root that
+    // `start` opens at depth 0, and it closes last
+    // (trace-events.md, "Recorder Integration — Starting a Recording").
+    assert_eq!(returns.len(), 3);
 
     // Path table contains both source files in registration order.
     let paths: Vec<&Path> = path_events(&events);
@@ -868,18 +895,27 @@ fn test_cpi_nested_three_programs() {
         .iter()
         .map(|f| f.name.as_str())
         .collect();
+    // `<toplevel>` heads the table: it is the call tree's root, which
+    // `start` registers before any function the recorder resolves
+    // (trace-events.md, "Recorder Integration — Starting a Recording").
     assert_eq!(
         func_names,
-        vec!["main", "token_program", "associated_token"],
+        vec!["<toplevel>", "main", "token_program", "associated_token"],
     );
 
     // 3 calls: main + 2 CPIs.
     let calls = call_events(&events);
-    assert_eq!(calls.len(), 3);
+    // The `<toplevel>` frame counts as a call: `start` opens it at depth 0
+    // as the call tree's root, before any call the recorder makes
+    // (trace-events.md, "Recorder Integration — Starting a Recording").
+    assert_eq!(calls.len(), 4);
 
     // 3 returns: 2 CPI returns + main return.
     let returns = return_events(&events);
-    assert_eq!(returns.len(), 3);
+    // The `<toplevel>` frame returns too: it is the call tree's root that
+    // `start` opens at depth 0, and it closes last
+    // (trace-events.md, "Recorder Integration — Starting a Recording").
+    assert_eq!(returns.len(), 4);
 
     // Path table in registration order.
     let paths: Vec<&Path> = path_events(&events);
@@ -975,7 +1011,10 @@ fn test_cpi_with_multiple_accounts() {
         .iter()
         .map(|f| f.name.as_str())
         .collect();
-    assert_eq!(func_names, vec!["main", "target"]);
+    // `<toplevel>` heads the table: it is the call tree's root, which
+    // `start` registers before any function the recorder resolves
+    // (trace-events.md, "Recorder Integration — Starting a Recording").
+    assert_eq!(func_names, vec!["<toplevel>", "main", "target"]);
 }
 
 /// CPI return value propagation: callee sets r0 before returning.
@@ -1037,7 +1076,10 @@ fn test_cpi_return_value_propagation() {
         .iter()
         .map(|f| f.name.as_str())
         .collect();
-    assert_eq!(func_names, vec!["main", "callee"]);
+    // `<toplevel>` heads the table: it is the call tree's root, which
+    // `start` registers before any function the recorder resolves
+    // (trace-events.md, "Recorder Integration — Starting a Recording").
+    assert_eq!(func_names, vec!["<toplevel>", "main", "callee"]);
 }
 
 // ===========================================================================
@@ -1635,9 +1677,15 @@ fn test_variable_tracking_pc_progression() {
     // No large PC jumps, so the trace has exactly one main frame: 1 call,
     // 1 return.
     let calls = call_events(&events);
-    assert_eq!(calls.len(), 1);
+    // The `<toplevel>` frame counts as a call: `start` opens it at depth 0
+    // as the call tree's root, before any call the recorder makes
+    // (trace-events.md, "Recorder Integration — Starting a Recording").
+    assert_eq!(calls.len(), 2);
     let returns = return_events(&events);
-    assert_eq!(returns.len(), 1);
+    // The `<toplevel>` frame returns too: it is the call tree's root that
+    // `start` opens at depth 0, and it closes last
+    // (trace-events.md, "Recorder Integration — Starting a Recording").
+    assert_eq!(returns.len(), 2);
 
     // 1 implicit start step + 5 line-changes (1..=5) = 6 step events.
     let steps = step_events(&events);
@@ -1750,7 +1798,10 @@ fn test_error_path_panic_abort() {
         .iter()
         .map(|f| f.name.as_str())
         .collect();
-    assert_eq!(func_names, vec!["main", "fn_at_pc_90000"]);
+    // `<toplevel>` heads the table: it is the call tree's root, which
+    // `start` registers before any function the recorder resolves
+    // (trace-events.md, "Recorder Integration — Starting a Recording").
+    assert_eq!(func_names, vec!["<toplevel>", "main", "fn_at_pc_90000"]);
 
     // Path table: user source + panicking-runtime source, in registration order.
     let paths: Vec<&Path> = path_events(&events);
@@ -1803,9 +1854,15 @@ fn test_single_instruction_trace() {
     let steps = step_events(&events);
     assert_eq!(steps.len(), 2);
     let calls = call_events(&events);
-    assert_eq!(calls.len(), 1);
+    // The `<toplevel>` frame counts as a call: `start` opens it at depth 0
+    // as the call tree's root, before any call the recorder makes
+    // (trace-events.md, "Recorder Integration — Starting a Recording").
+    assert_eq!(calls.len(), 2);
     let returns = return_events(&events);
-    assert_eq!(returns.len(), 1);
+    // The `<toplevel>` frame returns too: it is the call tree's root that
+    // `start` opens at depth 0, and it closes last
+    // (trace-events.md, "Recorder Integration — Starting a Recording").
+    assert_eq!(returns.len(), 2);
 
     // Distinct integer values: 0 (zero registers), 1, 2, 3 (r1..r3), 42 (r0).
     let mut int_values: Vec<i64> = events
@@ -2212,16 +2269,25 @@ fn test_cpi_large_multi_program_trace() {
         .iter()
         .map(|f| f.name.as_str())
         .collect();
+    // `<toplevel>` heads the table: it is the call tree's root, which
+    // `start` registers before any function the recorder resolves
+    // (trace-events.md, "Recorder Integration — Starting a Recording").
     assert_eq!(
         func_names,
-        vec!["main", "program_a", "program_b", "program_c"],
+        vec!["<toplevel>", "main", "program_a", "program_b", "program_c"],
     );
 
     // 4 calls (main + 3 CPIs), 4 matching returns.
     let calls = call_events(&events);
-    assert_eq!(calls.len(), 4);
+    // The `<toplevel>` frame counts as a call: `start` opens it at depth 0
+    // as the call tree's root, before any call the recorder makes
+    // (trace-events.md, "Recorder Integration — Starting a Recording").
+    assert_eq!(calls.len(), 5);
     let returns = return_events(&events);
-    assert_eq!(returns.len(), 4);
+    // The `<toplevel>` frame returns too: it is the call tree's root that
+    // `start` opens at depth 0, and it closes last
+    // (trace-events.md, "Recorder Integration — Starting a Recording").
+    assert_eq!(returns.len(), 5);
 
     // Path table contains all 4 source files in registration order.
     let paths: Vec<&Path> = path_events(&events);

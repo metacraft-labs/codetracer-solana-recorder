@@ -471,18 +471,28 @@ fn test_recorded_trace_via_ct_print_json() {
         .iter()
         .filter_map(|v| v.as_str())
         .collect();
+    // TWO: `<toplevel>` plus the program's own entry point. `<toplevel>` is
+    // the call tree's root, registered by `start` — see `trace-events.md`
+    // §"Recorder Integration — Starting a Recording" — so every recording
+    // carries it as function 0.
     assert_eq!(
         functions.len(),
-        1,
-        "expected exactly 1 entry in the functions table; got {:?} — \
+        2,
+        "expected exactly 2 entries in the functions table (`<toplevel>` and \
+         the entry point); got {:?} — \
          if multi-frame call synthesis or DWARF function-name \
          resolution has landed, extend this test to assert on the \
          resolved names via `ends_with` matching",
         functions
     );
+    assert_eq!(
+        functions[0], "<toplevel>",
+        "the call tree's root is function 0; got {:?}",
+        functions
+    );
     assert!(
-        functions[0].ends_with("main"),
-        "expected the sole function-table entry to be `main`; got {:?}",
+        functions[1].ends_with("main"),
+        "expected the program's own entry point after `<toplevel>`; got {:?}",
         functions
     );
 
@@ -501,11 +511,15 @@ fn test_recorded_trace_via_ct_print_json() {
         "expected 8 step events for the synthetic Solana fixture; \
          counts={counts}",
     );
+    // TWO: the `<toplevel>` frame `start` opens as the call tree's root
+    // (`trace-events.md` §"Recorder Integration — Starting a Recording") and
+    // the synthesised `main` frame inside it. The step count is unchanged —
+    // the entry step was always emitted.
     assert_eq!(
         counts["calls"].as_u64(),
-        Some(1),
-        "expected exactly 1 call event (the synthesised `main` frame); \
-         counts={counts}",
+        Some(2),
+        "expected 2 call events (`<toplevel>` and the synthesised `main` \
+         frame); counts={counts}",
     );
     assert_eq!(
         counts["paths"].as_u64(),
@@ -515,7 +529,10 @@ fn test_recorded_trace_via_ct_print_json() {
 
     let events = doc["events"].as_array().expect("events array");
 
-    // ----- Call sequence: exactly `main` -----------------------------
+    // ----- Call sequence: `<toplevel>`, then `main` -------------------
+    // `<toplevel>` is the call tree's root, opened by `start`
+    // (`trace-events.md` §"Recorder Integration — Starting a Recording"), and
+    // `main` is the frame the recorder synthesises inside it.
     let call_sequence: Vec<&str> = events
         .iter()
         .filter(|e| e["kind"] == "call_entry")
@@ -523,13 +540,18 @@ fn test_recorded_trace_via_ct_print_json() {
         .collect();
     assert_eq!(
         call_sequence.len(),
-        1,
-        "expected exactly 1 call_entry event; got {:?}",
+        2,
+        "expected 2 call_entry events (`<toplevel>` then `main`); got {:?}",
+        call_sequence
+    );
+    assert_eq!(
+        call_sequence[0], "<toplevel>",
+        "the first call_entry is the call tree's root; got {:?}",
         call_sequence
     );
     assert!(
-        call_sequence[0].ends_with("main"),
-        "expected the sole call_entry to be `main`; got {:?}",
+        call_sequence[1].ends_with("main"),
+        "expected `main` inside `<toplevel>`; got {:?}",
         call_sequence
     );
 

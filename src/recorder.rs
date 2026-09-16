@@ -341,6 +341,27 @@ fn resolve_source_against_elf_crate(dwarf_path: &Path, elf_path: &Path) -> PathB
 /// ``user_crate_root`` when available.  Everything else is passed
 /// through unchanged so synthetic-fixture tests that pass bare
 /// basenames still see the basename in the recorded trace.
+/// Whether `path` has a per-line length table, resolved the same way path
+/// registration resolves it.
+///
+/// A column is only addressable in a file the writer sized from its own line
+/// table. A file registered without one is sized by the line-only fallback,
+/// where one address is one line — so a column folded into that address reads
+/// back as a LATER LINE, not as a column. DWARF paths routinely fail to
+/// resolve on the recording machine (`--remap-path-prefix`, a build on another
+/// host), which makes this the normal case rather than an edge one.
+fn path_has_line_table(path: &Path, source_path: &Path) -> bool {
+    if !read_line_lengths_for_path(path).is_empty() {
+        return true;
+    }
+    // The same parent-directory fallback path registration applies, so the two
+    // cannot disagree about whether a file is addressable.
+    source_path
+        .parent()
+        .map(|p| !read_line_lengths_for_path(&p.join(path)).is_empty())
+        .unwrap_or(false)
+}
+
 fn canonical_step_path(
     file_str: &str,
     source_path_str: &str,
@@ -2558,6 +2579,9 @@ pub fn record_from_snapshots_into_writer(
     // §"Column Encoding").  Outside column-aware mode this stays at
     // `None` and the legacy line-only dedupe applies.
     let mut prev_column: Option<u32> = None;
+    // Memoised per step path: does this file have a column axis at all?
+    let mut column_addressable: std::collections::HashMap<PathBuf, bool> =
+        std::collections::HashMap::new();
     let mut prev_pc: Option<u64> = None;
     let mut prev_regs: [u64; 12] = [0u64; 12];
 
@@ -2697,6 +2721,15 @@ pub fn record_from_snapshots_into_writer(
             // same path string as the trace anchor.
             let step_path =
                 canonical_step_path(file_str, &source_path_str, user_crate_root.as_deref());
+            // Offer the column only for a file the writer can address one in.
+            let column = if *column_addressable
+                .entry(step_path.clone())
+                .or_insert_with(|| path_has_line_table(&step_path, &source_path))
+            {
+                column
+            } else {
+                None
+            };
             TraceWriter::register_step_with_column(
                 writer,
                 &step_path,
