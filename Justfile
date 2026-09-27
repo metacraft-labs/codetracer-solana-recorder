@@ -52,7 +52,7 @@ prepare-ci:
   echo "CODETRACER_NIM_LIB_DIR=${GITHUB_WORKSPACE}/../codetracer-trace-format-nim" >> "${GITHUB_ENV:-/dev/null}"
 
 # --- M13: Packaging UX Standardization ---
-# These recipes implement Repo-Requirements.md §2.8. The OS-packaged
+# These recipes implement Repo-Requirements.md §2.5. The OS-packaged
 # recorders share a uniform packaging surface: `bump-version` rewrites
 # Cargo.toml + packaging/recorder-metadata.yml; `build-package` shells
 # out to packaging/build-all.sh with the requested channel selector;
