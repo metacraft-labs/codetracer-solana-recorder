@@ -1701,11 +1701,10 @@ fn synthesise_return_value(
     } else if let Some(stripped) = text.strip_prefix("return Ok(") {
         let close = stripped.rfind(')')?;
         ("Ok".to_string(), stripped[..close].trim().to_string())
-    } else if let Some(stripped) = text.strip_prefix("Ok(") {
+    } else {
+        let stripped = text.strip_prefix("Ok(")?;
         let close = stripped.rfind(')')?;
         ("Ok".to_string(), stripped[..close].trim().to_string())
-    } else {
-        return None;
     };
     let inner = decode_return_payload(&payload_text, type_ids, writer);
     let result_type_id = type_ids.ensure_variant(writer, "Result");

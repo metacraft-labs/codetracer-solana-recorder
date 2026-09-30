@@ -51,6 +51,39 @@
             # devShell via ``nix develop -c sh``).
             mcl-blockchain.packages.${system}.cargo-build-sbf
           ];
+
+          # `cargo <subcommand>` looks for `cargo-<subcommand>` in
+          # `$CARGO_HOME/bin` BEFORE it searches PATH. On any machine with
+          # rustup — including the self-hosted macOS runner — that directory
+          # holds rustup's proxies, so `cargo fmt` and `cargo clippy` run
+          # rustup's `cargo-fmt` / `cargo-clippy` instead of the shell's, and
+          # fail with "'cargo-fmt' is not installed for the toolchain".
+          #
+          # The shell therefore gets its own CARGO_HOME with an empty `bin/`,
+          # so subcommand lookup falls through to PATH. `registry/` and `git/`
+          # are symlinks to the real CARGO_HOME, and so are its config and
+          # credentials when present: the download cache is shared, and only
+          # the proxy directory is left behind.
+          shellHook = ''
+            _solana_real_cargo_home="''${CARGO_HOME:-$HOME/.cargo}"
+            _solana_cargo_home="''${XDG_CACHE_HOME:-$HOME/.cache}/codetracer-solana-recorder/cargo-home"
+            if [ "$_solana_real_cargo_home" != "$_solana_cargo_home" ]; then
+              mkdir -p "$_solana_cargo_home" \
+                "$_solana_real_cargo_home/registry" "$_solana_real_cargo_home/git"
+              # Re-pointed on every entry, so a changed CARGO_HOME is followed
+              # rather than left sharing the previous one's cache. Only a link
+              # is ever replaced; a real file placed here is left alone.
+              for _solana_entry in registry git config.toml credentials.toml; do
+                if [ -e "$_solana_real_cargo_home/$_solana_entry" ] &&
+                  { [ -L "$_solana_cargo_home/$_solana_entry" ] ||
+                    [ ! -e "$_solana_cargo_home/$_solana_entry" ]; }; then
+                  ln -sfn "$_solana_real_cargo_home/$_solana_entry" "$_solana_cargo_home/$_solana_entry"
+                fi
+              done
+              export CARGO_HOME="$_solana_cargo_home"
+            fi
+            unset _solana_real_cargo_home _solana_cargo_home _solana_entry
+          '';
         };
       }
     );
