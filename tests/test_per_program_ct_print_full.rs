@@ -3453,9 +3453,8 @@ fn test_declare_id_entrypoint_test_via_ct_print_full() {
 // Solana-syscall-shaped macros that are distinct from `msg!`:
 //
 //   * `sol_log_data!(...)` — Solana's binary-log syscall.  Surfaces as
-//     a `TraceLogEvent`-kinded io_event (mapped to `ioStderr` in the
-//     multi-stream IO event stream) so the strict pin can distinguish
-//     it from a `Write`-kinded (`ioStdout`) `msg!` event by `io_kind`.
+//     a `TraceLogEvent`-kinded io_event, so the strict pin can
+//     distinguish it from a `Write`-kinded `msg!` event by `io_kind`.
 //   * `sol_log_compute_units!(N)` — emits the SBF VM's remaining-units
 //     counter.  Also a `TraceLogEvent` event but with a metadata-style
 //     `compute_units_remaining=<N>` payload the recorder parses out of
@@ -3489,7 +3488,7 @@ fn sol_log_data_compute_snapshots() -> (Vec<RegisterSnapshot>, Vec<(u64, &'stati
 /// Decode every (io_kind, text) pair from io_events, in events order.
 /// Used by the `sol_log_data` / `sol_log_compute_units` test to assert
 /// that each macro shape surfaces with its expected `io_kind`
-/// distinguisher (sol_log_data → `ioStderr`, msg! → `ioStdout`).
+/// distinguisher (sol_log_data → `TraceLogEvent`, msg! → `Write`).
 fn observed_io_kind_and_text(doc: &serde_json::Value) -> Vec<(String, String)> {
     doc["events"]
         .as_array()
@@ -3564,22 +3563,22 @@ fn test_sol_log_data_compute_test_via_ct_print_full() {
         kinds_and_text,
         vec![
             (
-                "ioStdout".to_string(),
+                "Write".to_string(),
                 "about to log binary event".to_string(),
             ),
             (
-                "ioStderr".to_string(),
+                "TraceLogEvent".to_string(),
                 "data:&[b\"event\", &payload]".to_string(),
             ),
             (
-                "ioStderr".to_string(),
+                "TraceLogEvent".to_string(),
                 "compute_units_remaining=199500".to_string(),
             ),
         ],
-        "msg! must surface as `Write`/`ioStdout`; both `sol_log_data!` \
-         and `sol_log_compute_units!` must surface as `TraceLogEvent`/\
-         `ioStderr` with their respective payloads (binary-log args + \
-         parsed compute-units integer)",
+        "msg! must surface as `Write`; both `sol_log_data!` and \
+         `sol_log_compute_units!` must surface as `TraceLogEvent` with \
+         their respective payloads (binary-log args + parsed \
+         compute-units integer)",
     );
 }
 
