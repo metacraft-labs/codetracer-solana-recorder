@@ -286,20 +286,41 @@ fn record(args: RecordArgs) -> Result<()> {
     let elf_data = std::fs::read(&elf_path)
         .with_context(|| format!("failed to read ELF file: {}", elf_path.display()))?;
 
-    let regs_data = codetracer_solana_recorder::executor::execute_with_tracing(
+    let exec = codetracer_solana_recorder::executor::execute_with_memory_trace(
         &elf_data, 1_000_000, // 1M compute units
     )
     .with_context(|| "SBF VM execution failed")?;
 
     eprintln!(
         "Execution complete: {} register snapshots",
-        regs_data.len() / 96
+        exec.regs.len() / 96
     );
 
-    // Use the existing record_from_traces pipeline.
-    codetracer_solana_recorder::recorder::record_from_traces(
-        &regs_data, &elf_data, &elf_path, &out_dir,
-    )?;
+    // With DWARF describing the executed code, record at the source level:
+    // real files and lines, named locals read through their DWARF
+    // locations, and function frames.
+    match codetracer_solana_recorder::source_debug::SourceDebugInfo::load(&elf_data, &elf_path) {
+        Ok(debug)
+            if codetracer_solana_recorder::source_recorder::describes_execution(&debug, &exec) =>
+        {
+            codetracer_solana_recorder::source_recorder::record_execution(
+                &exec, &debug, &elf_path, &out_dir,
+            )?;
+        }
+        other => {
+            if let Err(e) = other {
+                eprintln!("No usable debug info ({e}); recording without source-level locals.");
+            } else {
+                eprintln!(
+                    "The ELF's debug info does not describe the executed code; \
+                     recording without source-level locals."
+                );
+            }
+            codetracer_solana_recorder::recorder::record_from_traces(
+                &exec.regs, &elf_data, &elf_path, &out_dir,
+            )?;
+        }
+    }
 
     eprintln!("Trace written to {}", out_dir.display());
 

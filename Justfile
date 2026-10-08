@@ -10,7 +10,10 @@ build:
 build-release:
   cargo build --release --locked
 
-test:
+build-decoder:
+  cd ../codetracer-trace-format-nim && direnv exec . just build-ct-print
+
+test: build-decoder
   cargo test --locked
   bash tests/verify-cli-convention-no-silent-skip.sh
 
@@ -33,26 +36,26 @@ format:
 fmt: format
 
 # Recorder-specific CI prep, run by the shared reusable-recorder-ci workflow
-# (nixos-modules) after setup-dev-env, before lint/test. Builds the Nim
-# trace-writer sibling static lib + ct-print (golden-trace decode) via the dev
-# env and exports CODETRACER_NIM_LIB_DIR to later steps under GitHub Actions.
-# Shebang recipe so shell state persists across lines.
-# TODO: replace with `../codetracer-trace-format-nim` just build-trace-writer-lib
-# build-ct-print once it ships those targets (cross-repo-builds.md).
+# (nixos-modules) after setup-dev-env, before lint/test. Installs the Nim
+# dependencies of the codetracer-trace-format-nim sibling and builds ct-print
+# there. Shebang recipe so shell state persists across lines.
+#
+# The trace writer's C ABI archive is NOT built here. The
+# codetracer_trace_writer_nim crate's build script compiles and links it, with
+# the flags the library requires (one process heap, --threads:off). An archive
+# built here would not be the one linked, and its flags could only drift.
 prepare-ci:
   #!/usr/bin/env bash
   set -euo pipefail
+  "$SOLANA_CI_PYTHON" scripts/allow-declared-nim-env.py
   (
     cd "${GITHUB_WORKSPACE}/../codetracer-trace-format-nim"
     nimble install -y stew results
-    nim c --app:staticlib --mm:arc --noMain -d:release -p:src \
-      -o:libcodetracer_trace_writer.a src/codetracer_trace_writer_ffi.nim
     nim c -d:release -p:src -o:ct-print src/codetracer_ct_print.nim
   )
-  echo "CODETRACER_NIM_LIB_DIR=${GITHUB_WORKSPACE}/../codetracer-trace-format-nim" >> "${GITHUB_ENV:-/dev/null}"
 
 # --- M13: Packaging UX Standardization ---
-# These recipes implement Repo-Requirements.md §2.8. The OS-packaged
+# These recipes implement Repo-Requirements.md §2.5. The OS-packaged
 # recorders share a uniform packaging surface: `bump-version` rewrites
 # Cargo.toml + packaging/recorder-metadata.yml; `build-package` shells
 # out to packaging/build-all.sh with the requested channel selector;
