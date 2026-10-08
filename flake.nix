@@ -24,6 +24,7 @@
         devShells.default = pkgs.mkShell {
           inputsFrom = [ mcl-blockchain.devShells.${system}.solana ];
           packages = [
+            pkgs.direnv
             pkgs.zstd # required by libcodetracer_trace_writer (Nim FFI)
             # Declare the toolchain explicitly so CI's dev shell
             # mirrors local dev exactly.  Cached mcl-blockchain
