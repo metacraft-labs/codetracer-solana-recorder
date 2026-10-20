@@ -121,6 +121,15 @@ enum Commands {
     /// and `held-state.json`. No network access.
     ReplayBundle(ReplayBundleArgs),
 
+    /// Keep a replay alive and drive it with JSON operations on stdin.
+    ///
+    /// `init` (sysvars, feature accounts), then any number of `accounts`,
+    /// `tx`, `evict` and `held` operations, one per line; one result line per
+    /// operation on stdout. A live capture drives this, because the state it
+    /// holds cannot be passed around as a file per block. Traces go under
+    /// `<out-dir>/traces/`.
+    ReplayStream(ReplayStreamArgs),
+
     /// Print version information.
     Version,
 }
@@ -171,6 +180,18 @@ struct ReplayArgs {
     /// variable when the flag is omitted.
     #[arg(short = 'o', long = "out-dir")]
     out_dir: Option<PathBuf>,
+}
+
+#[derive(Debug, clap::Args)]
+struct ReplayStreamArgs {
+    /// Directory for traces. Falls back to
+    /// `CODETRACER_SOLANA_RECORDER_OUT_DIR`.
+    #[arg(short = 'o', long = "out-dir")]
+    out_dir: Option<PathBuf>,
+
+    /// Do not record the VM registers r0..r10 at each step.
+    #[arg(long = "no-registers")]
+    no_registers: bool,
 }
 
 #[derive(Debug, clap::Args)]
@@ -232,6 +253,7 @@ fn main() -> Result<()> {
         Commands::Record(args) => record(args),
         Commands::Replay(args) => replay(args),
         Commands::ReplayBundle(args) => replay_bundle(args),
+        Commands::ReplayStream(args) => replay_stream(args),
         Commands::Version => {
             println!("codetracer-solana-recorder {}", env!("CARGO_PKG_VERSION"));
             Ok(())
@@ -420,5 +442,30 @@ fn replay_bundle(args: ReplayBundleArgs) -> Result<()> {
     if s.divergent + s.unchecked > 0 {
         std::process::exit(2);
     }
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// `replay-stream` implementation
+// ---------------------------------------------------------------------------
+
+/// Execute the `replay-stream` subcommand.
+fn replay_stream(args: ReplayStreamArgs) -> Result<()> {
+    let out_dir = resolve_out_dir(args.out_dir);
+    let opts = codetracer_solana_recorder::onchain::ctfs::TraceOptions {
+        registers: !args.no_registers,
+    };
+    let stdin = std::io::stdin();
+    let stdout = std::io::stdout();
+    let s = codetracer_solana_recorder::onchain::replay_stream(
+        stdin.lock(),
+        stdout.lock(),
+        &out_dir,
+        &opts,
+    )?;
+    eprintln!(
+        "{} executed ({} match, {} divergent, {} unchecked), {} not executed, {} traced",
+        s.executed, s.matched, s.divergent, s.unchecked, s.not_executed, s.traced
+    );
     Ok(())
 }

@@ -186,7 +186,46 @@ pub struct Replay {
     /// account outside this set is not executed — an account the replay does
     /// not hold would be read as nonexistent, which is a prestate guess.
     held: HashSet<Address>,
+    /// programdata address -> the upgradeable program whose code it holds.
+    programdata_of: HashMap<Address, Address>,
     base_clock: Clock,
+}
+
+/// The accounts a transaction may write: the message header's writable
+/// ranges, then the lookup-table addresses the chain records it loading
+/// writable. Over-approximates (a writable-marked key the runtime demotes is
+/// still listed), which is the safe direction for eviction.
+pub fn writable_keys(tx: &BundleTransaction) -> Result<Vec<String>> {
+    let wire = tx.wire_bytes()?;
+    let vtx: VersionedTransaction = wincode::deserialize(&wire).map_err(|e| {
+        eyre!(
+            "transaction {}: wire bytes do not decode: {e}",
+            tx.signature
+        )
+    })?;
+    let h = vtx.message.header();
+    let keys = vtx.message.static_account_keys();
+    let n = keys.len();
+    let signed = h.num_required_signatures as usize;
+    let mut out = Vec::new();
+    for (i, k) in keys.iter().enumerate() {
+        let writable = if i < signed {
+            i < signed.saturating_sub(h.num_readonly_signed_accounts as usize)
+        } else {
+            i < n.saturating_sub(h.num_readonly_unsigned_accounts as usize)
+        };
+        if writable {
+            out.push(k.to_string());
+        }
+    }
+    if let Some(list) = tx
+        .meta
+        .as_ref()
+        .and_then(|m| m["loadedAddresses"]["writable"].as_array())
+    {
+        out.extend(list.iter().filter_map(|k| k.as_str().map(str::to_string)));
+    }
+    Ok(out)
 }
 
 fn parse_address(s: &str) -> Result<Address> {
@@ -236,23 +275,66 @@ impl Replay {
         }
         let base_clock: Clock = svm.get_sysvar();
 
-        let mut held = HashSet::new();
-        // Data accounts first, executables last: an upgradeable program is
-        // loaded from its programdata account at the moment the program
-        // account is set, so the programdata must already be there.
-        let (programs, data): (Vec<_>, Vec<_>) = bundle.accounts.iter().partition(|a| a.executable);
-        for entry in data.into_iter().chain(programs) {
-            let key = parse_address(&entry.pubkey)?;
-            svm.set_account(key, to_account(entry)?)
-                .map_err(|e| eyre!("account {}: {e:?}", entry.pubkey))?;
-            held.insert(key);
-        }
-        Ok(Self {
+        let mut replay = Self {
             svm,
             capture,
-            held,
+            held: HashSet::new(),
+            programdata_of: HashMap::new(),
             base_clock,
-        })
+        };
+        replay.add_accounts(&bundle.accounts)?;
+        Ok(replay)
+    }
+
+    /// Starts holding `entries`, replacing any state already held for them.
+    ///
+    /// Data accounts are set first and executables last, because an
+    /// upgradeable program is loaded from its programdata account at the
+    /// moment the program account is set. A programdata account that arrives
+    /// after its program (in a later batch) reloads that program, so the order
+    /// in which a capture learns about the two cannot leave a stale or
+    /// tombstoned executable behind.
+    pub fn add_accounts(&mut self, entries: &[AccountEntry]) -> Result<()> {
+        let (programs, data): (Vec<_>, Vec<_>) = entries.iter().partition(|a| a.executable);
+        let mut reload = Vec::new();
+        for entry in data.into_iter().chain(programs) {
+            let key = parse_address(&entry.pubkey)?;
+            let account = to_account(entry)?;
+            if account.executable && account.owner == solana_sdk_ids::bpf_loader_upgradeable::id() {
+                if let Some(pd) = account.data.get(4..36) {
+                    self.programdata_of
+                        .insert(Address::try_from(pd).unwrap_or_default(), key);
+                }
+            } else if let Some(program) = self.programdata_of.get(&key) {
+                reload.push(*program);
+            }
+            self.svm
+                .set_account(key, account)
+                .map_err(|e| eyre!("account {}: {e:?}", entry.pubkey))?;
+            self.held.insert(key);
+        }
+        for program in reload {
+            if let Some(account) = self.svm.get_account(&program) {
+                self.svm
+                    .set_account(program, account)
+                    .map_err(|e| eyre!("reloading program {program}: {e:?}"))?;
+            }
+        }
+        Ok(())
+    }
+
+    /// Stops holding `keys`. Their state is no longer known: a transaction
+    /// that wrote them could not be replayed exactly, so a later transaction
+    /// naming one of them is refused until the capture reads it again.
+    pub fn evict(&mut self, keys: &[String]) -> usize {
+        keys.iter()
+            .filter_map(|k| parse_address(k).ok())
+            .filter(|k| self.held.remove(k))
+            .count()
+    }
+
+    pub fn held_count(&self) -> usize {
+        self.held.len()
     }
 
     pub fn listing(&self, key: u64) -> Option<Arc<Listing>> {

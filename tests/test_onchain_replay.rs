@@ -300,3 +300,78 @@ fn entrypoint_offset(elf: &[u8]) -> Option<usize> {
     }
     None
 }
+
+#[test]
+fn test_a_refused_transaction_stops_the_replay_holding_what_it_writes() {
+    use codetracer_solana_recorder::onchain::{Summary, ctfs::TraceOptions, replay_stream};
+    let bundle = fixture("p-token-transfer");
+    let (exec, _) = run(&bundle);
+    let good = with_recorded_prefacts(&bundle, &exec.account_keys);
+    let sender = exec.account_keys[1].clone();
+    let tx = serde_json::to_value(&good.transactions[0]).unwrap();
+    let mut tx_op = tx.clone();
+    tx_op["op"] = "tx".into();
+
+    let stream = |accounts: Vec<&codetracer_solana_recorder::onchain::bundle::AccountEntry>,
+                  ops: &[serde_json::Value]|
+     -> (Vec<serde_json::Value>, Summary) {
+        let mut input = String::new();
+        input +=
+            &serde_json::json!({"op": "init", "sysvars": good.sysvars, "features": good.features})
+                .to_string();
+        input += "\n";
+        input += &serde_json::json!({"op": "accounts", "accounts": accounts}).to_string();
+        input += "\n";
+        for op in ops {
+            input += &op.to_string();
+            input += "\n";
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let mut out = Vec::new();
+        let s = replay_stream(
+            input.as_bytes(),
+            &mut out,
+            dir.path(),
+            &TraceOptions { registers: false },
+        )
+        .unwrap();
+        let lines = String::from_utf8(out)
+            .unwrap()
+            .lines()
+            .map(|l| serde_json::from_str(l).unwrap())
+            .collect();
+        (lines, s)
+    };
+
+    // Without the sender's token account the transaction is refused, and the
+    // accounts it writes stop being held: supplying the missing one does not
+    // make the transaction runnable, because its other writable accounts are
+    // now unknown too.
+    let without: Vec<_> = good
+        .accounts
+        .iter()
+        .filter(|a| a.pubkey != sender)
+        .collect();
+    let only_sender: Vec<_> = good
+        .accounts
+        .iter()
+        .filter(|a| a.pubkey == sender)
+        .collect();
+    let (lines, s) = stream(
+        without,
+        &[
+            tx_op.clone(),
+            serde_json::json!({"op": "accounts", "accounts": only_sender}),
+            tx_op.clone(),
+        ],
+    );
+    assert_eq!(lines[2]["executed"], false, "{}", lines[2]);
+    assert!(lines[2]["evicted"].as_u64().unwrap() > 0, "{}", lines[2]);
+    assert_eq!(lines[4]["executed"], false, "{}", lines[4]);
+    assert_eq!(s.matched, 0);
+
+    // Control: with every account held from the start, the same stream matches.
+    let (lines, s) = stream(good.accounts.iter().collect(), &[tx_op]);
+    assert_eq!(lines[2]["verdict"]["status"], "match", "{}", lines[2]);
+    assert_eq!(s.matched, 1);
+}
