@@ -189,6 +189,8 @@ pub struct Replay {
     /// programdata address -> the upgradeable program whose code it holds.
     programdata_of: HashMap<Address, Address>,
     base_clock: Clock,
+    /// The Clock sysvar account's lamports as the cluster holds them.
+    clock_lamports: Option<u64>,
 }
 
 /// The accounts a transaction may write: the message header's writable
@@ -274,6 +276,11 @@ impl Replay {
                 .map_err(|e| eyre!("sysvar {}: {e:?}", entry.pubkey))?;
         }
         let base_clock: Clock = svm.get_sysvar();
+        let clock_lamports = bundle
+            .sysvars
+            .iter()
+            .find(|e| e.pubkey == solana_sdk_ids::sysvar::clock::id().to_string())
+            .map(|e| e.lamports);
 
         let mut replay = Self {
             svm,
@@ -281,6 +288,7 @@ impl Replay {
             held: HashSet::new(),
             programdata_of: HashMap::new(),
             base_clock,
+            clock_lamports,
         };
         replay.add_accounts(&bundle.accounts)?;
         Ok(replay)
@@ -378,11 +386,23 @@ impl Replay {
             }
         }
 
-        let missing: Vec<String> = keys
+        let mut missing: Vec<String> = keys
             .iter()
             .filter(|k| !self.held.contains(k) && !runtime_provided(k, &self.svm))
             .map(|k| k.to_string())
             .collect();
+        // An upgradeable program is only as held as its code: with its
+        // programdata missing the runtime would load a tombstone and fail the
+        // transaction with "Program is not deployed", which is the replay's
+        // gap and not the chain's behaviour.
+        for (programdata, program) in &self.programdata_of {
+            if keys.contains(program)
+                && self.held.contains(program)
+                && !self.held.contains(programdata)
+            {
+                missing.push(programdata.to_string());
+            }
+        }
         if !missing.is_empty() {
             return Ok(TxOutcome::NotExecuted(NotExecuted {
                 signature: tx.signature.clone(),
@@ -400,6 +420,17 @@ impl Replay {
             clock.unix_timestamp = t;
         }
         self.svm.set_sysvar(&clock);
+        // `set_sysvar` writes the account with 1 lamport; the cluster's Clock
+        // account holds its rent-exempt balance, and a transaction that names
+        // Clock reports that balance in its pre/post balances.
+        if let Some(lamports) = self.clock_lamports {
+            if let Some(mut account) = self.svm.get_account(&solana_sdk_ids::sysvar::clock::id()) {
+                account.lamports = lamports;
+                self.svm
+                    .set_account(solana_sdk_ids::sysvar::clock::id(), account)
+                    .map_err(|e| eyre!("clock: {e:?}"))?;
+            }
+        }
 
         let pre_accounts: Vec<Option<Account>> =
             keys.iter().map(|k| self.svm.get_account(k)).collect();

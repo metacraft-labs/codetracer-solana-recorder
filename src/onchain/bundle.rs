@@ -56,7 +56,10 @@ pub struct AccountEntry {
     pub lamports: u64,
     pub owner: String,
     pub executable: bool,
-    #[serde(default)]
+    /// Most accounts carry `u64::MAX` (rent-exempt). A JavaScript writer cannot
+    /// represent that exactly and sends `1.8446744073709552e19`, so a float is
+    /// accepted and saturates to `u64::MAX` rather than being refused.
+    #[serde(default, deserialize_with = "lenient_u64")]
     pub rent_epoch: u64,
     /// Base64 of the account data.
     pub data: String,
@@ -120,4 +123,14 @@ pub fn read_bundle(path: &Path) -> Result<ReplayBundle> {
         );
     }
     Ok(bundle)
+}
+
+fn lenient_u64<'de, D: serde::Deserializer<'de>>(d: D) -> Result<u64, D::Error> {
+    match serde_json::Value::deserialize(d)? {
+        serde_json::Value::Number(n) => n
+            .as_u64()
+            .or_else(|| n.as_f64().filter(|f| *f >= 0.0).map(|f| f as u64))
+            .ok_or_else(|| serde::de::Error::custom(format!("{n} is not a u64"))),
+        other => Err(serde::de::Error::custom(format!("{other} is not a u64"))),
+    }
 }
