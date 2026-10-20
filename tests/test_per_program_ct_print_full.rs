@@ -3562,10 +3562,7 @@ fn test_sol_log_data_compute_test_via_ct_print_full() {
     assert_eq!(
         kinds_and_text,
         vec![
-            (
-                "Write".to_string(),
-                "about to log binary event".to_string(),
-            ),
+            ("Write".to_string(), "about to log binary event".to_string(),),
             (
                 "TraceLogEvent".to_string(),
                 "data:&[b\"event\", &payload]".to_string(),

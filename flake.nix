@@ -5,6 +5,13 @@
     mcl-blockchain.url = "github:metacraft-labs/nix-blockchain-development";
     nixpkgs.follows = "mcl-blockchain/nixpkgs";
     flake-utils.follows = "mcl-blockchain/flake-utils";
+    # The on-chain replay engine links Agave 4.3 (the runtime mainnet runs), whose
+    # crates declare rust-version 1.97.1. nixpkgs at this pin ships 1.91, so the
+    # toolchain is pinned here by exact channel instead of taken from nixpkgs.
+    fenix = {
+      url = "github:nix-community/fenix";
+      inputs.nixpkgs.follows = "nixpkgs";
+    };
   };
 
   outputs =
@@ -13,12 +20,28 @@
       nixpkgs,
       flake-utils,
       mcl-blockchain,
+      fenix,
       ...
     }:
     flake-utils.lib.eachDefaultSystem (
       system:
       let
         pkgs = import nixpkgs { inherit system; };
+        rustToolchain = fenix.packages.${system}.combine (
+          let
+            channel = fenix.packages.${system}.toolchainOf {
+              channel = "1.97.1";
+              sha256 = "sha256-A1abGIbOtcBSdrUMhDGrER3pRM1hQP4fp9gh3Y4PKc8=";
+            };
+          in
+          [
+            channel.rustc
+            channel.cargo
+            channel.rustfmt
+            channel.clippy
+            channel.rust-src
+          ]
+        );
       in
       {
         devShells.default = pkgs.mkShell {
@@ -34,10 +57,7 @@
             pkgs.nimble
             pkgs.just
             pkgs.capnproto
-            pkgs.rustc
-            pkgs.cargo
-            pkgs.rustfmt
-            pkgs.clippy
+            rustToolchain
             pkgs.pkg-config
             # Solana SBF toolchain.  The mcl-blockchain ``solana``
             # devShell exposes ``cargo-build-sbf`` via its own
@@ -51,6 +71,13 @@
             # devShell via ``nix develop -c sh``).
             mcl-blockchain.packages.${system}.cargo-build-sbf
           ];
+
+          # Rust 1.90+ links x86_64-linux executables with its bundled rust-lld,
+          # which bypasses the cc-wrapper / ld-wrapper that writes each Nix store
+          # library's directory into RUNPATH. The binaries then fail at start
+          # with `libssl.so.3: cannot open shared object file`. nixpkgs' rustc
+          # opts out the same way; this toolchain comes from fenix and does not.
+          CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_RUSTFLAGS = "-C linker-features=-lld";
 
           # `cargo <subcommand>` looks for `cargo-<subcommand>` in
           # `$CARGO_HOME/bin` BEFORE it searches PATH. On any machine with
