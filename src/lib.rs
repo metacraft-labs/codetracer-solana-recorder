@@ -3,6 +3,7 @@ pub mod cpi;
 pub mod dwarf;
 pub mod executor;
 pub mod multi_program;
+pub mod onchain;
 pub mod recorder;
 pub mod register_trace;
 pub mod replay;

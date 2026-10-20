@@ -4,9 +4,10 @@
 //! ELF file (.so), runs it through the SBF VM with register tracing enabled,
 //! and writes the CodeTracer trace output files.
 //!
-//! Also supports the `replay` subcommand which fetches a confirmed on-chain
-//! transaction via Solana JSON-RPC and replays it through the recording
-//! pipeline.
+//! Also supports `replay`, which replays a confirmed on-chain transaction
+//! through the real runtime against current account state, and
+//! `replay-bundle`, which replays a captured bundle offline. Both check every
+//! replay against the chain's recorded metadata.
 //!
 //! The recorder always writes traces in the canonical CodeTracer multi-stream
 //! CTFS format (see `Recorder-CLI-Conventions.md` §4 in `codetracer-specs`).
@@ -26,7 +27,10 @@
 //!
 //! # Replay a confirmed on-chain transaction:
 //! codetracer-solana-recorder replay --signature <SIG> \
-//!     [--rpc-url <URL>] [--program-dir <PATH>] [-o <out-dir>]
+//!     [--rpc-url <URL>] [-o <out-dir>]
+//!
+//! # Replay a captured bundle, offline:
+//! codetracer-solana-recorder replay-bundle --bundle <bundle.json> [-o <out-dir>]
 //! ```
 //!
 //! # Environment variables
@@ -98,14 +102,24 @@ enum Commands {
     /// CodeTracer trace files to the output directory.
     Record(RecordArgs),
 
-    /// Replay a confirmed on-chain transaction.
+    /// Replay a confirmed on-chain transaction against CURRENT account state.
     ///
-    /// Fetches the transaction via Solana JSON-RPC, reconstructs its
-    /// execution context, and records a CodeTracer trace.
-    ///
-    /// NOTE: Uses *current* account state, not historical state at the
-    /// transaction's slot.
+    /// Fetches the transaction, the accounts it names (as they are now), the
+    /// program code, sysvars and the cluster's feature accounts, executes it
+    /// through the real runtime, and checks it against the chain's record.
+    /// Solana's RPC cannot read an account at a past slot, so for almost any
+    /// transaction this state is a later post-state and the verdict says
+    /// `divergent` (cause `prestate`). Exits 2 unless the verdict is `match`.
     Replay(ReplayArgs),
+
+    /// Replay a bundle of on-chain transactions through the real runtime.
+    ///
+    /// Executes every transaction in the bundle, in order, through LiteSVM
+    /// (Agave's program runtime and SBF VM, register tracing on), checks
+    /// each against the chain's recorded metadata, and writes
+    /// `verdicts.jsonl`, a trace per transaction the bundle marks `trace`,
+    /// and `held-state.json`. No network access.
+    ReplayBundle(ReplayBundleArgs),
 
     /// Print version information.
     Version,
@@ -151,19 +165,28 @@ struct ReplayArgs {
     #[arg(long = "rpc-url", default_value = "http://localhost:8899")]
     rpc_url: String,
 
-    /// Directory containing compiled `.so` files with DWARF debug info.
-    ///
-    /// The recorder will search this directory for program binaries.
-    /// Defaults to `target/deploy/`.
-    #[arg(long = "program-dir")]
-    program_dir: Option<PathBuf>,
-
     /// Directory where the trace files will be written.
     ///
     /// Falls back to the `CODETRACER_SOLANA_RECORDER_OUT_DIR` environment
     /// variable when the flag is omitted.
     #[arg(short = 'o', long = "out-dir")]
     out_dir: Option<PathBuf>,
+}
+
+#[derive(Debug, clap::Args)]
+struct ReplayBundleArgs {
+    /// Path to a `codetracer-solana/replay-bundle@1` JSON file.
+    #[arg(long = "bundle")]
+    bundle: PathBuf,
+
+    /// Directory for verdicts, traces and held state. Falls back to
+    /// `CODETRACER_SOLANA_RECORDER_OUT_DIR`.
+    #[arg(short = 'o', long = "out-dir")]
+    out_dir: Option<PathBuf>,
+
+    /// Do not record the VM registers r0..r10 at each step.
+    #[arg(long = "no-registers")]
+    no_registers: bool,
 }
 
 // ---------------------------------------------------------------------------
@@ -208,6 +231,7 @@ fn main() -> Result<()> {
     match cli.command {
         Commands::Record(args) => record(args),
         Commands::Replay(args) => replay(args),
+        Commands::ReplayBundle(args) => replay_bundle(args),
         Commands::Version => {
             println!("codetracer-solana-recorder {}", env!("CARGO_PKG_VERSION"));
             Ok(())
@@ -340,10 +364,61 @@ fn replay(args: ReplayArgs) -> Result<()> {
 
     let out_dir = resolve_out_dir(args.out_dir);
 
-    codetracer_solana_recorder::replay::replay_transaction(
+    let bundle = codetracer_solana_recorder::onchain::fetch::bundle_for_signature(
         &args.rpc_url,
         &args.signature,
-        &out_dir,
-        args.program_dir.as_deref(),
-    )
+    )?;
+    std::fs::create_dir_all(&out_dir)?;
+    std::fs::write(out_dir.join("bundle.json"), serde_json::to_vec(&bundle)?)?;
+    let opts = codetracer_solana_recorder::onchain::ctfs::TraceOptions { registers: true };
+    let s = codetracer_solana_recorder::onchain::replay_bundle(&bundle, &out_dir, &opts)?;
+    eprintln!(
+        "replayed against CURRENT account state: {} match, {} divergent, {} unchecked, {} not executed; \
+         verdicts in {}",
+        s.matched,
+        s.divergent,
+        s.unchecked,
+        s.not_executed,
+        out_dir.join("verdicts.jsonl").display()
+    );
+    if s.matched == 0 {
+        std::process::exit(2);
+    }
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// `replay-bundle` implementation
+// ---------------------------------------------------------------------------
+
+/// Execute the `replay-bundle` subcommand.
+///
+/// Exits non-zero when any executed transaction is `divergent` or
+/// `unchecked`, so a caller that ignores the verdict file still cannot take a
+/// wrong or unverified trace for a good one.
+fn replay_bundle(args: ReplayBundleArgs) -> Result<()> {
+    if recording_disabled() {
+        eprintln!("{ENV_DISABLED} is set; skipping bundle replay (no output written).");
+        return Ok(());
+    }
+    let out_dir = resolve_out_dir(args.out_dir);
+    let opts = codetracer_solana_recorder::onchain::ctfs::TraceOptions {
+        registers: !args.no_registers,
+    };
+    let s = codetracer_solana_recorder::onchain::replay_bundle_file(&args.bundle, &out_dir, &opts)?;
+    eprintln!(
+        "{} executed ({} match, {} divergent, {} unchecked), {} not executed, {} traced; \
+         verdicts in {}",
+        s.executed,
+        s.matched,
+        s.divergent,
+        s.unchecked,
+        s.not_executed,
+        s.traced,
+        out_dir.join("verdicts.jsonl").display()
+    );
+    if s.divergent + s.unchecked > 0 {
+        std::process::exit(2);
+    }
+    Ok(())
 }
