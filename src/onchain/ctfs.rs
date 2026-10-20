@@ -24,7 +24,7 @@ use std::sync::Arc;
 
 use codetracer_trace_types::{EventLogKind, Line, NONE_VALUE, TypeKind, ValueRecord};
 use codetracer_trace_writer_nim::trace_writer::TraceWriter;
-use codetracer_trace_writer_nim::{TraceEventsFileFormat, create_trace_writer};
+use codetracer_trace_writer_nim::{NimTraceWriter, TraceEventsFileFormat};
 use eyre::{Result, eyre};
 
 use super::engine::{InstructionRecord, TxExecution};
@@ -100,8 +100,11 @@ pub fn write_transaction_trace(
                 .rev(),
         );
     }
-    let tx_path = out_dir.join("transaction.txt");
-    std::fs::write(&tx_path, tx_lines.join("\n") + "\n")?;
+    // Paths are recorded RELATIVE to the trace directory: an absolute path
+    // would put the directory a trace happened to be written in into the
+    // container's bytes, and the same execution rebuilt elsewhere would differ.
+    let tx_path = PathBuf::from("transaction.txt");
+    std::fs::write(out_dir.join(&tx_path), tx_lines.join("\n") + "\n")?;
 
     let mut listing_paths = HashMap::new();
     let mut used = HashMap::new();
@@ -111,17 +114,26 @@ pub fn write_transaction_trace(
                 let listing = listings
                     .get(&key)
                     .ok_or_else(|| eyre!("no listing for executable {key:016x}"))?;
-                let path = out_dir
-                    .join("listings")
-                    .join(format!("{}-{key:016x}.sbf", r.program_id));
-                std::fs::write(&path, listing.text())?;
+                let path =
+                    PathBuf::from("listings").join(format!("{}-{key:016x}.sbf", r.program_id));
+                std::fs::write(out_dir.join(&path), listing.text())?;
                 slot.insert(path);
                 used.insert(key, listing.clone());
             }
         }
     }
 
-    let mut writer = create_trace_writer(&exec.signature, &[], TraceEventsFileFormat::Ctfs);
+    // The recording's identity is DERIVED, not minted, so the same execution
+    // always writes the same container bytes; a trace rebuilt from its bundle
+    // in a sandbox is then byte-identical to the one the capture wrote.
+    let mut writer = Box::new(NimTraceWriter::new(
+        &exec.signature,
+        &[],
+        TraceEventsFileFormat::Ctfs,
+    ));
+    writer
+        .set_recording_id(&recording_id(exec.block_time, &exec.signature))
+        .map_err(|e| eyre!("{e}"))?;
     TraceWriter::begin_writing_trace_events(&mut *writer, &out_dir.join("trace.bin"))
         .map_err(|e| eyre!("{e}"))?;
     TraceWriter::start(&mut *writer, &tx_path, Line(1));
@@ -165,11 +177,37 @@ pub fn write_transaction_trace(
     writer.close().map_err(|e| eyre!("{e}"))?;
 
     Ok(WrittenTrace {
-        dir: out_dir,
+        dir: out_dir.clone(),
         steps,
         calls,
-        listings: listing_paths.into_values().collect(),
+        listings: listing_paths
+            .into_values()
+            .map(|p| out_dir.join(p))
+            .collect(),
     })
+}
+
+/// A UUIDv7 for the recording, derived from the transaction: the block time
+/// as its millisecond timestamp, and SHA-256 of the signature for the 74 bits
+/// a minted UUIDv7 would fill at random.
+pub fn recording_id(block_time: Option<i64>, signature: &str) -> String {
+    use sha2::{Digest, Sha256};
+    let ms = (block_time.unwrap_or(0).max(0) as u64).saturating_mul(1000) & 0xffff_ffff_ffff;
+    let h = Sha256::digest(signature.as_bytes());
+    let mut b = [0u8; 16];
+    b[..6].copy_from_slice(&ms.to_be_bytes()[2..]);
+    b[6..].copy_from_slice(&h[..10]);
+    b[6] = 0x70 | (b[6] & 0x0f);
+    b[8] = 0x80 | (b[8] & 0x3f);
+    let x: String = b.iter().map(|v| format!("{v:02x}")).collect();
+    format!(
+        "{}-{}-{}-{}-{}",
+        &x[0..8],
+        &x[8..12],
+        &x[12..16],
+        &x[16..20],
+        &x[20..32]
+    )
 }
 
 /// Positions (in `records`) of the invocations `caller` made, in order.

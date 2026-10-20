@@ -72,6 +72,7 @@ solana-message = "4"
 solana-transaction = { version = "4", features = ["wincode"] }
 wincode = "0.6"
 bs58 = "0.5"
+sha2 = "0.10"
 
 [dev-dependencies]
 codetracer_trace_reader = { path = "../codetracer-trace-format/codetracer_trace_reader" }

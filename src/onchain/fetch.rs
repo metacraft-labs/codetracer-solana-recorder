@@ -16,7 +16,8 @@ use serde_json::{Value, json};
 
 use super::bundle::{AccountEntry, BUNDLE_FORMAT, BundleTransaction, FeatureEntry, ReplayBundle};
 
-const SYSVARS: &[&str] = &[
+/// The sysvar accounts a bundle carries.
+pub const SYSVARS: &[&str] = &[
     "SysvarC1ock11111111111111111111111111111111",
     "SysvarRent111111111111111111111111111111111",
     "SysvarEpochSchedu1e111111111111111111111111",

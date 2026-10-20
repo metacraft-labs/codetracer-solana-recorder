@@ -375,3 +375,58 @@ fn test_a_refused_transaction_stops_the_replay_holding_what_it_writes() {
     assert_eq!(lines[2]["verdict"]["status"], "match", "{}", lines[2]);
     assert_eq!(s.matched, 1);
 }
+
+#[test]
+fn test_a_trace_rebuilt_from_its_bundle_is_byte_identical() {
+    use codetracer_solana_recorder::onchain::{ctfs::TraceOptions, replay_bundle};
+    let bundle = fixture("ata-create-cpi");
+    let (exec, _) = run(&bundle);
+    let good = with_recorded_prefacts(&bundle, &exec.account_keys);
+    let sig = good.transactions[0].signature.clone();
+    let opts = TraceOptions { registers: true };
+
+    let first = tempfile::tempdir().unwrap();
+    let s = replay_bundle(&good, first.path(), &opts).unwrap();
+    assert_eq!(s.matched, 1);
+    let trace_dir = first.path().join("traces").join(&sig);
+    let emitted: codetracer_solana_recorder::onchain::bundle::ReplayBundle =
+        serde_json::from_slice(&std::fs::read(trace_dir.join("replay.bundle.json")).unwrap())
+            .unwrap();
+
+    // The emitted bundle holds only what this transaction needed, and is
+    // enough on its own: replaying it gives the same verdict and the same bytes.
+    assert!(emitted.accounts.len() <= good.accounts.len());
+    let second = tempfile::tempdir().unwrap();
+    let s2 = replay_bundle(&emitted, second.path(), &opts).unwrap();
+    assert_eq!(s2.matched, 1);
+    let ct = |dir: &std::path::Path| {
+        std::fs::read(dir.join("traces").join(&sig).join(format!("{sig}.ct"))).unwrap()
+    };
+    assert_eq!(
+        ct(first.path()),
+        ct(second.path()),
+        "the container bytes differ"
+    );
+
+    // Control: a different transaction's container differs, so equality above
+    // is not two empty or constant files.
+    let other = fixture("p-token-transfer");
+    let (oexec, _) = run(&other);
+    let third = tempfile::tempdir().unwrap();
+    replay_bundle(
+        &with_recorded_prefacts(&other, &oexec.account_keys),
+        third.path(),
+        &opts,
+    )
+    .unwrap();
+    let osig = &other.transactions[0].signature;
+    let other_ct = std::fs::read(
+        third
+            .path()
+            .join("traces")
+            .join(osig)
+            .join(format!("{osig}.ct")),
+    )
+    .unwrap();
+    assert_ne!(ct(first.path()), other_ct);
+}

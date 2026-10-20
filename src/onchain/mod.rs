@@ -101,6 +101,12 @@ pub fn run_transaction(
                     opts,
                 )?;
                 summary.traced += 1;
+                if let Some(bundle) = &exec.bundle {
+                    std::fs::write(
+                        written.dir.join("replay.bundle.json"),
+                        serde_json::to_vec(bundle)?,
+                    )?;
+                }
                 json!({
                     "dir": written.dir,
                     "steps": written.steps,

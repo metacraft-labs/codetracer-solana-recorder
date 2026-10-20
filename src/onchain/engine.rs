@@ -24,6 +24,7 @@ use std::str::FromStr;
 use std::sync::{Arc, Mutex};
 
 use agave_feature_set::FeatureSet;
+use base64::Engine as _;
 use eyre::{Result, eyre};
 use litesvm::{InvocationInspectCallback, LiteSVM};
 use solana_account::{Account, ReadableAccount};
@@ -78,6 +79,14 @@ pub struct TxExecution {
     pub account_keys: Vec<String>,
     pub pre_accounts: Vec<Option<Account>>,
     pub post_accounts: Vec<Option<Account>>,
+    pub block_time: Option<i64>,
+    /// For a transaction marked `trace`: a self-contained bundle of exactly
+    /// the state it executed on (its accounts, the programdata of the
+    /// upgradeable programs it names, its lookup tables, the sysvars and the
+    /// feature set). `replay-bundle` on it reproduces the same execution, the
+    /// same verdict and the same trace with no network and no capture, which is
+    /// what lets a live capture's traces be rebuilt and checked offline.
+    pub bundle: Option<ReplayBundle>,
 }
 
 /// Why a transaction was not executed at all.
@@ -190,6 +199,8 @@ pub struct Replay {
     programdata_of: HashMap<Address, Address>,
     /// Programs the runtime could not load for tracing (see `set_guarded`).
     unloadable: HashSet<Address>,
+    /// The cluster's feature accounts, carried into every emitted bundle.
+    features: Vec<super::bundle::FeatureEntry>,
     base_clock: Clock,
     /// The Clock sysvar account's lamports as the cluster holds them.
     clock_lamports: Option<u64>,
@@ -290,6 +301,7 @@ impl Replay {
             held: HashSet::new(),
             programdata_of: HashMap::new(),
             unloadable: HashSet::new(),
+            features: bundle.features.clone(),
             base_clock,
             clock_lamports,
         };
@@ -631,6 +643,54 @@ impl Replay {
         let pre_accounts: Vec<Option<Account>> =
             keys.iter().map(|k| self.svm.get_account(k)).collect();
 
+        let bundle = if tx.trace {
+            let mut ids: Vec<Address> = keys.clone();
+            for (programdata, program) in &self.programdata_of {
+                if keys.contains(program) && !ids.contains(programdata) {
+                    ids.push(*programdata);
+                }
+            }
+            for lookup in vtx.message.address_table_lookups().unwrap_or_default() {
+                if !ids.contains(&lookup.account_key) {
+                    ids.push(lookup.account_key);
+                }
+            }
+            let entry = |svm: &LiteSVM, k: &Address| {
+                let a = svm.get_account(k).unwrap_or(Account {
+                    lamports: 0,
+                    data: Vec::new(),
+                    owner: solana_sdk_ids::system_program::id(),
+                    executable: false,
+                    rent_epoch: 0,
+                });
+                AccountEntry {
+                    pubkey: k.to_string(),
+                    lamports: a.lamports,
+                    owner: a.owner.to_string(),
+                    executable: a.executable,
+                    rent_epoch: a.rent_epoch,
+                    data: base64::engine::general_purpose::STANDARD.encode(&a.data),
+                    read_at_slot: None,
+                }
+            };
+            let sysvars = super::fetch::SYSVARS
+                .iter()
+                .filter_map(|s| parse_address(s).ok())
+                .filter(|k| self.svm.get_account(k).is_some())
+                .map(|k| entry(&self.svm, &k))
+                .collect();
+            Some(ReplayBundle {
+                format: super::bundle::BUNDLE_FORMAT.to_string(),
+                cluster: "mainnet-beta".to_string(),
+                sysvars,
+                features: self.features.clone(),
+                accounts: ids.iter().map(|k| entry(&self.svm, k)).collect(),
+                transactions: vec![tx.clone()],
+            })
+        } else {
+            None
+        };
+
         self.capture.lock().unwrap().instructions.clear();
         let result = self.svm.send_transaction(vtx);
         let (error, meta) = match result {
@@ -698,11 +758,12 @@ impl Replay {
             account_keys: keys.iter().map(|k| k.to_string()).collect(),
             pre_accounts,
             post_accounts,
+            block_time: tx.block_time,
+            bundle,
         })))
     }
 
     pub fn account_entry(&self, key: &str, read_at_slot: Option<u64>) -> Option<AccountEntry> {
-        use base64::Engine as _;
         self.account(key).map(|a| AccountEntry {
             pubkey: key.to_string(),
             lamports: a.lamports(),
