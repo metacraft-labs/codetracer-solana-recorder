@@ -188,6 +188,8 @@ pub struct Replay {
     held: HashSet<Address>,
     /// programdata address -> the upgradeable program whose code it holds.
     programdata_of: HashMap<Address, Address>,
+    /// Programs the runtime could not load for tracing (see `set_guarded`).
+    unloadable: HashSet<Address>,
     base_clock: Clock,
     /// The Clock sysvar account's lamports as the cluster holds them.
     clock_lamports: Option<u64>,
@@ -287,6 +289,7 @@ impl Replay {
             capture,
             held: HashSet::new(),
             programdata_of: HashMap::new(),
+            unloadable: HashSet::new(),
             base_clock,
             clock_lamports,
         };
@@ -316,19 +319,50 @@ impl Replay {
             } else if let Some(program) = self.programdata_of.get(&key) {
                 reload.push(*program);
             }
-            self.svm
-                .set_account(key, account)
-                .map_err(|e| eyre!("account {}: {e:?}", entry.pubkey))?;
-            self.held.insert(key);
+            if self.set_guarded(key, account)? {
+                self.held.insert(key);
+            }
         }
         for program in reload {
             if let Some(account) = self.svm.get_account(&program) {
-                self.svm
-                    .set_account(program, account)
-                    .map_err(|e| eyre!("reloading program {program}: {e:?}"))?;
+                if !self.set_guarded(program, account)? {
+                    self.held.remove(&program);
+                }
             }
         }
         Ok(())
+    }
+
+    /// `set_account`, surviving a loader panic on an executable.
+    ///
+    /// Register tracing needs the runtime's debugging features, which turn on
+    /// solana-sbpf's symbol and section labels, and solana-sbpf 0.23 then
+    /// panics (`Option::unwrap` in `Executable::load`) on an ELF that has no
+    /// section-name table — which some deployed mainnet programs do not. Such
+    /// a program cannot be loaded for tracing at all; it is recorded as
+    /// unloadable and every transaction naming it is refused with that reason,
+    /// rather than the whole replay aborting. Returns whether it was set.
+    fn set_guarded(&mut self, key: Address, account: Account) -> Result<bool> {
+        if !account.executable {
+            self.svm
+                .set_account(key, account)
+                .map_err(|e| eyre!("account {key}: {e:?}"))?;
+            return Ok(true);
+        }
+        let svm = &mut self.svm;
+        match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            svm.set_account(key, account)
+        })) {
+            Ok(r) => {
+                r.map_err(|e| eyre!("program {key}: {e:?}"))?;
+                self.unloadable.remove(&key);
+                Ok(true)
+            }
+            Err(_) => {
+                self.unloadable.insert(key);
+                Ok(false)
+            }
+        }
     }
 
     /// Stops holding `keys`. Their state is no longer known: a transaction
@@ -339,6 +373,158 @@ impl Replay {
             .filter_map(|k| parse_address(k).ok())
             .filter(|k| self.held.remove(k))
             .count()
+    }
+
+    /// Settles the accounts a transaction wrote when the replay could not
+    /// reproduce it (refused, or divergent): each held writable account is
+    /// either CARRIED to the post-state the chain's own record determines, or
+    /// evicted. Returns `(carried, evicted)`.
+    ///
+    /// Only two cases are carried, and in both the post-state is fully stated
+    /// by consensus facts in the metadata, so nothing is guessed:
+    ///
+    /// * The transaction FAILED on chain. Every write is rolled back except the
+    ///   fee, so each held writable account keeps its state, the fee payer's
+    ///   lamports become `postBalances[0]`, and a durable-nonce account (the
+    ///   target of a leading System `AdvanceNonceAccount`) is evicted, because
+    ///   its advance survives the failure.
+    /// * The account is a plain wallet — owned by the System program, holding
+    ///   no data, not executable. Its whole state is its lamports, which
+    ///   `postBalances` states, unless a System instruction in the transaction
+    ///   (top-level or inner) creates, assigns or allocates it; any such
+    ///   instruction naming it evicts it instead.
+    ///
+    /// Everything else is evicted. Without carrying, a wallet that pays for a
+    /// stream of transactions — each touching some account the capture has
+    /// not read yet — is evicted by every one of them and never held for long.
+    pub fn settle_unreplayed(&mut self, tx: &BundleTransaction) -> Result<(usize, usize)> {
+        let Some(meta) = tx.meta.as_ref() else {
+            return Ok((0, self.evict(&writable_keys(tx)?)));
+        };
+        let wire = tx.wire_bytes()?;
+        let vtx: VersionedTransaction = wincode::deserialize(&wire).map_err(|e| {
+            eyre!(
+                "transaction {}: wire bytes do not decode: {e}",
+                tx.signature
+            )
+        })?;
+        let mut keys: Vec<Address> = vtx.message.static_account_keys().to_vec();
+        for part in ["writable", "readonly"] {
+            for k in meta["loadedAddresses"][part]
+                .as_array()
+                .into_iter()
+                .flatten()
+            {
+                keys.push(parse_address(k.as_str().unwrap_or_default())?);
+            }
+        }
+        let post: Vec<Option<u64>> = meta["postBalances"]
+            .as_array()
+            .map(|a| a.iter().map(|v| v.as_u64()).collect())
+            .unwrap_or_default();
+        let writable: Vec<Address> = writable_keys(tx)?
+            .iter()
+            .filter_map(|k| parse_address(k).ok())
+            .collect();
+        let system = solana_sdk_ids::system_program::id();
+
+        // Every (program, accounts, data) the transaction ran, top-level and inner.
+        let mut instructions: Vec<(Address, Vec<u8>, Vec<u8>)> = vtx
+            .message
+            .instructions()
+            .iter()
+            .filter_map(|ix| {
+                keys.get(ix.program_id_index as usize)
+                    .map(|p| (*p, ix.accounts.clone(), ix.data.clone()))
+            })
+            .collect();
+        for group in meta["innerInstructions"].as_array().into_iter().flatten() {
+            for ix in group["instructions"].as_array().into_iter().flatten() {
+                let pid = ix["programIdIndex"]
+                    .as_u64()
+                    .and_then(|i| keys.get(i as usize));
+                let accts = ix["accounts"].as_array().map(|a| {
+                    a.iter()
+                        .filter_map(|x| x.as_u64().map(|x| x as u8))
+                        .collect()
+                });
+                let data = ix["data"]
+                    .as_str()
+                    .and_then(|s| bs58::decode(s).into_vec().ok());
+                match (pid, accts, data) {
+                    (Some(p), Some(a), Some(d)) => instructions.push((*p, a, d)),
+                    // An inner instruction this cannot read could be one that
+                    // reshapes an account; carry nothing.
+                    _ => return Ok((0, self.evict(&writable_keys(tx)?))),
+                }
+            }
+        }
+        let system_tag = |data: &[u8]| {
+            data.get(0..4)
+                .map(|b| u32::from_le_bytes(b.try_into().unwrap()))
+        };
+        // CreateAccount 0, Assign 1, CreateAccountWithSeed 3, Allocate 8,
+        // AllocateWithSeed 9, AssignWithSeed 10: the System instructions that
+        // change an account's owner or data rather than only its lamports.
+        let reshaped: HashSet<Address> = instructions
+            .iter()
+            .filter(|(p, _, d)| {
+                *p == system && matches!(system_tag(d), Some(0 | 1 | 3 | 8 | 9 | 10))
+            })
+            .flat_map(|(_, a, _)| a.iter().filter_map(|i| keys.get(*i as usize).copied()))
+            .collect();
+        let failed = !meta["err"].is_null();
+        let nonce: Option<Address> = instructions.first().and_then(|(p, a, d)| {
+            (*p == system && system_tag(d) == Some(4))
+                .then(|| a.first().and_then(|i| keys.get(*i as usize).copied()))
+                .flatten()
+        });
+
+        let (mut carried, mut evicted) = (0, 0);
+        for key in writable {
+            if !self.held.contains(&key) {
+                continue;
+            }
+            let index = keys.iter().position(|k| *k == key);
+            let post_lamports = index.and_then(|i| post.get(i).copied().flatten());
+            let current = self.svm.get_account(&key);
+            let wallet = current
+                .as_ref()
+                .is_none_or(|a| a.owner == system && a.data.is_empty() && !a.executable);
+            let carry = if failed {
+                Some(nonce != Some(key))
+            } else {
+                Some(wallet && !reshaped.contains(&key))
+            };
+            match (carry, post_lamports) {
+                (Some(true), Some(lamports)) => {
+                    let mut account = current.unwrap_or(Account {
+                        lamports: 0,
+                        data: Vec::new(),
+                        owner: system,
+                        executable: false,
+                        rent_epoch: u64::MAX,
+                    });
+                    // A failed transaction changed only the fee payer.
+                    if !failed || index == Some(0) {
+                        account.lamports = lamports;
+                    }
+                    self.svm
+                        .set_account(key, account)
+                        .map_err(|e| eyre!("carrying {key}: {e:?}"))?;
+                    carried += 1;
+                }
+                _ => {
+                    self.held.remove(&key);
+                    evicted += 1;
+                }
+            }
+        }
+        Ok((carried, evicted))
+    }
+
+    pub fn holds(&self, key: &str) -> bool {
+        parse_address(key).is_ok_and(|k| self.held.contains(&k))
     }
 
     pub fn held_count(&self) -> usize {
@@ -386,6 +572,16 @@ impl Replay {
             }
         }
 
+        if let Some(program) = keys.iter().find(|k| self.unloadable.contains(k)) {
+            return Ok(TxOutcome::NotExecuted(NotExecuted {
+                signature: tx.signature.clone(),
+                reason: format!(
+                    "runtime-refused: program {program} cannot be loaded with register tracing \
+                     (solana-sbpf 0.23 panics loading an ELF without a section-name table \
+                     when symbol labels are enabled)"
+                ),
+            }));
+        }
         let mut missing: Vec<String> = keys
             .iter()
             .filter(|k| !self.held.contains(k) && !runtime_provided(k, &self.svm))

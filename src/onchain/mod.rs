@@ -64,6 +64,7 @@ pub fn run_transaction(
     summary: &mut Summary,
 ) -> Result<Value> {
     let outcome = replay.execute(tx)?;
+    let refused = matches!(outcome, TxOutcome::NotExecuted(_));
     let (mut line, matched) = match outcome {
         TxOutcome::NotExecuted(n) => {
             summary.not_executed += 1;
@@ -138,9 +139,26 @@ pub fn run_transaction(
             )
         }
     };
-    if !matched {
+    let held_before: Vec<String> = writable_keys(tx)?
+        .into_iter()
+        .filter(|k| replay.holds(k))
+        .collect();
+    if refused {
+        // The replay never touched this transaction's accounts, so those whose
+        // post-state the chain's record fully states are carried to it.
+        let (carried, evicted) = replay.settle_unreplayed(tx)?;
+        line["carried"] = json!(carried);
+        line["evicted"] = json!(evicted);
+    } else if !matched {
+        // The replay executed it and wrote its own (wrong) post-state: nothing
+        // it wrote can be carried.
         let evicted = replay.evict(&writable_keys(tx)?);
         line["evicted"] = json!(evicted);
+    }
+    if refused || !matched {
+        // Which keys stopped being held, so a capture knows what to read again.
+        let gone: Vec<&String> = held_before.iter().filter(|k| !replay.holds(k)).collect();
+        line["evictedKeys"] = json!(gone);
     }
     Ok(line)
 }
