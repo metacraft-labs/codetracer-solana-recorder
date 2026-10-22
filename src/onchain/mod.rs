@@ -87,7 +87,19 @@ pub fn run_transaction(
                 oracle::Status::Divergent => summary.divergent += 1,
                 oracle::Status::Unchecked => summary.unchecked += 1,
             }
-            let trace = if tx.trace {
+            // EVERY SBF INVOCATION MUST CARRY ITS OWN REGISTER TRACE, or the trace is
+            // refused rather than written. The runtime hands over a register trace only
+            // for an executable its program cache holds as loaded; an invocation without
+            // one would be written as a single step, like a builtin, and the divergence
+            // check could not see it — it compares the chain's facts, not the steps. The
+            // recorder would then publish a trace with an invocation's execution missing
+            // while the verdict still said `match`.
+            let untraced = untraced_sbf_invocations(&exec, |p| replay.is_builtin(p));
+            let trace = if tx.trace && !untraced.is_empty() {
+                json!({ "refused": format!(
+                    "{} SBF invocation(s) carry no register trace ({}); a trace written \
+                     without them would omit their execution", untraced.len(), untraced.join(", ")) })
+            } else if tx.trace {
                 let listings = exec
                     .instructions
                     .iter()
@@ -167,6 +179,19 @@ pub fn run_transaction(
         line["evictedKeys"] = json!(gone);
     }
     Ok(line)
+}
+
+/// The program ids of invocations that are not builtins and yet carry no
+/// register trace — each one an execution a written trace would silently omit.
+pub fn untraced_sbf_invocations(
+    exec: &engine::TxExecution,
+    is_builtin: impl Fn(&str) -> bool,
+) -> Vec<String> {
+    exec.instructions
+        .iter()
+        .filter(|r| r.registers.is_none() && !is_builtin(&r.program_id))
+        .map(|r| r.program_id.clone())
+        .collect()
 }
 
 pub fn replay_bundle_file(

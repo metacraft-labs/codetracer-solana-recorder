@@ -430,3 +430,25 @@ fn test_a_trace_rebuilt_from_its_bundle_is_byte_identical() {
     .unwrap();
     assert_ne!(ct(first.path()), other_ct);
 }
+
+#[test]
+fn test_an_sbf_invocation_without_its_register_trace_is_caught() {
+    use codetracer_solana_recorder::onchain::untraced_sbf_invocations;
+    let bundle = fixture("ata-create-cpi");
+    let replay = Replay::new(&bundle).unwrap();
+    let (mut exec, _) = run(&bundle);
+    // Control: on the real execution every non-builtin invocation has its trace,
+    // and the builtin System program legitimately has none.
+    assert!(untraced_sbf_invocations(&exec, |p| replay.is_builtin(p)).is_empty());
+    assert!(exec.instructions.iter().any(|r| r.registers.is_none()));
+    // The defect: one SBF invocation (a CPI into SPL Token) loses its register trace,
+    // which a trace writer would otherwise render as a one-step builtin frame.
+    let victim = exec
+        .instructions
+        .iter()
+        .position(|r| r.caller.is_some() && r.registers.is_some())
+        .unwrap();
+    exec.instructions[victim].registers = None;
+    let named = untraced_sbf_invocations(&exec, |p| replay.is_builtin(p));
+    assert_eq!(named, vec![exec.instructions[victim].program_id.clone()]);
+}

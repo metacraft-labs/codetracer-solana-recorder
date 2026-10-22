@@ -535,6 +535,16 @@ impl Replay {
         Ok((carried, evicted))
     }
 
+    /// Whether `program` is a builtin: a native-loader program the runtime runs
+    /// without SBF, so it has no register trace by construction.
+    pub fn is_builtin(&self, program: &str) -> bool {
+        parse_address(program).is_ok_and(|k| {
+            self.svm
+                .get_account(&k)
+                .is_some_and(|a| a.executable && a.owner == solana_sdk_ids::native_loader::id())
+        })
+    }
+
     pub fn holds(&self, key: &str) -> bool {
         parse_address(key).is_ok_and(|k| self.held.contains(&k))
     }
