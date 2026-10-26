@@ -82,6 +82,13 @@ pub struct SyscallState {
     /// to look up the region by index every call.
     pub heap_start: u64,
     pub heap_len: u64,
+    /// Guest memory written by each syscall invocation, index-aligned
+    /// with ``log`` (one entry per invocation, empty when the syscall
+    /// wrote nothing).  Each write is ``(vm_addr, bytes_now_there)``.
+    /// The source-level recorder replays these, together with the
+    /// program's own store instructions, to know the contents of guest
+    /// memory at every step.
+    pub mem_writes: RefCell<Vec<Vec<(u64, Vec<u8>)>>>,
 }
 
 /// Single entry in the syscall log.  Captures only what's cheap to
@@ -103,6 +110,7 @@ impl SyscallState {
             bump_pos: RefCell::new(heap_start.saturating_add(heap_len)),
             heap_start,
             heap_len,
+            mem_writes: RefCell::new(Vec::new()),
         }
     }
 
@@ -124,6 +132,15 @@ impl SyscallState {
             name: name.to_string(),
             payload,
         });
+        self.mem_writes.borrow_mut().push(Vec::new());
+    }
+
+    /// Record that the syscall currently executing (the latest
+    /// ``push``ed one) left ``bytes`` at ``vm_addr``.
+    fn record_write(&self, vm_addr: u64, bytes: &[u8]) {
+        if let Some(writes) = self.mem_writes.borrow_mut().last_mut() {
+            writes.push((vm_addr, bytes.to_vec()));
+        }
     }
 }
 
@@ -381,6 +398,8 @@ declare_builtin_function!(
                 n as usize,
             );
         }
+        let written = unsafe { std::slice::from_raw_parts(dst_host as *const u8, n as usize) };
+        ctx.syscall_state().record_write(dst_addr, written);
         Ok(0)
     }
 );
@@ -414,6 +433,8 @@ declare_builtin_function!(
         unsafe {
             std::ptr::copy(src_host as *const u8, dst_host as *mut u8, n as usize);
         }
+        let written = unsafe { std::slice::from_raw_parts(dst_host as *const u8, n as usize) };
+        ctx.syscall_state().record_write(dst_addr, written);
         Ok(0)
     }
 );
@@ -444,6 +465,8 @@ declare_builtin_function!(
         unsafe {
             std::ptr::write_bytes(dst_host as *mut u8, val as u8, n as usize);
         }
+        ctx.syscall_state()
+            .record_write(dst_addr, &vec![val as u8; n as usize]);
         Ok(0)
     }
 );
@@ -493,6 +516,8 @@ declare_builtin_function!(
         unsafe {
             std::ptr::write_unaligned(result_host as *mut i32, cmp_val);
         }
+        ctx.syscall_state()
+            .record_write(result_addr, &cmp_val.to_le_bytes());
         Ok(0)
     }
 );

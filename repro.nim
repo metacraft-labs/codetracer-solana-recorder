@@ -25,6 +25,9 @@
 
 import repro_project_dsl
 import repro_dsl_stdlib/foreign_env
+when not defined(windows):
+  import solana_sbf_sdk_tools
+import "../codetracer-trace-format-nim/build_writer_artifacts"
 
 package codetracer_solana_recorder:
   defaultToolProvisioning (when defined(windows): tarball else: path)
@@ -48,6 +51,7 @@ package codetracer_solana_recorder:
     # a static library at cargo build time.
     "nim >=2.2 <3.0"
     "nimble"
+    "git"
 
     # Cap'n Proto schema compiler used by the recorder's build.rs.
     "capnp"
@@ -55,6 +59,12 @@ package codetracer_solana_recorder:
     # libzstd headers + library, needed when linking the Nim FFI
     # static library into the cargo build.
     "zstd"
+    when not defined(windows):
+      "solana-sbf-sdk"
+      "mkdir"
+      "rm"
+      "ln"
+      "basename"
 
     # pkg-config + OpenSSL — openssl-sys consults pkg-config to find
     # OpenSSL on Linux/macOS. The Windows build uses the rustls-tls
@@ -67,6 +77,12 @@ package codetracer_solana_recorder:
     # POSIX build, so an unguarded entry would fail to resolve on Linux/macOS.
     when defined(windows):
       "chocolatey"
+
+    # The unchanged CLI harness uses Bash, dirname, grep and Cargo.
+    "sh"
+    "bash"
+    "dirname"
+    "grep"
 
   executable codetracerSolanaRecorder:
     name: "codetracer-solana-recorder"
@@ -116,24 +132,50 @@ package codetracer_solana_recorder:
     # §M4 — the whole-binary edge becomes a fan-out point without
     # changing this recipe.
 
+    const nimRoot = "../codetracer-trace-format-nim"
+    let decoderBuild = buildCtPrint(nimRoot)
+    let decoderBinary = ctPrintPath(nimRoot)
+
     let testsBuild = cargo.test(
       locked = true,
       noRun = true,
       actionId = "codetracer-solana-recorder.cargo-test-build",
       extraInputs = @[
         "Cargo.toml", "Cargo.lock",
-        "src", "build.rs", "tests"
+        "src", "build.rs", "tests", "test-programs"
       ],
       extraOutputs = @["target/debug/deps"])
 
     let testsRun = cargo.test(
       locked = true,
       actionId = "codetracer-solana-recorder.cargo-test-run",
-      after = @[testsBuild.action],
+      after = @[testsBuild.action, decoderBuild],
       extraInputs = @[
         "Cargo.toml", "Cargo.lock",
-        "src", "tests",
-        "target/debug/deps"
+        "src", "tests", "test-programs",
+        "target/debug/deps", decoderBinary
       ])
 
-    discard collect("test", @[testsRun.action])
+    # Existing Bash verification is a full test boundary, not a builder.
+    let cliVerify = shell(
+      command = "bash tests/verify-cli-convention-no-silent-skip.sh",
+      actionId = "codetracer-solana-recorder.verify-cli-convention",
+      after = @[testsRun.action],
+      extraInputs = @["tests/verify-cli-convention-no-silent-skip.sh",
+                      "Cargo.toml", "Cargo.lock", "src", "build.rs"],
+      cacheable = false)
+
+    for action in [recorderBuild, testsBuild.action, testsRun.action, cliVerify]:
+      appendRegisteredActionToolIdentityRefs(action.id,
+        ["cargo", "rustc", "nim", "nimble", "git", "capnp", "zstd"])
+      when defined(linux):
+        appendRegisteredActionToolIdentityRefs(action.id, ["gcc", "pkg-config", "openssl"])
+      elif defined(macosx):
+        appendRegisteredActionToolIdentityRefs(action.id, ["clang", "pkg-config", "openssl"])
+    when not defined(windows):
+      # The pinned owning SBF wrapper creates its real HOME cache mirror
+      # with these commands; the compiler/toolchain itself stays immutable.
+      appendRegisteredActionToolIdentityRefs(testsRun.action.id,
+        ["solana-sbf-sdk", "mkdir", "rm", "ln", "basename"])
+    appendRegisteredActionToolIdentityRefs(cliVerify.id, ["sh", "bash", "dirname", "grep"])
+    discard collect("test", @[testsRun.action, cliVerify])

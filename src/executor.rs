@@ -102,6 +102,42 @@ impl HasSyscallState for RecorderContext {
 ///
 /// The register trace as raw bytes (each row = 12 × u64 = 96 bytes).
 pub fn execute_with_tracing(elf_data: &[u8], compute_budget: u64) -> Result<Vec<u8>> {
+    Ok(execute_with_memory_trace(elf_data, compute_budget)?.regs)
+}
+
+/// Everything one execution of a program leaves behind for the recorder:
+/// the per-instruction register snapshots plus what it needs to know the
+/// contents of guest memory at every one of those instructions.
+///
+/// Guest memory is not snapshotted per instruction.  Instead the trace
+/// carries the memory image the program started from and the writes the
+/// program could not have made through its own store instructions (the
+/// ones made by syscalls).  Replaying the program's stores -- fully
+/// determined by the instruction stream and the register snapshots --
+/// interleaved with those syscall writes reproduces memory exactly; see
+/// [`crate::sbf_memory::ShadowMemory`].
+pub struct ExecutionTrace {
+    /// Raw register trace, 96 bytes per executed instruction (the
+    /// registers *before* that instruction ran).
+    pub regs: Vec<u8>,
+    /// The program's `.text` bytes; register `r11` indexes 8-byte slots
+    /// in it.
+    pub text: Vec<u8>,
+    /// Every memory region mapped for the program, as it was when the
+    /// program started: `(vm_start_address, initial_bytes)`.
+    pub initial_memory: Vec<(u64, Vec<u8>)>,
+    /// Memory written by each syscall invocation, in invocation order.
+    pub syscall_writes: Vec<Vec<(u64, Vec<u8>)>>,
+    /// Whether the program's SBPF version uses the relocated memory
+    /// instruction classes (SBPF v2+).
+    pub moved_memory_instructions: bool,
+    /// Whether the program bumps its own stack frame (`add r10, -N` in the
+    /// prologue) instead of the VM moving `r10` to a fresh fixed frame.
+    pub manual_stack_frames: bool,
+}
+
+/// Execute a compiled SBF ELF and capture an [`ExecutionTrace`].
+pub fn execute_with_memory_trace(elf_data: &[u8], compute_budget: u64) -> Result<ExecutionTrace> {
     let config = Config {
         enable_register_tracing: true,
         enable_instruction_meter: true,
@@ -158,6 +194,14 @@ pub fn execute_with_tracing(elf_data: &[u8], compute_budget: u64) -> Result<Vec<
     // ``process_instruction``.
     let mut input = vec![0u8; 48]; // num=0, data_len=0, program_id=32 zero bytes
 
+    let ro_region = executable.get_ro_region();
+    let initial_memory = vec![
+        (ro_region.vm_addr, executable.get_ro_section().to_vec()),
+        (ebpf::MM_STACK_START, stack.clone()),
+        (ebpf::MM_HEAP_START, heap.clone()),
+        (ebpf::MM_INPUT_START, input.clone()),
+    ];
+
     let sbpf_version = executable.get_sbpf_version();
     // The program's read-only data (constants, string literals etc.)
     // is mapped at ``MM_PROGRAM_START``.  The on-chain Solana runtime
@@ -172,7 +216,7 @@ pub fn execute_with_tracing(elf_data: &[u8], compute_budget: u64) -> Result<Vec<
     // ``AccessViolation(Load, 4295012184, 8, "program")``
     // (4295012184 = 0x1_0000_0018 = ``MM_PROGRAM_START + 0x18``).
     let regions = vec![
-        executable.get_ro_region(),
+        ro_region,
         MemoryRegion::new_writable(&mut stack, ebpf::MM_STACK_START),
         MemoryRegion::new_writable(&mut heap, ebpf::MM_HEAP_START),
         MemoryRegion::new_writable(&mut input, ebpf::MM_INPUT_START),
@@ -211,6 +255,15 @@ pub fn execute_with_tracing(elf_data: &[u8], compute_budget: u64) -> Result<Vec<
             regs_data.extend_from_slice(&reg_val.to_le_bytes());
         }
     }
+    drop(vm);
 
-    Ok(regs_data)
+    let syscall_writes = context.syscall_state.mem_writes.take();
+    Ok(ExecutionTrace {
+        regs: regs_data,
+        text: executable.get_text_bytes().1.to_vec(),
+        initial_memory,
+        syscall_writes,
+        moved_memory_instructions: sbpf_version.move_memory_instruction_classes(),
+        manual_stack_frames: sbpf_version.manual_stack_frame_bump(),
+    })
 }

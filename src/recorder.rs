@@ -38,7 +38,6 @@
 //! degrade to empty and the recorder behaves exactly as before.
 
 use std::collections::HashMap;
-use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 
 use codetracer_trace_types::{EventLogKind, Line, NONE_VALUE, TypeId, TypeKind, ValueRecord};
@@ -341,27 +340,6 @@ fn resolve_source_against_elf_crate(dwarf_path: &Path, elf_path: &Path) -> PathB
 /// ``user_crate_root`` when available.  Everything else is passed
 /// through unchanged so synthetic-fixture tests that pass bare
 /// basenames still see the basename in the recorded trace.
-/// Whether `path` has a per-line length table, resolved the same way path
-/// registration resolves it.
-///
-/// A column is only addressable in a file the writer sized from its own line
-/// table. A file registered without one is sized by the line-only fallback,
-/// where one address is one line — so a column folded into that address reads
-/// back as a LATER LINE, not as a column. DWARF paths routinely fail to
-/// resolve on the recording machine (`--remap-path-prefix`, a build on another
-/// host), which makes this the normal case rather than an edge one.
-fn path_has_line_table(path: &Path, source_path: &Path) -> bool {
-    if !read_line_lengths_for_path(path).is_empty() {
-        return true;
-    }
-    // The same parent-directory fallback path registration applies, so the two
-    // cannot disagree about whether a file is addressable.
-    source_path
-        .parent()
-        .map(|p| !read_line_lengths_for_path(&p.join(path)).is_empty())
-        .unwrap_or(false)
-}
-
 fn canonical_step_path(
     file_str: &str,
     source_path_str: &str,
@@ -381,6 +359,94 @@ fn canonical_step_path(
         }
     }
     PathBuf::from(file_str)
+}
+
+/// The source files of one recording, each under one path string and each
+/// registered with its line table before anything else names it.
+///
+/// In a column-aware trace the writer fixes a file's table at the file's first
+/// mention -- a registration, or a step, function or call naming it -- and a
+/// table offered later cannot be honoured. Every mention therefore goes through
+/// [`SourcePaths::ensure`], which registers the file's table on the first one
+/// and returns the single string ([`canonical_step_path`]) the file is named by
+/// in every record, so two spellings of one file cannot become two records.
+struct SourcePaths {
+    source_path: PathBuf,
+    source_path_str: String,
+    user_crate_root: Option<PathBuf>,
+    /// Per spelling seen in debug info: the path the file is recorded under.
+    canonical: HashMap<String, PathBuf>,
+    /// Per recorded path: whether it was registered with a line table.
+    tabled: HashMap<PathBuf, bool>,
+}
+
+impl SourcePaths {
+    fn new(source_path: &Path) -> Self {
+        // The user's crate root: the nearest ancestor of an absolute
+        // ``source_path`` that holds a ``Cargo.toml``. ``cargo-build-sbf``
+        // remaps every source path to a relative ``src/<name>.rs``, so this is
+        // what such a path is resolved against, and what tells the user's
+        // files from bundled dependencies'. ``None`` for a relative
+        // ``source_path`` (synthetic fixtures).
+        let user_crate_root = if source_path.is_absolute() {
+            source_path
+                .ancestors()
+                .find(|anc| anc.join("Cargo.toml").exists())
+                .map(Path::to_path_buf)
+        } else {
+            None
+        };
+        Self {
+            source_path: source_path.to_path_buf(),
+            source_path_str: source_path.to_string_lossy().into_owned(),
+            user_crate_root,
+            canonical: HashMap::new(),
+            tabled: HashMap::new(),
+        }
+    }
+
+    /// The path `file_str` is recorded under, registered with its line table
+    /// if this is the file's first mention.
+    ///
+    /// The table is read from the recorded path, or, when that does not read
+    /// (a bare basename), from `file_str` beside the trace anchor. A file that
+    /// reads neither way is registered without one.
+    fn ensure(&mut self, writer: &mut dyn TraceWriter, file_str: &str) -> PathBuf {
+        if let Some(path) = self.canonical.get(file_str) {
+            return path.clone();
+        }
+        let path = canonical_step_path(
+            file_str,
+            &self.source_path_str,
+            self.user_crate_root.as_deref(),
+        );
+        if !self.tabled.contains_key(&path) {
+            let lengths = match read_line_lengths_for_path(&path) {
+                v if !v.is_empty() => v,
+                _ => self
+                    .source_path
+                    .parent()
+                    .map(|p| read_line_lengths_for_path(&p.join(file_str)))
+                    .unwrap_or_default(),
+            };
+            let _ = writer.register_path_with_line_lengths(&path, &lengths);
+            self.tabled.insert(path.clone(), !lengths.is_empty());
+        }
+        self.canonical.insert(file_str.to_string(), path.clone());
+        path
+    }
+
+    /// Whether `path` (as returned by [`SourcePaths::ensure`]) has a line
+    /// table.
+    ///
+    /// A column is only addressable in a file the writer sized from its own
+    /// line table. In a file without one, a column folded into the address
+    /// reads back as a later line. DWARF paths routinely fail to resolve on
+    /// the recording machine (`--remap-path-prefix`, a build on another
+    /// host), so this is the normal case rather than an edge one.
+    fn has_table(&self, path: &Path) -> bool {
+        self.tabled.get(path).copied().unwrap_or(false)
+    }
 }
 
 fn is_third_party_for_user(
@@ -2363,40 +2429,13 @@ pub fn record_from_snapshots_into_writer(
     writer.enable_column_breakpoints_support();
     writer.enable_column_motions_support();
 
-    // Per source path emitted by this trace, register the path together
-    // with its per-line byte counts so the `paths.dat` Layout A column-
-    // resolution at read time can decode columns from the running
-    // `global_position_index`.  We dedupe (some traces step through
-    // tens of thousands of snapshots that share at most a handful of
-    // source files) and skip synthetic / unreadable paths via the same
-    // gating the Python recorder uses.
-    {
-        let mut registered: HashSet<String> = HashSet::new();
-        // The primary source path always belongs in the table even when
-        // no snapshot's PC happens to land on it — keeps the metadata
-        // coherent for the column-aware reader.
-        let line_lengths = read_line_lengths_for_path(source_path);
-        let _ = writer.register_path_with_line_lengths(source_path, &line_lengths);
-        registered.insert(source_path.to_string_lossy().into_owned());
-        for (_, file_str, _, _) in source_locations {
-            if registered.insert(file_str.to_string()) {
-                let path = Path::new(file_str);
-                // When `file_str` is a bare filename or otherwise
-                // unreadable from cwd (the legacy fixtures pass bare
-                // basenames like `"control_flow_test.rs"`), fall back
-                // to resolving relative to the primary source path's
-                // directory so we still pick up the on-disk line
-                // lengths for column-aware decoding.
-                let lengths = match read_line_lengths_for_path(path) {
-                    v if !v.is_empty() => v,
-                    _ => source_path
-                        .parent()
-                        .map(|p| read_line_lengths_for_path(&p.join(file_str)))
-                        .unwrap_or_default(),
-                };
-                let _ = writer.register_path_with_line_lengths(path, &lengths);
-            }
-        }
+    // Register every source file with its per-line table before the first
+    // record that names it (`start` names the anchor), under the one path
+    // string every later record uses for it. See `SourcePaths`.
+    let mut paths = SourcePaths::new(source_path);
+    paths.ensure(writer, &source_path.to_string_lossy());
+    for (_, file_str, _, _) in source_locations {
+        paths.ensure(writer, file_str);
     }
 
     // Load and analyse the fixture source so we can resolve nested call
@@ -2548,28 +2587,6 @@ pub fn record_from_snapshots_into_writer(
     // step-over advances through real lines, and the
     // ``process_instruction`` scope spans every user-source step
     // from start to finish so its locals stay visible throughout.
-    let source_path_str = source_path.to_string_lossy().to_string();
-    // Resolve the user's crate root once per recording: the nearest
-    // ancestor of ``source_path`` that contains a ``Cargo.toml``.
-    // Used below to decide whether a snapshot's relative DWARF path
-    // (cargo-build-sbf applies ``--remap-path-prefix`` so every
-    // source path arrives as a relative ``src/<basename>.rs``)
-    // names a file that lives in the user's crate or in one of the
-    // bundled solana-program / curve25519-dalek / std dependencies
-    // (``src/lib.rs`` from solana-program-entrypoint, ``src/hazmat.rs``
-    // from subtle, ``src/syscalls.rs``, etc.).  ``None`` when
-    // ``source_path`` is relative (synthetic-fixture tests) or
-    // ``source_path``'s tree has no ancestor Cargo.toml -- the
-    // third-party check below short-circuits to "keep" in those
-    // cases so existing test_comprehensive scenarios stay green.
-    let user_crate_root: Option<PathBuf> = if source_path.is_absolute() {
-        source_path
-            .ancestors()
-            .find(|anc| anc.join("Cargo.toml").exists())
-            .map(Path::to_path_buf)
-    } else {
-        None
-    };
     let mut prev_line: Option<u32> = None;
     // Track the previously emitted column on the same line so we can
     // fire a fresh column-aware step when the next snapshot lands on a
@@ -2578,9 +2595,6 @@ pub fn record_from_snapshots_into_writer(
     // §"Column Encoding").  Outside column-aware mode this stays at
     // `None` and the legacy line-only dedupe applies.
     let mut prev_column: Option<u32> = None;
-    // Memoised per step path: does this file have a column axis at all?
-    let mut column_addressable: std::collections::HashMap<PathBuf, bool> =
-        std::collections::HashMap::new();
     let mut prev_pc: Option<u64> = None;
     let mut prev_regs: [u64; 12] = [0u64; 12];
 
@@ -2604,7 +2618,11 @@ pub fn record_from_snapshots_into_writer(
         // prev_regs so the next user-source landing sees a
         // continuous register flow, but emit no Step / Value / Call
         // events for them.  See the loop preamble for rationale.
-        if is_third_party_for_user(&source_path_str, file_str, user_crate_root.as_deref()) {
+        if is_third_party_for_user(
+            &paths.source_path_str,
+            file_str,
+            paths.user_crate_root.as_deref(),
+        ) {
             prev_pc = Some(pc);
             prev_regs = snap.registers;
             continue;
@@ -2634,10 +2652,11 @@ pub fn record_from_snapshots_into_writer(
                         let callee_name = curr_fn
                             .map(str::to_string)
                             .unwrap_or_else(|| format!("fn_at_pc_{pc}"));
+                        let callee_path = paths.ensure(writer, file_str);
                         let callee_fn_id = TraceWriter::ensure_function_id(
                             writer,
                             &callee_name,
-                            &Path::new(file_str),
+                            &callee_path,
                             Line(line as i64),
                         );
                         TraceWriter::register_call(writer, callee_fn_id, vec![]);
@@ -2712,19 +2731,11 @@ pub fn record_from_snapshots_into_writer(
         let line_changed = prev_line != Some(line);
         let column_changed = column.is_some() && prev_column != column;
         if line_changed || column_changed {
-            // Normalise the step's path so it matches the trace
-            // anchor (``source_path``).  ``cargo-build-sbf`` applies
-            // ``--remap-path-prefix`` to user-crate source paths so
-            // DWARF gives us bare basenames or short relative paths;
-            // canonicalising here keeps every emitted Step on the
-            // same path string as the trace anchor.
-            let step_path =
-                canonical_step_path(file_str, &source_path_str, user_crate_root.as_deref());
+            // One path string per file, the anchor's for the anchor: see
+            // `canonical_step_path`.
+            let step_path = paths.ensure(writer, file_str);
             // Offer the column only for a file the writer can address one in.
-            let column = if *column_addressable
-                .entry(step_path.clone())
-                .or_insert_with(|| path_has_line_table(&step_path, &source_path))
-            {
+            let column = if paths.has_table(&step_path) {
                 column
             } else {
                 None
@@ -2887,21 +2898,12 @@ pub fn record_with_cpi(
     // model and we fall back to the registry-derived names.
     let model = SourceModel::load(source_path);
 
-    // Register the primary source path with its per-line byte counts
-    // BEFORE `TraceWriter::start` — `start` interns the path
-    // implicitly (with no line-length data), so a late call to
-    // `register_path_with_line_lengths` would create a stale paths.dat
-    // entry without per-line byte counts and the column-aware reader
-    // would silently fall back to the legacy DefaultLinesPerFile GLI.
-    // Per-CPI program source files are registered lazily inside the
-    // snapshot loop as they appear via `registry.find_location_with_column`.
-    {
-        let line_lengths = read_line_lengths_for_path(source_path);
-        let _ =
-            TraceWriter::register_path_with_line_lengths(&mut *writer, source_path, &line_lengths);
-    }
-    let mut registered_paths: HashSet<String> = HashSet::new();
-    registered_paths.insert(source_path.to_string_lossy().into_owned());
+    // Register the anchor with its per-line table before `start` names it.
+    // Every other file is registered by `SourcePaths::ensure` at its first
+    // mention -- the call into it, or the step on it -- under the one path
+    // string every record uses for it.
+    let mut paths = SourcePaths::new(source_path);
+    paths.ensure(&mut *writer, &source_path.to_string_lossy());
 
     // Start the trace.
     TraceWriter::start(&mut *writer, source_path, Line(1));
@@ -2996,10 +2998,11 @@ pub fn record_with_cpi(
                     .function_at(line)
                     .map(str::to_string)
                     .unwrap_or_else(|| program_name_str.to_string());
+                let callee_path = paths.ensure(&mut *writer, &file_str);
                 let cpi_fn_id = TraceWriter::ensure_function_id(
                     &mut *writer,
                     &callee_name,
-                    &Path::new(&file_str),
+                    &callee_path,
                     Line(line as i64),
                 );
                 // Stage CPI-target metadata as call args so the calltrace
@@ -3069,10 +3072,11 @@ pub fn record_with_cpi(
                                 let callee_name = curr_fn
                                     .map(str::to_string)
                                     .unwrap_or_else(|| format!("fn_at_pc_{pc}"));
+                                let callee_path = paths.ensure(&mut *writer, &file_str);
                                 let callee_fn_id = TraceWriter::ensure_function_id(
                                     &mut *writer,
                                     &callee_name,
-                                    &Path::new(&file_str),
+                                    &callee_path,
                                     Line(line as i64),
                                 );
                                 TraceWriter::register_call(&mut *writer, callee_fn_id, vec![]);
@@ -3121,25 +3125,13 @@ pub fn record_with_cpi(
             }
         };
 
-        // Lazily register this source path with the writer so the
-        // column-aware reader can resolve `DeltaColumn` events on every
-        // file referenced by the trace.  Synthetic / unreadable files
-        // degrade to an empty `line_lengths`, which the writer accepts.
-        if registered_paths.insert(file_str.clone()) {
-            let path = Path::new(&file_str);
-            // Bare basenames fall back to resolving against the
-            // primary source path's directory; mirrors the non-CPI
-            // path's resolver so column-aware decoding works on the
-            // existing CPI fixtures that pass relative file names.
-            let lengths = match read_line_lengths_for_path(path) {
-                v if !v.is_empty() => v,
-                _ => source_path
-                    .parent()
-                    .map(|p| read_line_lengths_for_path(&p.join(&file_str)))
-                    .unwrap_or_default(),
-            };
-            let _ = TraceWriter::register_path_with_line_lengths(&mut *writer, path, &lengths);
-        }
+        let step_path = paths.ensure(&mut *writer, &file_str);
+        // Offer the column only for a file the writer can address one in.
+        let column = if paths.has_table(&step_path) {
+            column
+        } else {
+            None
+        };
 
         // Emit step on a fresh (line, column) — same contract as the
         // non-CPI path.  Line changes always fire; same-line column
@@ -3150,7 +3142,7 @@ pub fn record_with_cpi(
         if line_changed || column_changed {
             TraceWriter::register_step_with_column(
                 &mut *writer,
-                &Path::new(&file_str),
+                &step_path,
                 Line(line as i64),
                 column.map(|c| Line(c as i64)),
             );

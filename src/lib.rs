@@ -7,5 +7,8 @@ pub mod recorder;
 pub mod register_trace;
 pub mod replay;
 pub mod rpc_client;
+pub mod sbf_memory;
+pub mod source_debug;
+pub mod source_recorder;
 pub mod syscalls;
 pub mod tracer_trait;
