@@ -27,7 +27,7 @@
       system:
       let
         pkgs = import nixpkgs { inherit system; };
-        rustToolchain = fenix.packages.${system}.combine (
+        fenixToolchain = fenix.packages.${system}.combine (
           let
             channel = fenix.packages.${system}.toolchainOf {
               channel = "1.97.1";
@@ -42,6 +42,43 @@
             channel.rust-src
           ]
         );
+        # Rust 1.90+ links x86_64-linux executables with its bundled rust-lld,
+        # which bypasses the cc-wrapper / ld-wrapper that writes each Nix store
+        # library's directory into RUNPATH. The binaries then fail at start
+        # with `libssl.so.3: cannot open shared object file`. nixpkgs' rustc
+        # opts out at build time; this toolchain comes from fenix and does not,
+        # so its compilers are wrapped to pass `-C linker-features=-lld`.
+        #
+        # The flag belongs to this toolchain, not to the shell. The Solana SBF
+        # toolchain that `cargo build-sbf` drives is an older rustc that rejects
+        # it, and that rustc compiles host code too (build scripts, proc macros,
+        # the target probe of `cargo metadata`), so a shell-wide
+        # `CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_RUSTFLAGS` reaches it and
+        # breaks the SBF build (tests/test_dev_shell_toolchains.rs).
+        #
+        # `clippy-driver` links the build scripts of workspace members, so it is
+        # wrapped too. `cargo-clippy` runs the driver that sits beside its own
+        # resolved executable, so it is copied in rather than linked, which
+        # makes that the wrapped driver. The toolchain carries only the host
+        # std, so x86_64-unknown-linux-gnu is the only target it can link.
+        rustToolchain =
+          if system == "x86_64-linux" then
+            pkgs.symlinkJoin {
+              name = "${fenixToolchain.name}-nix-linker";
+              paths = [ fenixToolchain ];
+              nativeBuildInputs = [ pkgs.makeWrapper ];
+              postBuild = ''
+                for tool in rustc clippy-driver; do
+                  rm "$out/bin/$tool"
+                  makeWrapper "${fenixToolchain}/bin/$tool" "$out/bin/$tool" \
+                    --append-flags "-C linker-features=-lld"
+                done
+                rm "$out/bin/cargo-clippy"
+                cp "${fenixToolchain}/bin/cargo-clippy" "$out/bin/cargo-clippy"
+              '';
+            }
+          else
+            fenixToolchain;
       in
       {
         devShells.default = pkgs.mkShell {
@@ -75,13 +112,6 @@
             # devShell via ``nix develop -c sh``).
             mcl-blockchain.packages.${system}.cargo-build-sbf
           ];
-
-          # Rust 1.90+ links x86_64-linux executables with its bundled rust-lld,
-          # which bypasses the cc-wrapper / ld-wrapper that writes each Nix store
-          # library's directory into RUNPATH. The binaries then fail at start
-          # with `libssl.so.3: cannot open shared object file`. nixpkgs' rustc
-          # opts out the same way; this toolchain comes from fenix and does not.
-          CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_RUSTFLAGS = "-C linker-features=-lld";
 
           # `cargo <subcommand>` looks for `cargo-<subcommand>` in
           # `$CARGO_HOME/bin` BEFORE it searches PATH. On any machine with
