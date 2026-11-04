@@ -59,6 +59,12 @@ package codetracer_solana_recorder:
     # libzstd headers + library, needed when linking the Nim FFI
     # static library into the cargo build.
     "zstd"
+    # zstd.h + libzstd for the sibling ct-print edge
+    # (``build_writer_artifacts.buildCtPrint`` compiles and links against
+    # them; ``zstd`` is the CLI only). The constructor cannot provision a
+    # tool from inside ``build:`` and refuses a recipe that omits it.
+    when not defined(windows):
+      "zstd-dev"
     when not defined(windows):
       "solana-sbf-sdk"
       "mkdir"
