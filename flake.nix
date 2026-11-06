@@ -100,6 +100,18 @@
             pkgs.capnproto
             rustToolchain
             pkgs.pkg-config
+            # agave-precompiles turns on solana-secp256r1-program's
+            # `openssl-vendored` feature unconditionally, so openssl-sys
+            # builds OpenSSL from source (openssl-src), and its Configure
+            # step is a Perl script. Without perl here the build only works
+            # on hosts that happen to have one on PATH; a CI runner that has
+            # none fails with "Command 'perl' not found".
+            pkgs.perl
+            # codetracer_trace_writer_nim's build.rs runs
+            # `nimble install --depsOnly`, and nimble shells out to git
+            # ("'git' not in PATH" otherwise). SOLANA_CI_GIT names the
+            # same package for CI scripts but does not put it on PATH.
+            pkgs.git
             # Solana SBF toolchain.  The mcl-blockchain ``solana``
             # devShell exposes ``cargo-build-sbf`` via its own
             # ``packages = [...]`` list; ``inputsFrom`` only propagates

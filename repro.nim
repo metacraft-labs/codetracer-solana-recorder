@@ -78,6 +78,15 @@ package codetracer_solana_recorder:
     when not defined(windows):
       "pkg-config"
       "openssl"
+    # perl + make — agave-precompiles enables solana-secp256r1-program's
+    # `openssl-vendored` feature unconditionally, so openssl-sys builds
+    # OpenSSL from source (openssl-src): its Configure step is a Perl
+    # script and the build runs make. Neither reaches a cargo edge's PATH
+    # unless declared, and a host without them fails with "Command 'perl'
+    # not found".
+    when not defined(windows):
+      "perl"
+      "make"
     # `choco pack` / `choco push` in .github/workflows/publish-chocolatey.yml.
     # Windows-guarded because Chocolatey is a Windows package manager with no
     # POSIX build, so an unguarded entry would fail to resolve on Linux/macOS.
@@ -175,9 +184,11 @@ package codetracer_solana_recorder:
       appendRegisteredActionToolIdentityRefs(action.id,
         ["cargo", "rustc", "nim", "nimble", "git", "capnp", "zstd"])
       when defined(linux):
-        appendRegisteredActionToolIdentityRefs(action.id, ["gcc", "pkg-config", "openssl"])
+        appendRegisteredActionToolIdentityRefs(action.id,
+          ["gcc", "pkg-config", "openssl", "perl", "make"])
       elif defined(macosx):
-        appendRegisteredActionToolIdentityRefs(action.id, ["clang", "pkg-config", "openssl"])
+        appendRegisteredActionToolIdentityRefs(action.id,
+          ["clang", "pkg-config", "openssl", "perl", "make"])
     when not defined(windows):
       # The pinned owning SBF wrapper creates its real HOME cache mirror
       # with these commands; the compiler/toolchain itself stays immutable.
