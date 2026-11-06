@@ -32,12 +32,33 @@ codetracer-solana-recorder record --regs trace.regs --elf program.so \
     --out-dir <dir>
 ```
 
-Replay a confirmed on-chain transaction via Solana JSON-RPC:
+Replay a confirmed on-chain transaction through the real Solana runtime
+(LiteSVM over Agave 4.3's program runtime and SBF VM, register tracing on):
 
 ```bash
 codetracer-solana-recorder replay --signature <SIG> \
-    [--rpc-url <URL>] [--program-dir <PATH>] --out-dir <dir>
+    [--rpc-url <URL>] --out-dir <dir>
 ```
+
+The RPC cannot read an account at a past slot, so `replay` executes against
+the accounts' CURRENT state. Every replay is checked against the chain's own
+record (result, compute units, fee, logs, balances before and after, token
+balances, inner instructions, return data), and `verdicts.jsonl` states
+`match`, `divergent` (with its cause, `prestate` or `execution`) or
+`unchecked`. For a transaction whose accounts have changed since, expect
+`divergent` / `prestate`: that is the check working, not failing.
+
+Replay a captured bundle (`codetracer-solana/replay-bundle@1`) with no
+network access. This is the form BlockTracer's capture writes and CI pins:
+
+```bash
+codetracer-solana-recorder replay-bundle --bundle <bundle.json> --out-dir <dir>
+# writes verdicts.jsonl, traces/<signature>/, held-state.json
+```
+
+On-chain traces are T1. Steps point at a disassembly listing of the executed
+program, frames come from the VM's own call/exit and CPI records, and the
+values shown are the VM registers `r0`..`r10`, named as such.
 
 The recorder always writes traces in the canonical CodeTracer CTFS
 multi-stream format (see
@@ -66,7 +87,8 @@ The recorder is organized into the following modules:
 * `multi_program.rs` — multi-program registry for CPI-aware tracing
 * `account_decoder.rs` — Anchor IDL / Borsh account data decoding
 * `tracer_trait.rs` — pluggable `SbpfTracer` trait + `CodeTracerTracer` impl
-* `replay.rs` — on-chain transaction replay via Solana JSON-RPC
+* `onchain/` — replay through the real runtime, the divergence check, T1 traces
+* `replay.rs` — helpers over a fetched transaction
 * `rpc_client.rs` — Solana JSON-RPC client
 
 ### Testing
