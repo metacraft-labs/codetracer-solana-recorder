@@ -41,7 +41,11 @@ def read(*args):
     return subprocess.check_output([str(git), "--git-dir=" + str(sdk / ".git"), "--work-tree=" + str(sdk), *args], cwd=sdk, env=env)
 lock = tomllib.loads((root / "repro.lock").read_text())
 selected = [d for d in lock["lock"]["deps"] if d["name"] == "codetracer-trace-format-nim"]
-if len(selected) != 1 or selected[0]["path"] != "../codetracer-trace-format-nim":
+# A v2 lock records the checkout location as `path`. A v3 lock
+# (reprobuild.solved-graph-lock.v3) records no location: its readers derive
+# the checkout from the entry's `name`, here the one-level sibling `sdk`. Both
+# select the same directory; a v2 entry that names any other path is refused.
+if len(selected) != 1 or selected[0].get("path", "../codetracer-trace-format-nim") != "../codetracer-trace-format-nim":
     raise RuntimeError("owning lock has no unique declared Nim sibling")
 revision = selected[0]["revision"]
 if re.fullmatch("[0-9a-f]{40}", revision) is None or selected[0]["integrity"] != "git-sha1:" + revision:
