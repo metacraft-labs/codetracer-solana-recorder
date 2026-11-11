@@ -18,8 +18,15 @@ name: publish-rpm
 #   CODETRACER_RPM_BUCKET_TOKEN            (R2/S3 token, if needed)
 #   CODETRACER_AUR_GPG_PRIVATE_KEY         (re-used: same GPG key)
 #   CODETRACER_AUR_GPG_PRIVATE_KEY_PASS
+#   CI_TOKEN_PROVIDER_APP_ID / CI_TOKEN_PROVIDER_PRIVATE_KEY
+#                                          (sibling clones in setup-dev-env)
 # Required variables:
 #   R2_CODETRACER_BUCKET_NAME
+#
+# Runs on the self-hosted NixOS runners: every tool comes from Nix (the
+# repo's dev shell for the build, the flake-pinned nixpkgs for rpmbuild,
+# patchelf, gnupg and the AWS CLI). Each architecture is built natively on
+# a runner of that architecture, so no cross toolchain is needed.
 
 on:
   push:
@@ -46,7 +53,7 @@ on:
 
 jobs:
   build-and-publish-rpm:
-    runs-on: [self-hosted, nixos]
+    runs-on: [self-hosted, linux, "${{ (inputs.arch || 'x86_64') == 'aarch64' && 'arm64' || 'x64' }}"]
     name: rpm / ${{ inputs.arch || 'x86_64' }}
     environment: rpm
     env:
@@ -75,42 +82,62 @@ jobs:
           echo "Resolved version: ${version}"
           echo "version=${version}" >> "$GITHUB_OUTPUT"
 
-      - name: Install Rust toolchain
-        uses: dtolnay/rust-toolchain@stable
+      - name: Mint installation token for cross-repo sibling clones
+        id: ci_token
+        uses: actions/create-github-app-token@v2
         with:
-          targets: |
-            x86_64-unknown-linux-gnu
-            aarch64-unknown-linux-gnu
+          app-id: ${{ secrets.CI_TOKEN_PROVIDER_APP_ID }}
+          private-key: ${{ secrets.CI_TOKEN_PROVIDER_PRIVATE_KEY }}
+          owner: metacraft-labs
 
-      - name: Install rpmbuild + cross-compile deps
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y rpm xz-utils gnupg
-          if [[ "$ARCH" == "aarch64" ]]; then
-            sudo apt-get install -y gcc-aarch64-linux-gnu
-          fi
+      - name: Setup dev env
+        # Installs Nix and clones the siblings listed in .github/sibling-repos
+        # at the revisions this commit's repro.lock pins.
+        uses: metacraft-labs/metacraft-github-actions/setup-dev-env@dev
+        with:
+          env-flavor: nix
+          gh-token: ${{ steps.ci_token.outputs.token }}
 
       - name: Build recorder binary
         run: |
           set -euo pipefail
-          if [[ "$ARCH" == "aarch64" ]]; then
-            export CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER=aarch64-linux-gnu-gcc
-            cargo build --release --locked \
-              --target aarch64-unknown-linux-gnu \
-              --bin codetracer-solana-recorder
-            echo "binary=$(pwd)/target/aarch64-unknown-linux-gnu/release/codetracer-solana-recorder" >> "$GITHUB_ENV"
-          else
-            cargo build --release --locked \
-              --bin codetracer-solana-recorder
-            echo "binary=$(pwd)/target/release/codetracer-solana-recorder" >> "$GITHUB_ENV"
-          fi
+          dev-exec cargo build --release --locked \
+            --bin codetracer-solana-recorder
+          binary="$(pwd)/target/release/codetracer-solana-recorder"
+          # The Nix toolchain links the binary against the Nix store's
+          # dynamic loader. Point it at the standard FHS loader and drop the
+          # store RUNPATH so it runs on the distributions that install
+          # the package, then refuse to ship anything still tied to /nix.
+          case "$(uname -m)" in
+            x86_64)  loader=/lib64/ld-linux-x86-64.so.2 ;;
+            aarch64) loader=/lib/ld-linux-aarch64.so.1 ;;
+            *) echo "::error::unsupported build machine $(uname -m)"; exit 1 ;;
+          esac
+          nix shell --inputs-from . nixpkgs#patchelf nixpkgs#binutils -c bash -euo pipefail -c '
+            patchelf --set-interpreter "$1" --remove-rpath "$2"
+            readelf -lW "$2" | grep "program interpreter"
+            readelf -dW "$2" | grep -E "NEEDED|RPATH|RUNPATH" || true
+            if readelf -lW -dW "$2" | grep -q /nix/store; then
+              echo "::error::$2 still references /nix/store"; exit 1
+            fi
+            floor=$(objdump -T "$2" | grep -o "GLIBC_[0-9.]*" | sort -uV | tail -n1)
+            echo "::notice::$(basename "$2") requires glibc ${floor#GLIBC_} or newer"
+            echo "glibc_floor=${floor#GLIBC_}" >> "$GITHUB_ENV"
+          ' _ "$loader" "$binary"
+          echo "binary=$binary" >> "$GITHUB_ENV"
 
       - name: Build .rpm
         env:
           VERSION: ${{ steps.version.outputs.version }}
         run: |
+          set -euo pipefail
+          # The generated spec carries the template's version; stamp the one
+          # being released (build.sh looks for <name>-<VERSION>-*.rpm).
+          sed -i -e "s/^Version:\( *\).*/Version:\1${VERSION}/" \
+            packaging/rpm/codetracer-solana-recorder.spec
           mkdir -p out
-          bash packaging/rpm/build.sh \
+          nix shell --inputs-from . nixpkgs#rpm -c \
+            bash packaging/rpm/build.sh \
             packaging/rpm \
             "${{ env.binary }}" \
             out \
@@ -118,20 +145,30 @@ jobs:
             "$VERSION" \
             codetracer-solana-recorder \
             "$ARCH"
-
-      - name: Import GPG key
-        if: ${{ inputs.dry_run == false }}
-        uses: crazy-max/ghaction-import-gpg@v6
-        with:
-          gpg_private_key: ${{ secrets.CODETRACER_AUR_GPG_PRIVATE_KEY }}
-          passphrase:      ${{ secrets.CODETRACER_AUR_GPG_PRIVATE_KEY_PASS }}
+          rpm=$(find out -name "*.rpm" -type f | head -n1)
+          nix shell --inputs-from . nixpkgs#rpm -c rpm -qip --requires "$rpm"
 
       - name: Sign .rpm
         if: ${{ inputs.dry_run == false }}
+        env:
+          GPG_PRIVATE_KEY: ${{ secrets.CODETRACER_AUR_GPG_PRIVATE_KEY }}
+          GPG_PASSPHRASE: ${{ secrets.CODETRACER_AUR_GPG_PRIVATE_KEY_PASS }}
         run: |
           set -euo pipefail
           rpm=$(find out -name "*.rpm" -type f | head -n1)
-          gpg --armor --detach-sign "$rpm"
+          GNUPGHOME="$(mktemp -d)"
+          export GNUPGHOME
+          trap 'rm -rf "$GNUPGHOME"' EXIT
+          # The key secret is either an armored key or its base64 encoding.
+          nix shell --inputs-from . nixpkgs#gnupg -c bash -euo pipefail -c '
+            if printf "%s" "$GPG_PRIVATE_KEY" | grep -q "BEGIN PGP PRIVATE KEY"; then
+              printf "%s\n" "$GPG_PRIVATE_KEY"
+            else
+              printf "%s" "$GPG_PRIVATE_KEY" | base64 -d
+            fi | gpg --batch --import
+            printf "%s" "$GPG_PASSPHRASE" | gpg --batch --yes --pinentry-mode loopback \
+              --passphrase-fd 0 --armor --detach-sign "$1"
+          ' _ "$rpm"
 
       - name: Upload .rpm to rpm.codetracer.com (R2)
         if: ${{ inputs.dry_run == false }}
@@ -145,16 +182,16 @@ jobs:
             echo "::error::CODETRACER_RPM_BUCKET_ACCESS_KEY_ID secret missing; cannot upload."
             exit 1
           fi
-          python3 -m pip install --user awscli
-          export PATH="$HOME/.local/bin:$PATH"
           rpm=$(find out -name "*.rpm" -type f | head -n1)
           asc="$rpm.asc"
           bucket_name="${{ vars.R2_CODETRACER_BUCKET_NAME }}"
           endpoint="${{ secrets.CODETRACER_RPM_BUCKET_S3_URL }}"
           dest="s3://$bucket_name/rpm/codetracer-solana-recorder/$(basename "$rpm")"
-          aws --endpoint-url="$endpoint" \
+          nix shell --inputs-from . nixpkgs#awscli2 -c \
+            aws --endpoint-url="$endpoint" \
             s3 cp "$rpm" "$dest" --checksum-algorithm CRC32
-          aws --endpoint-url="$endpoint" \
+          nix shell --inputs-from . nixpkgs#awscli2 -c \
+            aws --endpoint-url="$endpoint" \
             s3 cp "$asc" "$dest.asc" --checksum-algorithm CRC32
           echo "Published $dest"
 

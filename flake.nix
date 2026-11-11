@@ -5,6 +5,13 @@
     mcl-blockchain.url = "github:metacraft-labs/nix-blockchain-development";
     nixpkgs.follows = "mcl-blockchain/nixpkgs";
     flake-utils.follows = "mcl-blockchain/flake-utils";
+    # The on-chain replay engine links Agave 4.3 (the runtime mainnet runs), whose
+    # crates declare rust-version 1.97.1. nixpkgs at this pin ships 1.91, so the
+    # toolchain is pinned here by exact channel instead of taken from nixpkgs.
+    fenix = {
+      url = "github:nix-community/fenix";
+      inputs.nixpkgs.follows = "nixpkgs";
+    };
   };
 
   outputs =
@@ -13,12 +20,65 @@
       nixpkgs,
       flake-utils,
       mcl-blockchain,
+      fenix,
       ...
     }:
     flake-utils.lib.eachDefaultSystem (
       system:
       let
         pkgs = import nixpkgs { inherit system; };
+        fenixToolchain = fenix.packages.${system}.combine (
+          let
+            channel = fenix.packages.${system}.toolchainOf {
+              channel = "1.97.1";
+              sha256 = "sha256-A1abGIbOtcBSdrUMhDGrER3pRM1hQP4fp9gh3Y4PKc8=";
+            };
+          in
+          [
+            channel.rustc
+            channel.cargo
+            channel.rustfmt
+            channel.clippy
+            channel.rust-src
+          ]
+        );
+        # Rust 1.90+ links x86_64-linux executables with its bundled rust-lld,
+        # which bypasses the cc-wrapper / ld-wrapper that writes each Nix store
+        # library's directory into RUNPATH. The binaries then fail at start
+        # with `libssl.so.3: cannot open shared object file`. nixpkgs' rustc
+        # opts out at build time; this toolchain comes from fenix and does not,
+        # so its compilers are wrapped to pass `-C linker-features=-lld`.
+        #
+        # The flag belongs to this toolchain, not to the shell. The Solana SBF
+        # toolchain that `cargo build-sbf` drives is an older rustc that rejects
+        # it, and that rustc compiles host code too (build scripts, proc macros,
+        # the target probe of `cargo metadata`), so a shell-wide
+        # `CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_RUSTFLAGS` reaches it and
+        # breaks the SBF build (tests/test_dev_shell_toolchains.rs).
+        #
+        # `clippy-driver` links the build scripts of workspace members, so it is
+        # wrapped too. `cargo-clippy` runs the driver that sits beside its own
+        # resolved executable, so it is copied in rather than linked, which
+        # makes that the wrapped driver. The toolchain carries only the host
+        # std, so x86_64-unknown-linux-gnu is the only target it can link.
+        rustToolchain =
+          if system == "x86_64-linux" then
+            pkgs.symlinkJoin {
+              name = "${fenixToolchain.name}-nix-linker";
+              paths = [ fenixToolchain ];
+              nativeBuildInputs = [ pkgs.makeWrapper ];
+              postBuild = ''
+                for tool in rustc clippy-driver; do
+                  rm "$out/bin/$tool"
+                  makeWrapper "${fenixToolchain}/bin/$tool" "$out/bin/$tool" \
+                    --append-flags "-C linker-features=-lld"
+                done
+                rm "$out/bin/cargo-clippy"
+                cp "${fenixToolchain}/bin/cargo-clippy" "$out/bin/cargo-clippy"
+              '';
+            }
+          else
+            fenixToolchain;
       in
       {
         devShells.default = pkgs.mkShell {
@@ -38,11 +98,20 @@
             pkgs.nimble
             pkgs.just
             pkgs.capnproto
-            pkgs.rustc
-            pkgs.cargo
-            pkgs.rustfmt
-            pkgs.clippy
+            rustToolchain
             pkgs.pkg-config
+            # agave-precompiles turns on solana-secp256r1-program's
+            # `openssl-vendored` feature unconditionally, so openssl-sys
+            # builds OpenSSL from source (openssl-src), and its Configure
+            # step is a Perl script. Without perl here the build only works
+            # on hosts that happen to have one on PATH; a CI runner that has
+            # none fails with "Command 'perl' not found".
+            pkgs.perl
+            # codetracer_trace_writer_nim's build.rs runs
+            # `nimble install --depsOnly`, and nimble shells out to git
+            # ("'git' not in PATH" otherwise). SOLANA_CI_GIT names the
+            # same package for CI scripts but does not put it on PATH.
+            pkgs.git
             # Solana SBF toolchain.  The mcl-blockchain ``solana``
             # devShell exposes ``cargo-build-sbf`` via its own
             # ``packages = [...]`` list; ``inputsFrom`` only propagates

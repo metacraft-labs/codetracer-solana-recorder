@@ -59,6 +59,12 @@ package codetracer_solana_recorder:
     # libzstd headers + library, needed when linking the Nim FFI
     # static library into the cargo build.
     "zstd"
+    # zstd.h + libzstd for the sibling ct-print edge
+    # (``build_writer_artifacts.buildCtPrint`` compiles and links against
+    # them; ``zstd`` is the CLI only). The constructor cannot provision a
+    # tool from inside ``build:`` and refuses a recipe that omits it.
+    when not defined(windows):
+      "zstd-dev"
     when not defined(windows):
       "solana-sbf-sdk"
       "mkdir"
@@ -72,6 +78,15 @@ package codetracer_solana_recorder:
     when not defined(windows):
       "pkg-config"
       "openssl"
+    # perl + make — agave-precompiles enables solana-secp256r1-program's
+    # `openssl-vendored` feature unconditionally, so openssl-sys builds
+    # OpenSSL from source (openssl-src): its Configure step is a Perl
+    # script and the build runs make. Neither reaches a cargo edge's PATH
+    # unless declared, and a host without them fails with "Command 'perl'
+    # not found".
+    when not defined(windows):
+      "perl"
+      "make"
     # `choco pack` / `choco push` in .github/workflows/publish-chocolatey.yml.
     # Windows-guarded because Chocolatey is a Windows package manager with no
     # POSIX build, so an unguarded entry would fail to resolve on Linux/macOS.
@@ -169,9 +184,11 @@ package codetracer_solana_recorder:
       appendRegisteredActionToolIdentityRefs(action.id,
         ["cargo", "rustc", "nim", "nimble", "git", "capnp", "zstd"])
       when defined(linux):
-        appendRegisteredActionToolIdentityRefs(action.id, ["gcc", "pkg-config", "openssl"])
+        appendRegisteredActionToolIdentityRefs(action.id,
+          ["gcc", "pkg-config", "openssl", "perl", "make"])
       elif defined(macosx):
-        appendRegisteredActionToolIdentityRefs(action.id, ["clang", "pkg-config", "openssl"])
+        appendRegisteredActionToolIdentityRefs(action.id,
+          ["clang", "pkg-config", "openssl", "perl", "make"])
     when not defined(windows):
       # The pinned owning SBF wrapper creates its real HOME cache mirror
       # with these commands; the compiler/toolchain itself stays immutable.
