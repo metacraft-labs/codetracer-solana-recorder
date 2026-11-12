@@ -174,6 +174,64 @@ fn test_the_vm_path_test_fails_when_the_vm_path_breaks() {
     assert_eq!(verdict.cause, Some(Cause::Execution));
 }
 
+/// Recorder-Solana CXP-SOL-4: a prestate-caused and an execution-caused
+/// divergence are told apart in ONE run, and counted per cause. The two
+/// injections are the two defects the arms above inject separately: the head
+/// state in place of the transaction's own, and `exit` written over the SPL
+/// Token entrypoint on the chain's own prestate.
+#[test]
+fn test_divergence_causes_are_classified_not_merely_counted() {
+    let bundle = fixture("p-token-transfer");
+    let (exec, stale_verdict) = run(&bundle);
+    let good = with_recorded_prefacts(&bundle, &exec.account_keys);
+
+    let break_entrypoint = |b: &ReplayBundle| {
+        let mut broken = b.clone();
+        let programdata = broken
+            .accounts
+            .iter_mut()
+            .find(|a| a.owner == "BPFLoaderUpgradeab1e11111111111111111111111" && !a.executable)
+            .expect("the SPL Token programdata account");
+        let mut data = programdata.data_bytes().unwrap();
+        let entry = entrypoint_offset(&data[45..]).expect("the ELF entrypoint lies in .text");
+        data[45 + entry..45 + entry + 8].copy_from_slice(&[0x95, 0, 0, 0, 0, 0, 0, 0]);
+        programdata.data = base64::engine::general_purpose::STANDARD.encode(&data);
+        broken
+    };
+
+    let verdicts = [
+        ("stale prestate", stale_verdict),
+        (
+            "broken VM on the chain's prestate",
+            run(&break_entrypoint(&good)).1,
+        ),
+        ("both defects", run(&break_entrypoint(&bundle)).1),
+        ("neither (control)", run(&good).1),
+    ];
+    let causes: Vec<Option<Cause>> = verdicts.iter().map(|(_, v)| v.cause.clone()).collect();
+    assert_eq!(
+        causes,
+        vec![
+            Some(Cause::Prestate),
+            Some(Cause::Execution),
+            // A wrong prestate makes every later difference unattributable, so
+            // the oracle names the prestate when both are present.
+            Some(Cause::Prestate),
+            None,
+        ],
+        "{:?}",
+        verdicts
+            .iter()
+            .map(|(n, v)| (n, &v.status, &v.cause))
+            .collect::<Vec<_>>()
+    );
+    // Counted per cause, not as one "divergent" figure.
+    let per_cause = |c: Cause| causes.iter().filter(|x| x.as_ref() == Some(&c)).count();
+    assert_eq!(per_cause(Cause::Prestate), 2);
+    assert_eq!(per_cause(Cause::Execution), 1);
+    assert_eq!(verdicts[3].1.status, Status::Match);
+}
+
 #[test]
 fn test_a_cpi_target_appears_in_the_trace() {
     let bundle = fixture("ata-create-cpi");
