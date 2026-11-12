@@ -78,22 +78,17 @@ jobs:
         uses: metacraft-labs/metacraft-github-actions/setup-dev-env@dev
         with:
           env-flavor: reprobuild
-          # reprobuild v0.2.18 on every leg. A leg whose OS/arch has a
-          # release archive (v0.2.18 publishes linux-x86_64, darwin-aarch64
-          # and windows-x86_64) installs `repro-version`; the others (Linux
-          # arm64, Windows arm64) build `repro-build-pin` from source, so
-          # both name the same revision. v0.2.18 reads the committed
-          # repro.lock schema (reprobuild.solved-graph-lock.v3) and resolves
-          # a tool's local Nix selector and expression file in the caller
-          # project (reprobuild d4e516041); the branch pinned before
-          # (codex/attic-ci-cache-vars, 9673c20a) does neither.
-          #
-          # Not v0.2.19: it publishes no release archives, and its source
-          # build imports `test_certificates` from a `test-certificates-tools`
-          # checkout that this action does not provision on Windows.
-          repro-version: v0.2.18
-          repro-build-pin: "413830138a7a73293dfc551d623f7bf2cb0ab62c"
+          # reprobuild v0.2.23 (9dbf4e710d) on every leg. A leg whose OS/arch
+          # has a release archive (linux-x86_64, darwin-aarch64,
+          # windows-x86_64) installs `repro-version`; the others build
+          # `repro-build-pin` from source, so both name the same revision.
+          repro-version: v0.2.23
+          repro-build-pin: "9dbf4e710d7cc0b9a79a4bcd54c931afb6849dd0"
           gh-token: ${{ steps.ci_token.outputs.token }}
+          # A job-scoped broker re-mints the Nix GitHub credential while
+          # setup and the build run, so it outlives the token's one hour.
+          app-id: ${{ secrets.CI_TOKEN_PROVIDER_APP_ID }}
+          app-private-key: ${{ secrets.CI_TOKEN_PROVIDER_PRIVATE_KEY }}
           substituters: ${{ vars.SUBSTITUTERS }}
           trusted-public-keys: ${{ vars.TRUSTED_PUBLIC_KEYS }}
           attic-token: ${{ secrets.ATTIC_TOKEN }}
