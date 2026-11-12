@@ -147,11 +147,14 @@ jobs:
         # `repro.nim`. Verifies the primary shipping artefact (the
         # recorder binary or extension) materialises through the
         # reprobuild engine identically to `just build`.
-        run: dev-exec repro build
+        # reprobuild v0.2.23 refuses `uses:` declarations without an explicit
+        # provisioning mode ("refusing implicit PATH fallback"); this recipe
+        # resolves its tools from the prepared environment's PATH.
+        run: dev-exec repro build --tool-provisioning=path
 
       - name: repro test
         # Materialises the `test` collection.
-        run: dev-exec repro test
+        run: dev-exec repro test --tool-provisioning=path
 
       # Diagnostics on failure. Three things below are load-bearing:
       #
