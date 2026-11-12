@@ -274,6 +274,59 @@ fn test_divergence_causes_are_classified_not_merely_counted() {
     assert_eq!(verdicts[3].1.status, Status::Match);
 }
 
+/// An inner-instruction divergence names the first differing byte with both
+/// sides' bytes, so it can be diagnosed from the verdict alone. It found the
+/// Clock's timestamp one second off in a self-CPI event on 2026-11-12. The
+/// chain's recorded inner instruction is changed in one byte here, and
+/// everything else is the chain's own.
+#[test]
+fn test_an_inner_instruction_divergence_names_the_differing_byte() {
+    let bundle = fixture("ata-create-cpi");
+    let (exec, _) = run(&bundle);
+    let mut good = with_recorded_prefacts(&bundle, &exec.account_keys);
+    let (_, control) = run(&good);
+    assert_eq!(control.status, Status::Match, "{:?}", control.facts);
+
+    let meta = good.transactions[0].meta.as_mut().unwrap();
+    let (group, k, at) = meta["innerInstructions"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .enumerate()
+        .find_map(|(g, grp)| {
+            grp["instructions"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .enumerate()
+                .find_map(|(k, ii)| {
+                    let d = bs58::decode(ii["data"].as_str()?).into_vec().ok()?;
+                    (!d.is_empty()).then_some((g, k, d.len() - 1))
+                })
+        })
+        .expect("an inner instruction with data");
+    let ii = &mut meta["innerInstructions"][group]["instructions"][k];
+    let mut data = bs58::decode(ii["data"].as_str().unwrap())
+        .into_vec()
+        .unwrap();
+    data[at] ^= 0xff;
+    ii["data"] = serde_json::Value::String(bs58::encode(&data).into_string());
+
+    let (_, verdict) = run(&good);
+    assert_eq!(verdict.status, Status::Divergent);
+    let detail = verdict
+        .facts
+        .iter()
+        .find(|f| f.name == "innerInstructions")
+        .and_then(|f| f.detail.clone())
+        .expect("innerInstructions carries a detail");
+    assert!(
+        detail.contains(&format!("first differs at byte {at}")),
+        "{detail}"
+    );
+    assert!(detail.contains(&format!("{:02x}", data[at])), "{detail}");
+}
+
 #[test]
 fn test_a_cpi_target_appears_in_the_trace() {
     let bundle = fixture("ata-create-cpi");

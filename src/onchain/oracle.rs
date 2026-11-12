@@ -390,9 +390,32 @@ fn inner_instructions(list: &[Value], exec: &TxExecution) -> (bool, Option<Strin
                 && data.as_deref() == Some(o.2.as_slice())
                 && height.is_none_or(|h| h == o.3);
             if !same {
+                // Say WHICH part differs, so a divergence explains itself
+                // instead of needing its bundle re-run under a debugger.
+                let what = if pid != Some(o.0) {
+                    format!("program index chain {pid:?}, replay {}", o.0)
+                } else if accts.as_deref() != Some(o.1.as_slice()) {
+                    format!("accounts chain {accts:?}, replay {:?}", o.1)
+                } else if let Some(d) = data.as_deref().filter(|d| *d != o.2.as_slice()) {
+                    let at = d.iter().zip(o.2.iter()).position(|(a, b)| a != b);
+                    match at {
+                        Some(i) => format!(
+                            "data ({} vs {} bytes) first differs at byte {i}: chain {:02x?}, replay {:02x?}",
+                            d.len(),
+                            o.2.len(),
+                            &d[i..d.len().min(i + 16)],
+                            &o.2[i..o.2.len().min(i + 16)]
+                        ),
+                        None => format!("data length chain {}, replay {}", d.len(), o.2.len()),
+                    }
+                } else {
+                    format!("stack height chain {height:?}, replay {}", o.3)
+                };
                 return (
                     false,
-                    Some(format!("top-level {ci}, inner {k}: instruction differs")),
+                    Some(format!(
+                        "top-level {ci}, inner {k}: instruction differs: {what}"
+                    )),
                 );
             }
         }
