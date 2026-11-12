@@ -184,9 +184,15 @@ fn test_the_vm_path_test_fails_when_the_vm_path_breaks() {
 ///   exactly the fee, and every failed mainnet transaction was `divergent`.
 /// * `cpi-reentrant` invokes another program at depth 2 while a program is
 ///   already on the stack.
+/// * `v0-custom-error` is a v0 message that FAILED on chain with the program's
+///   own error (`Custom(5)` in instruction 3), kept by a later capture.
 #[test]
 fn test_the_pinned_corpus_replays_to_match() {
-    for name in ["failed-compute-exhausted", "cpi-reentrant"] {
+    for name in [
+        "failed-compute-exhausted",
+        "cpi-reentrant",
+        "v0-custom-error",
+    ] {
         let bundle = fixture(name);
         let (_, verdict) = run(&bundle);
         assert_eq!(verdict.status, Status::Match, "{name}: {:?}", verdict.facts);
