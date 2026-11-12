@@ -87,6 +87,16 @@ pub struct BundleTransaction {
     pub index_in_block: Option<u32>,
     #[serde(default)]
     pub block_time: Option<i64>,
+    /// The Clock sysvar's `unix_timestamp` while this slot executes, when the
+    /// capture knows it. It is NOT `block_time`. On mainnet in November 2026 a
+    /// transaction in slot S reads the PARENT block's time from the Clock, and the
+    /// Clock reaches S's own `blockTime` only once the block completes. Replaying
+    /// with `block_time` put a self-CPI event's timestamp one second ahead whenever
+    /// S's second differed from its parent's. Absent in older bundles, where the
+    /// replay falls back to `block_time`, and then not serialized, so such a bundle
+    /// is written back byte-identical.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub clock_time: Option<i64>,
     /// Base64 of the transaction's wire bytes (`getTransaction` with
     /// `encoding: "base64"`), so the replay executes the exact message the
     /// chain did, including v0 lookup-table and v1 forms.

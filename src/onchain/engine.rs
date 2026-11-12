@@ -639,7 +639,9 @@ impl Replay {
 
         let mut clock = self.base_clock.clone();
         clock.slot = tx.slot;
-        if let Some(t) = tx.block_time {
+        // The Clock's own timestamp for this slot when the bundle carries it
+        // (see `BundleTransaction::clock_time`), else the block's time.
+        if let Some(t) = tx.clock_time.or(tx.block_time) {
             clock.unix_timestamp = t;
         }
         self.svm.set_sysvar(&clock);

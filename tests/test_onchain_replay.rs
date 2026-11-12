@@ -274,6 +274,44 @@ fn test_divergence_causes_are_classified_not_merely_counted() {
     assert_eq!(verdicts[3].1.status, Status::Match);
 }
 
+/// The Clock a slot executes under is `clock_time` when the bundle carries
+/// it, and `block_time` only when it does not. `cpi-reentrant` is a Phoenix
+/// Eternal self-CPI whose event records `Clock::unix_timestamp` at byte 17.
+/// Its slot and its parent share a second, so both fields agree on chain. Here
+/// `block_time` is moved one second ahead, which is what every slot whose
+/// second differs from its parent's looks like.
+#[test]
+fn test_the_clock_is_the_slots_clock_time_not_its_block_time() {
+    let original = fixture("cpi-reentrant");
+    let t = original.transactions[0]
+        .block_time
+        .expect("the fixture has a block time");
+
+    let mut ahead = original.clone();
+    ahead.transactions[0].block_time = Some(t + 1);
+    ahead.transactions[0].clock_time = Some(t);
+    let (_, with_clock_time) = run(&ahead);
+    assert_eq!(
+        with_clock_time.status,
+        Status::Match,
+        "{:?}",
+        with_clock_time.facts
+    );
+
+    // Control: with no clock_time the replay falls back to block_time, and the
+    // event's timestamp is one second ahead of the chain's.
+    ahead.transactions[0].clock_time = None;
+    let (_, without) = run(&ahead);
+    assert_eq!(without.status, Status::Divergent);
+    let detail = without
+        .facts
+        .iter()
+        .find(|f| f.name == "innerInstructions")
+        .and_then(|f| f.detail.clone())
+        .unwrap_or_default();
+    assert!(detail.contains("first differs at byte 17"), "{detail}");
+}
+
 /// An inner-instruction divergence names the first differing byte with both
 /// sides' bytes, so it can be diagnosed from the verdict alone. It found the
 /// Clock's timestamp one second off in a self-CPI event on 2026-11-12. The

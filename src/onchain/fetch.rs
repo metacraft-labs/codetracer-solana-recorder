@@ -132,6 +132,18 @@ pub fn bundle_for_signature(rpc_url: &str, signature: &str) -> Result<ReplayBund
         .ok_or_else(|| eyre!("{signature}: no base64 transaction in the answer"))?
         .to_string();
     let slot = tx_json["slot"].as_u64().unwrap_or(0);
+    // The Clock's timestamp while this slot executes is the PARENT block's time
+    // (see `BundleTransaction::clock_time`). Best effort: a failure leaves it unset,
+    // and the replay falls back to the block's own time.
+    let clock_time = rpc
+        .call(
+            "getBlock",
+            json!([slot, {"transactionDetails": "none", "rewards": false, "maxSupportedTransactionVersion": 1, "commitment": "finalized"}]),
+        )
+        .ok()
+        .and_then(|b| b["parentSlot"].as_u64())
+        .and_then(|parent| rpc.call("getBlockTime", json!([parent])).ok())
+        .and_then(|t| t.as_i64());
     let message = &tx_json["transaction"]["message"];
 
     let mut keys: Vec<String> = Vec::new();
@@ -221,6 +233,7 @@ pub fn bundle_for_signature(rpc_url: &str, signature: &str) -> Result<ReplayBund
             slot,
             index_in_block: None,
             block_time: tx_json["blockTime"].as_i64(),
+            clock_time,
             wire,
             meta: Some(tx_json["meta"].clone()),
             trace: true,
