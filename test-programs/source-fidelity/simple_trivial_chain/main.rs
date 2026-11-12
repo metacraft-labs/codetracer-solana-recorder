@@ -18,5 +18,5 @@ fn compute() -> u64 {
 }
 
 fn main() {
-    let _ = compute();
+    assert_eq!(compute(), 10);
 }

@@ -372,7 +372,9 @@ fn steps_follow_the_program_lines_in_their_functions() {
         .collect();
     // `main` calls `compute` on line 21; compute's statements execute on
     // lines 15 and 14 (the compiler schedules `b`'s store before `a`'s), its
-    // closing brace on 18; then main finishes on 22.
+    // closing brace on 18. Back in main, line 21 is `assert_eq!(compute(), 10)`:
+    // its comparison runs as several steps on 21, with one the compiler's line
+    // table places on `fn main() {` (20); then main finishes on 22.
     assert_eq!(
         program_steps,
         vec![
@@ -380,6 +382,11 @@ fn steps_follow_the_program_lines_in_their_functions() {
             (15, Some("compute")),
             (14, Some("compute")),
             (18, Some("compute")),
+            (21, Some("main")),
+            (20, Some("main")),
+            (21, Some("main")),
+            (21, Some("main")),
+            (21, Some("main")),
             (22, Some("main")),
         ],
         "main.rs steps (line, function) in execution order"
@@ -488,6 +495,67 @@ fn copies_kept_by_the_compiler_are_read_with_their_values() {
         "locals at line 16"
     );
     assert_no_vm_addresses(&rec.trace);
+}
+
+/// Recorder-Solana CXP-SOL-2: the values the trace reads are the values the
+/// PROGRAM asserts. `main` runs `assert_eq!(compute(), N)` inside the SBF VM,
+/// so a completed run is the program's own check that `compute` returned N.
+/// The expected N is read out of that assertion in the source, never written
+/// here, and the trace must read the same N through the registers (the return
+/// value) and through DWARF locations into VM memory (`a` and `b`).
+#[test]
+fn the_traced_values_are_the_ones_the_program_asserts() {
+    let source = std::fs::read_to_string(fixture_source()).expect("read the fixture");
+    let asserted: i64 = source
+        .lines()
+        .find_map(|l| l.trim().strip_prefix("assert_eq!(compute(), "))
+        .and_then(|rest| rest.strip_suffix(");"))
+        .and_then(|n| n.trim().parse().ok())
+        .expect("the fixture's main asserts `assert_eq!(compute(), N);`");
+
+    for rec in [recording(), recording_keeping_copies()] {
+        let frame = |name: &str| {
+            rec.trace
+                .frames
+                .iter()
+                .find(|f| f.function == name)
+                .unwrap_or_else(|| panic!("no `{name}` frame"))
+        };
+        // The assertion ran in the VM and held: execution reached `main`'s
+        // closing line, past it. A failing `assert_eq!` ends on its own line
+        // in the panic path and never gets there (checked with N + 1, which
+        // also fails the return comparison below). A recorded Return for
+        // `main` is NOT that signal: the panic path records one too.
+        let main_lines: Vec<i64> = rec
+            .trace
+            .steps
+            .iter()
+            .filter(|s| s.function.as_deref() == Some("main"))
+            .map(|s| s.line)
+            .collect();
+        assert_eq!(
+            main_lines.last(),
+            Some(&22),
+            "main never got past its assertion; main's lines: {main_lines:?}"
+        );
+        assert_eq!(
+            frame("compute").return_value.as_ref().and_then(int_value),
+            Some(asserted),
+            "the register the trace reads as compute's return is the value main asserts"
+        );
+    }
+    // Through memory: with the copies kept, `a` and `b` hold it in their slots.
+    let at_16: Vec<(String, Option<i64>)> = recording_keeping_copies()
+        .trace
+        .steps_in("compute")
+        .into_iter()
+        .filter(|s| s.line == 16)
+        .flat_map(|s| s.vars.iter().map(|(n, v)| (n.clone(), int_value(v))))
+        .collect();
+    assert!(!at_16.is_empty(), "no locals at line 16 to compare");
+    for (name, value) in at_16 {
+        assert_eq!(value, Some(asserted), "`{name}` at line 16");
+    }
 }
 
 fn assert_no_vm_addresses(trace: &DecodedTrace) {
