@@ -25,15 +25,19 @@
 //!   to real names instead of the synthetic `fn_at_pc_<pc>` placeholder
 //!   the original heuristic used.
 //! * a **per-line content map** — so for every visited step the recorder
-//!   can scan the corresponding source line for known constructs
-//!   (`msg!(...)`, `panic!(...)`, `Err(...)`, `vec![..]` / array
-//!   literal, tuple literal, `Name { .. }` struct literal) and synthesise
-//!   the matching trace event (`register_special_event` for syscalls,
-//!   `register_variable_with_full_value` with the proper `ValueRecord`
-//!   variant for typed values).
+//!   can scan the corresponding source line for `msg!(...)`, `panic!(...)`,
+//!   `Err(...)` and Solana logging macros and synthesise the matching EVENT
+//!   (`register_special_event`), with the macro's literal text as payload.
 //!
-//! The synthesis is purely additive: every existing register-variable
-//! emission continues unchanged.  When the source file is missing
+//! It synthesises NO variables. This path has no DWARF variable information
+//! and the trace format cannot mark a name as inferred, so it records only the
+//! VM registers `r0`..`r10`, named as registers (Recorder-Solana CXP-SOL-2,
+//! operator decision 2026-11-12). Until then it guessed locals from `let`
+//! lines and function parameters and showed them as recovered variables.
+//! Named locals come from `source_recorder` when DWARF describes the program.
+//!
+//! The event synthesis is purely additive: the register-variable emission
+//! continues unchanged.  When the source file is missing
 //! (e.g. legacy unit tests that pass a fictitious `test.rs`), the maps
 //! degrade to empty and the recorder behaves exactly as before.
 
@@ -803,57 +807,6 @@ fn extract_let_lhs(text: &str) -> Option<&str> {
     Some(&rest[..end])
 }
 
-/// Returns ``true`` when the supplied ``let`` RHS would be picked up
-/// by one of the structured-value branches in
-/// [`synthesise_step_events`] (borrowed-slice indexing, enum-variant
-/// construction, vec/array literal with int elements, tuple literal,
-/// struct literal).  Used by [`VarEnv::prepopulate_lets_from_body`]
-/// to decide whether the name should *also* be emitted as a plain
-/// ``Int`` local at every snapshot -- structured RHSs are emitted as
-/// typed compound values by the synthesiser and the DAP locals view
-/// would otherwise see the same name twice (once as the structured
-/// value, once as ``Int``).
-///
-/// Multi-line struct literals (which ``synthesise_step_events``
-/// stitches via ``collect_struct_literal_lines``) are *not*
-/// recognised by this single-line check; that's a deliberate
-/// trade-off, since the prepopulate pass walks lines one at a time
-/// and the only fixtures that exercise multi-line struct literals
-/// (the recorder's hand-written
-/// ``test_per_program_ct_print_full`` cases) declare the struct
-/// name on the same line as the opening brace, which
-/// ``parse_struct_literal_rich`` matches.
-fn rhs_is_structured(rhs: &str) -> bool {
-    if is_borrowed_slice_rhs(rhs) {
-        return true;
-    }
-    if parse_variant_construction(rhs).is_some() {
-        return true;
-    }
-    if extract_array_or_vec_literal(rhs).is_some() {
-        return true;
-    }
-    if extract_tuple_literal(rhs).is_some() {
-        return true;
-    }
-    // Struct literals match on a leading capitalised identifier
-    // followed by ``{``.  A bare ``{ ... }`` block (e.g.
-    // ``let v = { let x = 1; x };``) doesn't qualify -- the
-    // synthesiser's ``parse_struct_literal_rich`` returns ``None``
-    // for it.  Approximate by requiring an alphanumeric character
-    // before the first ``{``.
-    if let Some(brace) = rhs.find('{')
-        && rhs[..brace]
-            .trim_end()
-            .chars()
-            .last()
-            .is_some_and(|c| c.is_ascii_alphanumeric() || c == '_')
-    {
-        return true;
-    }
-    false
-}
-
 /// Slice out the substring between the first `=` and the trailing `;`,
 /// then trim.  Returns `None` if no `=` is present or the slice is empty.
 fn extract_let_rhs(text: &str) -> Option<&str> {
@@ -966,361 +919,6 @@ fn extract_macro_call(line: &str, macro_name: &str) -> Option<(String, Vec<Strin
     Some((content, args))
 }
 
-/// Substitute `{}` placeholders in `fmt` with the values pulled from
-/// `args` (resolved through `env`).  When a positional `{}` runs out of
-/// args or an arg expression doesn't resolve to a value in `env`, the
-/// placeholder is left literal (`{}`) so partial-resolution paths still
-/// surface the spec-correct text where possible.  Inline named-arg
-/// placeholders (`{name}`) are also resolved when `name` lives in `env`
-/// — the Rust 2021 idiom used by `msg!("a={a}")`.
-///
-/// Returns `(substituted_text, fully_substituted)` where the second
-/// element is `true` only when every placeholder was successfully
-/// replaced — used by the caller to decide whether to surface the
-/// substituted string at all (avoids emitting partially-substituted
-/// payloads that would mask the present-day literal-text contract for
-/// fixtures where the env can't resolve every name).
-fn substitute_format(
-    fmt: &str,
-    args: &[String],
-    env: &VarEnv,
-    snap: &RegisterSnapshot,
-) -> (String, bool) {
-    let bytes = fmt.as_bytes();
-    let mut out = String::with_capacity(fmt.len());
-    let mut i = 0usize;
-    let mut arg_idx = 0usize;
-    let mut all_ok = true;
-    while i < bytes.len() {
-        let c = bytes[i];
-        // `{{` and `}}` are literal escapes.
-        if c == b'{' && i + 1 < bytes.len() && bytes[i + 1] == b'{' {
-            out.push('{');
-            i += 2;
-            continue;
-        }
-        if c == b'}' && i + 1 < bytes.len() && bytes[i + 1] == b'}' {
-            out.push('}');
-            i += 2;
-            continue;
-        }
-        if c == b'{' {
-            // Scan to the matching `}`.
-            let Some(end_off) = bytes[i + 1..].iter().position(|&b| b == b'}') else {
-                out.push('{');
-                i += 1;
-                continue;
-            };
-            let spec = std::str::from_utf8(&bytes[i + 1..i + 1 + end_off]).unwrap_or("");
-            // The format spec is `name?:fmt?` — we ignore everything after `:`
-            // and only handle empty (positional) or bare-identifier names.
-            let name_part = spec.split(':').next().unwrap_or("");
-            let resolved = if name_part.is_empty() {
-                // Positional `{}` — pull from args[arg_idx].
-                if arg_idx < args.len() {
-                    let arg_expr = &args[arg_idx];
-                    arg_idx += 1;
-                    env.resolve(arg_expr, snap)
-                } else {
-                    None
-                }
-            } else {
-                // Named `{name}` — look the identifier up in the env.
-                env.resolve(name_part, snap)
-            };
-            match resolved {
-                Some(v) => out.push_str(&v.to_string()),
-                None => {
-                    // Leave the placeholder literal so partial substitutions
-                    // don't accidentally drop information.
-                    out.push('{');
-                    out.push_str(spec);
-                    out.push('}');
-                    all_ok = false;
-                }
-            }
-            i += end_off + 2;
-            continue;
-        }
-        out.push(c as char);
-        i += 1;
-    }
-    if arg_idx < args.len() {
-        // Unused trailing args — treat as not-fully-substituted.
-        all_ok = false;
-    }
-    (out, all_ok)
-}
-
-/// Per-line / per-frame map of variable names to register slots, built
-/// dynamically as the recorder walks snapshots.  Function parameters
-/// are pre-loaded from the source (`fn name(p1: T1, p2: T2)` → `p1` →
-/// r1, `p2` → r2 etc.) and let-bindings are tracked as new register
-/// slots become live (the lowest register whose value differs from the
-/// previous snapshot at a `let NAME = ...` line).
-///
-/// This is the synthesiser's interpolation env for `msg!("fmt {}", x)`
-/// and `msg!("a={a}")`-style calls — the SBF interpreter doesn't run in
-/// the synthetic-snapshot pipeline, so the recorder reconstructs
-/// what-name-lives-where from the source plus the snapshot diff.
-#[derive(Default, Clone)]
-struct VarEnv {
-    /// Variable name → register index (0..=10).
-    names: HashMap<String, usize>,
-    /// Subset of [`Self::names`] that should be surfaced as ``Int``
-    /// locals in the trace's per-snapshot variable stream.
-    ///
-    /// We split this from ``names`` because two unrelated callers
-    /// populate the env:
-    ///   * The format-arg substitution path inside
-    ///     [`synthesise_step_events`] needs to *resolve* every
-    ///     identifier appearing in a ``msg!(..)`` to its current
-    ///     register value, so it pulls from ``names`` (params + any
-    ///     observed ``let NAME = ...``).
-    ///   * The DAP locals view needs the *names* of source-level
-    ///     locals on the stack to be present in the variable-name
-    ///     table.  That only makes sense for non-structured bindings
-    ///     -- ``let pair = (10, 20)`` is already emitted as a typed
-    ///     ``Tuple`` by ``synthesise_step_events``, and re-emitting
-    ///     it as ``Int`` would corrupt the test
-    ///     ``test_collections_test_via_ct_print_full``'s
-    ///     ``pair.kind == "Tuple"`` assertion.
-    ///
-    /// Function parameters and ``let NAME = <simple expr>`` are
-    /// added to both sets; ``let NAME = <struct/array/tuple/enum
-    /// literal>`` is added only to ``names`` (so the substitution
-    /// path can still resolve it).
-    emit_as_int: std::collections::HashSet<String>,
-}
-
-impl VarEnv {
-    fn new() -> Self {
-        Self {
-            names: HashMap::new(),
-            emit_as_int: std::collections::HashSet::new(),
-        }
-    }
-
-    /// Pre-load function parameter names from a `fn NAME(p1: T1, p2: T2, ...)`
-    /// declaration.  Each param `pi` is mapped to register `r{i}`
-    /// following the SBF calling convention used by the workspace's
-    /// hand-written fixtures.
-    fn load_params_from_fn(&mut self, fn_decl_line: &str) {
-        // Strip leading `fn NAME` and capture the parenthesised arg list.
-        let Some(open) = fn_decl_line.find('(') else {
-            return;
-        };
-        let Some(close_off) = fn_decl_line[open + 1..].find(')') else {
-            return;
-        };
-        let body = &fn_decl_line[open + 1..open + 1 + close_off];
-        let mut idx = 1usize;
-        for tok in split_top_level_commas(body) {
-            let t = tok.trim();
-            if t.is_empty() {
-                continue;
-            }
-            // Skip `&self` / `self` / `mut self`.
-            if t == "self" || t == "&self" || t == "&mut self" || t == "mut self" {
-                continue;
-            }
-            // Param name = identifier before the first `:`.
-            let name_part = t.split(':').next().unwrap_or("").trim();
-            let name = name_part
-                .trim_start_matches('&')
-                .trim_start_matches("mut ")
-                .trim_start_matches('_')
-                .trim_start_matches('&');
-            // Skip names that aren't simple identifiers (e.g. tuple-pattern params).
-            if !name.is_empty()
-                && name.chars().all(|c| c.is_ascii_alphanumeric() || c == '_')
-                && idx <= 10
-            {
-                self.names.insert(name.to_string(), idx);
-                self.emit_as_int.insert(name.to_string());
-            }
-            idx += 1;
-        }
-    }
-
-    /// Pre-populate the env with every ``let NAME = ...`` binding
-    /// declared in the body of a function spanning ``(start_line,
-    /// end_line)`` (inclusive).  Each new binding is assigned to a
-    /// placeholder register sequentially after any existing entries,
-    /// wrapping at ``r10`` so the SBF register convention is preserved.
-    ///
-    /// Why this exists: at ``opt-level=0`` the compiler keeps locals
-    /// on the BPF stack, so [`VarEnv::record_let`]'s
-    /// "register-with-a-changed-value" heuristic finds nothing to
-    /// match at the let-line snapshot and the binding never enters
-    /// the env.  The downstream DAP locals view then only shows the
-    /// params, not the lets -- which fails the WDIO smoke test's
-    /// ``finds sum_val in local variables`` substring assertion
-    /// (cross-repo run 27591732085).
-    ///
-    /// The pre-population guarantees the *name* appears in the
-    /// trace's variable-name table regardless of register placement.
-    /// ``record_let`` still runs on each visited let-line snapshot
-    /// and *upgrades* the placeholder to the real register when one
-    /// changes, so trace fixtures that *do* see register changes
-    /// (the recorder's hand-written ``test_comprehensive`` cases)
-    /// keep their precise register→name mapping.
-    fn prepopulate_lets_from_body(&mut self, model: &SourceModel, start_line: u32, end_line: u32) {
-        let mut next_reg = self.names.values().copied().max().map_or(1, |r| r + 1);
-        for line_no in start_line..=end_line {
-            let text = strip_line_for_match(model.line(line_no));
-            if let (Some(name), Some(rhs)) = (extract_let_lhs(text), extract_let_rhs(text))
-                && !self.names.contains_key(name)
-            {
-                let reg = next_reg.min(10);
-                self.names.insert(name.to_string(), reg);
-                // Only request Int-style emission for non-structured
-                // RHS.  Structured RHS (struct / array / vec / tuple /
-                // enum-variant literal, borrowed-slice indexing) is
-                // already emitted as a typed compound value by
-                // ``synthesise_step_events``; re-emitting it as an
-                // ``Int`` here would corrupt assertions like
-                // ``test_collections_test_via_ct_print_full``'s
-                // ``pair.kind == "Tuple"``.  The name still lands in
-                // ``names`` so the substitution path can resolve it.
-                if !rhs_is_structured(rhs) {
-                    self.emit_as_int.insert(name.to_string());
-                }
-                next_reg = (next_reg + 1).min(10);
-            }
-        }
-    }
-
-    /// Record a let-binding seen at this step.  `prev` is the previous
-    /// snapshot's register array (or all-zeros if this is the first
-    /// step).  We assign `name` to the lowest register r{1..=10} whose
-    /// value changed (became non-zero or differs).  This matches the
-    /// canonical fixture convention where each new let-binding's RHS
-    /// lands in the next live register slot.
-    fn record_let(&mut self, name: &str, prev: &[u64; 12], curr: &RegisterSnapshot) {
-        // Find the lowest register r1..r10 whose value differs between
-        // the previous snapshot and this one and pin ``name`` to it.
-        // When the binding is already known we still upgrade --
-        // ``prepopulate_lets_from_body`` may have seeded a placeholder
-        // sequential register at frame-push time so the *name* would
-        // appear in the DAP locals view even when ``opt-level=0``
-        // keeps the value on the BPF stack; if execution later traverses
-        // the let line at a higher opt level (or in a synthesised
-        // fixture) and *does* surface a real register change, the
-        // runtime-detected register supersedes the placeholder so
-        // substitution paths like ``synthesise_step_events``'s
-        // ``msg!("..", x, y)`` resolution -- exercised by
-        // ``test_msg_format_args_test_via_ct_print_full`` -- pick up
-        // the correct value.
-        //
-        // When no register changes (the opt-level=0 / stack-spilled
-        // case), we leave whatever is in ``names`` untouched so the
-        // placeholder stays.
-        for (r, prev_val) in prev.iter().enumerate().skip(1).take(10) {
-            if curr.reg(r) != *prev_val {
-                self.names.insert(name.to_string(), r);
-                self.emit_as_int.insert(name.to_string());
-                return;
-            }
-        }
-    }
-
-    /// Resolve a free-form arg expression to an integer at the given
-    /// snapshot.  Today we recognise:
-    ///
-    /// * a bare identifier present in `self.names` → `snap.reg(r{n})`,
-    /// * an integer literal → its value,
-    /// * `&NAME` / `*NAME` / `mut NAME` ref/deref forms that strip to
-    ///   a recognised identifier.
-    ///
-    /// Returns `None` for anything else so the caller can leave the
-    /// placeholder literal.
-    fn resolve(&self, expr: &str, snap: &RegisterSnapshot) -> Option<i64> {
-        let s = expr
-            .trim()
-            .trim_start_matches('&')
-            .trim_start_matches('*')
-            .trim_start_matches("mut ")
-            .trim();
-        if let Some(i) = parse_int_literal(s) {
-            return Some(i);
-        }
-        let r = self.names.get(s)?;
-        Some(snap.reg(*r) as i64)
-    }
-}
-
-/// Build a fresh `VarEnv` pre-loaded with the parameters declared by
-/// the function named `fn_name` in `model`.  When the function isn't
-/// found (synthetic source path / outer frame named "main" with no
-/// matching declaration), an empty env is returned.
-///
-/// In addition to function parameters, this also pre-populates the env
-/// with every ``let NAME = ...`` binding declared inside the function
-/// body, mapped to a placeholder register.  At ``opt-level=0`` (the
-/// recorder's SBF build profile -- see ``test-programs/Cargo.toml``),
-/// the compiler keeps local variables on the BPF stack rather than in
-/// registers, so the runtime ``VarEnv::record_let`` heuristic (which
-/// looks for a changed register at the let-line snapshot) can never
-/// find a match and the binding gets dropped.  That's why
-/// cross-repo run 27591732085 reached ``Ok(0)`` + 1277 register
-/// snapshots but the DAP locals view still missed ``sum_val`` etc.:
-/// the env-tracked emission path I added in a127a54 has nothing to
-/// emit because nothing was ever recorded.
-///
-/// Pre-populating from a source-side scan guarantees the *names* of
-/// every declared binding land in the env (and therefore in the
-/// trace's variable-name table the DAP server consumes for locals
-/// display) -- regardless of whether execution traversed that line or
-/// whether the compiler chose to keep the value in a register.  The
-/// register assignment is a best-effort placeholder (sequential after
-/// the params, capped at r10); ``record_let`` still runs at the
-/// snapshot of an actual let-line visit and *refines* the register
-/// assignment when it observes a real change.
-fn var_env_for_fn(model: &SourceModel, fn_name: &str) -> VarEnv {
-    let mut env = VarEnv::new();
-    let fn_range = model
-        .functions
-        .iter()
-        .find(|(_, _, name)| name == fn_name)
-        .map(|(start, end, _)| (*start, *end));
-    if let Some((decl_line, end_line)) = fn_range {
-        // Stitch the declaration across continuation lines so multi-line
-        // signatures (rare in fixtures but cheap to support) still parse.
-        let mut combined = String::new();
-        let mut depth: i32 = 0;
-        let mut saw_open = false;
-        let mut line_no = decl_line;
-        while (line_no as usize) < model.lines.len() {
-            let raw = model.line(line_no);
-            let stripped = strip_line_for_match(raw);
-            if !combined.is_empty() {
-                combined.push(' ');
-            }
-            combined.push_str(stripped);
-            for c in stripped.chars() {
-                match c {
-                    '(' => {
-                        depth += 1;
-                        saw_open = true;
-                    }
-                    ')' => depth -= 1,
-                    _ => {}
-                }
-            }
-            if saw_open && depth == 0 {
-                break;
-            }
-            line_no += 1;
-        }
-        env.load_params_from_fn(&combined);
-
-        // Pre-populate ``let NAME = ...`` bindings declared in the body.
-        env.prepopulate_lets_from_body(model, decl_line, end_line);
-    }
-    env
-}
-
 /// Parse a comma-separated argument list into trimmed segments, honouring
 /// parens/brackets/braces.  Used by the tuple, struct, and array
 /// synthesisers.  `text` should NOT include the outer delimiters.
@@ -1372,50 +970,6 @@ fn parse_int_literal(text: &str) -> Option<i64> {
     }
     let cleaned: String = s.chars().filter(|c| *c != '_').collect();
     cleaned.parse::<i64>().ok()
-}
-
-/// Build a `ValueRecord::Sequence` from the literal element list inside
-/// `[...]` or `vec![...]`.  Skips elements that aren't simple integer
-/// literals (the synthesiser deliberately sticks to lossless decoding).
-fn build_sequence_value(
-    elements_csv: &str,
-    int_type_id: TypeId,
-    seq_type_id: TypeId,
-) -> ValueRecord {
-    let mut elements = Vec::new();
-    for tok in split_top_level_commas(elements_csv) {
-        if let Some(i) = parse_int_literal(tok) {
-            elements.push(ValueRecord::Int {
-                i,
-                type_id: int_type_id,
-            });
-        }
-    }
-    ValueRecord::Sequence {
-        elements,
-        is_slice: false,
-        type_id: seq_type_id,
-    }
-}
-
-fn build_tuple_value(
-    elements_csv: &str,
-    int_type_id: TypeId,
-    tuple_type_id: TypeId,
-) -> ValueRecord {
-    let mut elements = Vec::new();
-    for tok in split_top_level_commas(elements_csv) {
-        if let Some(i) = parse_int_literal(tok) {
-            elements.push(ValueRecord::Int {
-                i,
-                type_id: int_type_id,
-            });
-        }
-    }
-    ValueRecord::Tuple {
-        elements,
-        type_id: tuple_type_id,
-    }
 }
 
 /// Try to detect an `EnumPath::Variant ...` enum-variant construction
@@ -1946,24 +1500,16 @@ fn collect_struct_literal_lines(model: &SourceModel, start_line: u32) -> String 
     acc
 }
 
-/// Synthesise the spec-mandated `RecordEvent`s and typed `ValueRecord`
-/// variables for a step at `line_no`.  Called immediately after
-/// `register_step` in the snapshot loop.
+/// Synthesise the spec-mandated `RecordEvent`s for a step at `line_no`.
+/// Called immediately after `register_step` in the snapshot loop.
 ///
-/// `env` and `snap` are used to interpolate `msg!(\"fmt {}\", arg)` and
-/// `msg!(\"a={a}\")`-style placeholders with the current register values
-/// — the SBF interpreter doesn't run in the synthetic-snapshot pipeline,
-/// so the recorder reconstructs what-name-lives-where from the source
-/// plus the snapshot diff.  When `env` can't resolve every placeholder
-/// the literal format string is preserved (no partial substitutions).
-fn synthesise_step_events(
-    model: &SourceModel,
-    writer: &mut dyn TraceWriter,
-    line_no: u32,
-    type_ids: &mut TypeIdCache,
-    env: &VarEnv,
-    snap: &RegisterSnapshot,
-) {
+/// It emits EVENTS only, never variables. Recorder-Solana CXP-SOL-2 (operator
+/// decision 2026-11-12): this path has no DWARF variable information, and the
+/// trace format cannot mark a name as inferred, so it records no name or value
+/// matched from source text. A `msg!`/`panic!` payload is its literal format
+/// string, never interpolated with a guessed binding; named locals come only
+/// from `source_recorder` when DWARF describes the program.
+fn synthesise_step_events(model: &SourceModel, writer: &mut dyn TraceWriter, line_no: u32) {
     let raw = model.line(line_no);
     let text = strip_line_for_match(raw);
     if text.is_empty() {
@@ -1973,20 +1519,14 @@ fn synthesise_step_events(
     // Side-effect macros / errors → io_events.
     if text.contains("msg!(") {
         let payload = match extract_macro_call(text, "msg") {
-            Some((fmt, args)) => {
-                let (substituted, all_ok) = substitute_format(&fmt, &args, env, snap);
-                if all_ok { substituted } else { fmt }
-            }
+            Some((fmt, _)) => fmt,
             None => "<msg!>".to_string(),
         };
         TraceWriter::register_special_event(writer, EventLogKind::Write, "SolanaMsg", &payload);
     }
     if text.contains("panic!(") {
         let payload = match extract_macro_call(text, "panic") {
-            Some((fmt, args)) => {
-                let (substituted, all_ok) = substitute_format(&fmt, &args, env, snap);
-                if all_ok { substituted } else { fmt }
-            }
+            Some((fmt, _)) => fmt,
             None => "<panic!>".to_string(),
         };
         TraceWriter::register_special_event(writer, EventLogKind::Error, "SolanaPanic", &payload);
@@ -2038,129 +1578,6 @@ fn synthesise_step_events(
             "SolanaCompute",
             &payload,
         );
-    }
-
-    // Typed structured-value let-bindings.
-    if let (Some(name), Some(rhs)) = (extract_let_lhs(text), extract_let_rhs(text)) {
-        // Borrowed-slice / slice-indexing patterns — surface as a
-        // `Sequence { is_slice: true }` so the strict pin can
-        // distinguish them from opaque pointers.  Checked first so an
-        // RHS like `&instruction_data[..32]` doesn't accidentally fall
-        // through to the array-literal detector (which would try to
-        // parse the contents of the `[..]` as csv).
-        if is_borrowed_slice_rhs(rhs) {
-            let value = ValueRecord::Sequence {
-                elements: Vec::new(),
-                is_slice: true,
-                type_id: type_ids.seq,
-            };
-            TraceWriter::register_variable_with_full_value(writer, name, value);
-            return;
-        }
-        // Enum-variant construction — `MyInstruction::Init { lamports: 500 }`,
-        // `MyInstruction::Update(7)`, `MyInstruction::Close`.  Checked
-        // before the struct-literal branch because `Name::Variant { .. }`
-        // would otherwise be decoded as a struct with the path as its name.
-        if let Some((enum_path, variant, payload)) = parse_variant_construction(rhs) {
-            let int_type_id = type_ids.int;
-            let struct_type_id = type_ids
-                .struct_type_for(&variant)
-                .unwrap_or(type_ids.struct_default);
-            let tuple_type_id = type_ids.tuple;
-            let contents = match payload {
-                VariantPayload::Struct(fields) => {
-                    let field_values: Vec<ValueRecord> = fields
-                        .iter()
-                        .map(|(_, i)| ValueRecord::Int {
-                            i: *i,
-                            type_id: int_type_id,
-                        })
-                        .collect();
-                    ValueRecord::Struct {
-                        field_values,
-                        type_id: struct_type_id,
-                    }
-                }
-                VariantPayload::Tuple(values) => {
-                    let elements: Vec<ValueRecord> = values
-                        .iter()
-                        .map(|i| ValueRecord::Int {
-                            i: *i,
-                            type_id: int_type_id,
-                        })
-                        .collect();
-                    ValueRecord::Tuple {
-                        elements,
-                        type_id: tuple_type_id,
-                    }
-                }
-                VariantPayload::Unit => ValueRecord::Tuple {
-                    elements: Vec::new(),
-                    type_id: tuple_type_id,
-                },
-            };
-            let variant_type_id = type_ids.ensure_variant(writer, &enum_path);
-            let value = ValueRecord::Variant {
-                discriminator: variant.clone(),
-                contents: Box::new(contents),
-                type_id: variant_type_id,
-            };
-            TraceWriter::register_variable_with_full_value(writer, name, value);
-            return;
-        }
-        // Vec / array literal — `vec![..]`, `[1, 2, 3]`, `&[1, 2, 3]`.
-        // Only emit when at least one element decoded as an int literal —
-        // arrays-of-byte-strings (`[b"vault", payer.as_ref()]`) and other
-        // shapes the synthesiser can't lossily decode are skipped rather
-        // than surfaced as empty `Sequence` placeholders.
-        if let Some(elements_csv) = extract_array_or_vec_literal(rhs) {
-            let value = build_sequence_value(elements_csv, type_ids.int, type_ids.seq);
-            let has_elements = match &value {
-                ValueRecord::Sequence { elements, .. } => !elements.is_empty(),
-                _ => false,
-            };
-            if has_elements {
-                TraceWriter::register_variable_with_full_value(writer, name, value);
-                return;
-            }
-        }
-        // Tuple literal — `(a, b)` with at least 2 elements.
-        if let Some(elements_csv) = extract_tuple_literal(rhs) {
-            let value = build_tuple_value(elements_csv, type_ids.int, type_ids.tuple);
-            TraceWriter::register_variable_with_full_value(writer, name, value);
-            return;
-        }
-        // Struct literal — `Name { .. }`.  Multi-line struct literals
-        // (Rust formatter often breaks them) are stitched back together
-        // before parsing.
-        let candidate = if rhs.contains('{') && !rhs.contains('}') {
-            collect_struct_literal_lines(model, line_no)
-        } else {
-            rhs.to_string()
-        };
-        // Strip the `let NAME = ` prefix from the stitched line if present.
-        let candidate_rhs = if let Some(eq) = candidate.find('=') {
-            candidate[eq + 1..]
-                .trim()
-                .trim_end_matches(';')
-                .trim()
-                .to_string()
-        } else {
-            candidate
-        };
-        if let Some((struct_name, fields)) =
-            parse_struct_literal_rich(&candidate_rhs, type_ids, writer)
-        {
-            let type_id = type_ids
-                .struct_type_for(struct_name.as_str())
-                .unwrap_or_else(|| type_ids.ensure_struct(writer, &struct_name));
-            let field_values: Vec<ValueRecord> = fields.into_iter().map(|(_, v)| v).collect();
-            let value = ValueRecord::Struct {
-                field_values,
-                type_id,
-            };
-            TraceWriter::register_variable_with_full_value(writer, name, value);
-        }
     }
 }
 
@@ -2238,52 +1655,6 @@ fn extract_err_payload(text: &str) -> Option<String> {
         return None;
     }
     Some(after[..end].to_string())
-}
-
-/// Recognise a borrowed-slice / slice-indexing / `try_borrow_data()`
-/// RHS so the let-binding surfaces as a `Sequence { is_slice: true }`
-/// rather than being silently dropped by the value-literal detector.
-///
-/// Recognised forms (canonical native-Solana account-data idioms):
-///   * `&IDENT[range]` / `&mut IDENT[range]` — slice-indexing into
-///     `instruction_data` (`&data[..32]`, `&data[32..]`, `&data[A..B]`).
-///   * `*.try_borrow_data()` / `*.try_borrow_mut_data()` — the canonical
-///     `RefCell`-wrapped account-data borrow, optionally followed by
-///     `.unwrap()` / `?` / `.expect(..)` chains.  We only need the
-///     leading `try_borrow_data(` substring to recognise the shape.
-fn is_borrowed_slice_rhs(rhs: &str) -> bool {
-    let trimmed = rhs.trim();
-    // `*.try_borrow_data(` / `*.try_borrow_mut_data(` — chained method
-    // call on an account info or similar.  We accept arbitrary trailing
-    // text (e.g. `.unwrap()` / `?`) so the test fixture's
-    // `account.try_borrow_data().unwrap()` shape matches.
-    if trimmed.contains(".try_borrow_data(") || trimmed.contains(".try_borrow_mut_data(") {
-        return true;
-    }
-    // `&IDENT[range]` / `&mut IDENT[range]` — slice-indexing.  Strip
-    // the leading `&` (and optional `mut `) then look for an identifier
-    // followed by `[<range>]`.  The range MUST contain `..` so we don't
-    // accidentally match a single-element index `xs[i]` (which is an
-    // element access, not a slice).
-    let body = trimmed.strip_prefix('&').unwrap_or(trimmed);
-    let body = body.strip_prefix("mut ").unwrap_or(body);
-    if let Some(open) = body.find('[') {
-        // Identifier-only prefix.
-        let ident = body[..open].trim();
-        let is_ident =
-            !ident.is_empty() && ident.chars().all(|c| c.is_ascii_alphanumeric() || c == '_');
-        if is_ident {
-            // Locate the matching `]` and check the content includes `..`.
-            let after = &body[open + 1..];
-            if let Some(close) = after.find(']') {
-                let inside = &after[..close];
-                if inside.contains("..") {
-                    return true;
-                }
-            }
-        }
-    }
-    false
 }
 
 fn extract_array_or_vec_literal(rhs: &str) -> Option<&str> {
@@ -2516,49 +1887,13 @@ pub fn record_from_snapshots_into_writer(
     // call order).
     let mut fn_stack: Vec<String> = vec![outer_fn_name.clone()];
 
-    // Per-frame variable→register environments used by the format-arg
-    // interpolation path in `synthesise_step_events`.  Stack-aligned
-    // with `fn_stack` (outer frame at index 0) so a CPI / nested call
-    // walks its own env without leaking the caller's bindings.
-    let mut env_stack: Vec<VarEnv> = vec![var_env_for_fn(&model, &outer_fn_name)];
-
-    // Emit a preview set of named-local ``Value`` events bound to the
-    // initial call position (before any ``Step``).  Without this the
-    // DAP server's ``ct/load-locals`` at the trace's initial rrTicks
-    // returns ``{"locals": []}`` -- the smoke test passes because it
-    // issues a ``next`` (step-over) first which advances the cursor
-    // past snap[0]'s Step (where the per-snapshot emission loop
-    // surfaces the names), but the deep test
-    // (test/wdio/specs/deep/solana-deep.e2e.ts:loads locals with
-    // variable values including sum_val) queries locals immediately
-    // and expects ``sum_val`` to be visible (cross-repo run
-    // 27592610978).  Bind a preview at the call_entry by emitting
-    // the names with snap[0]'s register values (which are largely
-    // zero -- the placeholder-register values aren't accurate at
-    // call_entry, but the assertion is a substring match on the
-    // name, not the value).
-    if let (Some(env), Some(first_snap)) = (env_stack.first(), snapshots.first()) {
-        for var_name in &env.emit_as_int {
-            let Some(&reg) = env.names.get(var_name) else {
-                continue;
-            };
-            let value = ValueRecord::Int {
-                i: first_snap.reg(reg) as i64,
-                type_id: type_ids.int,
-            };
-            TraceWriter::register_variable_with_full_value(writer, var_name, value);
-        }
-    }
-
     // Walk snapshots.
     //
     // Snapshots whose DWARF source path is third-party
     // (``is_third_party_source``) are entirely silent in the trace:
     // no ``Step``, no ``Value`` events, no call-boundary push/pop.
-    // The recorder still advances ``prev_pc`` / ``prev_regs`` across
-    // them so the per-snapshot register flow that feeds
-    // ``synthesise_step_events`` and ``VarEnv::record_let`` at the
-    // next user-source landing remains continuous.
+    // The recorder still advances ``prev_pc`` across them so call and
+    // return detection at the next user-source landing stays continuous.
     //
     // Why this beats the alternatives: SBF programs reach the
     // user's ``process_instruction`` through the
@@ -2576,17 +1911,11 @@ pub fn record_from_snapshots_into_writer(
     //
     // Pushing a call frame at the macro-into-stdlib transition was
     // tried first (move the wrapper steps to ``depth=1`` so step-
-    // over skips them) but the frame push reattaches the trace's
-    // very first ``Step`` -- which carries ``sum_val`` and the
-    // other ``process_instruction`` locals registered by the
-    // preview loop above -- to the inner ``fn_at_pc_<pc>`` frame's
-    // empty env, and the WDIO ``finds sum_val in local variables``
-    // smoke assertion fails (cross-repo run 27640716644 second
-    // attempt).  Silently dropping third-party snapshots avoids
-    // both pitfalls: the trace contains only user-source steps so
-    // step-over advances through real lines, and the
-    // ``process_instruction`` scope spans every user-source step
-    // from start to finish so its locals stay visible throughout.
+    // over skips them) but the frame push reattached the trace's
+    // very first ``Step`` to the inner ``fn_at_pc_<pc>`` frame (cross-repo
+    // run 27640716644). Silently dropping third-party snapshots avoids it:
+    // the trace contains only user-source steps, so step-over advances
+    // through real lines and ``process_instruction`` spans every one.
     let mut prev_line: Option<u32> = None;
     // Track the previously emitted column on the same line so we can
     // fire a fresh column-aware step when the next snapshot lands on a
@@ -2596,7 +1925,6 @@ pub fn record_from_snapshots_into_writer(
     // `None` and the legacy line-only dedupe applies.
     let mut prev_column: Option<u32> = None;
     let mut prev_pc: Option<u64> = None;
-    let mut prev_regs: [u64; 12] = [0u64; 12];
 
     // Track the most recently synthesised `Err`-shaped return value so
     // `?`-propagation in the caller can re-emit it without re-parsing
@@ -2614,9 +1942,8 @@ pub fn record_from_snapshots_into_writer(
             None => continue, // No source mapping; skip.
         };
 
-        // Silently absorb third-party snapshots: advance prev_pc /
-        // prev_regs so the next user-source landing sees a
-        // continuous register flow, but emit no Step / Value / Call
+        // Silently absorb third-party snapshots: advance prev_pc so the
+        // next user-source landing sees a continuous flow, but emit no Step / Value / Call
         // events for them.  See the loop preamble for rationale.
         if is_third_party_for_user(
             &paths.source_path_str,
@@ -2624,7 +1951,6 @@ pub fn record_from_snapshots_into_writer(
             paths.user_crate_root.as_deref(),
         ) {
             prev_pc = Some(pc);
-            prev_regs = snap.registers;
             continue;
         }
 
@@ -2660,7 +1986,6 @@ pub fn record_from_snapshots_into_writer(
                             Line(line as i64),
                         );
                         TraceWriter::register_call(writer, callee_fn_id, vec![]);
-                        env_stack.push(var_env_for_fn(&model, &callee_name));
                         fn_stack.push(callee_name);
                     } else {
                         // Backward cross-boundary jump: unwind the
@@ -2707,14 +2032,12 @@ pub fn record_from_snapshots_into_writer(
                                 {
                                     TraceWriter::register_return(writer, return_value.clone());
                                     fn_stack.pop();
-                                    env_stack.pop();
                                 }
                             }
                             None => {
                                 if fn_stack.len() > 1 {
                                     TraceWriter::register_return(writer, return_value);
                                     fn_stack.pop();
-                                    env_stack.pop();
                                 } else {
                                     TraceWriter::register_return(writer, return_value);
                                 }
@@ -2747,24 +2070,13 @@ pub fn record_from_snapshots_into_writer(
                 column.map(|c| Line(c as i64)),
             );
 
-            // Update the active frame's variable→register env from any
-            // `let NAME = ...` binding visible on this step before
-            // synthesising events — placeholder substitution downstream
-            // looks up named args via the env.
-            if let Some(env) = env_stack.last_mut()
-                && let Some(name) = extract_let_lhs(strip_line_for_match(model.line(line)))
-            {
-                env.record_let(name, &prev_regs, snap);
-            }
-
             // Synthesise side-effecting / typed-value events the SBF
             // synthetic-snapshot pipeline cannot observe.  Done before
             // the per-register Int emission so the synthesised
             // structured variable appears alongside its formal name in
             // the step's variable list (rather than after the r0..r10
             // block).
-            let active_env = env_stack.last().cloned().unwrap_or_else(VarEnv::new);
-            synthesise_step_events(&model, writer, line, &mut type_ids, &active_env, snap);
+            synthesise_step_events(&model, writer, line);
 
             prev_line = Some(line);
             prev_column = column;
@@ -2780,42 +2092,7 @@ pub fn record_from_snapshots_into_writer(
             TraceWriter::register_variable_with_full_value(writer, &name, value);
         }
 
-        // Surface each named binding tracked in the active frame's env
-        // (function parameters from ``fn (..)`` plus any ``let NAME =
-        // ..`` declarations seen so far) as an additional named local
-        // alongside the raw ``r0..r10`` registers.  Without this the
-        // DAP server's ``ct/load-locals`` query returns only the
-        // unnamed register expressions and the WDIO smoke test's
-        // ``finds sum_val in local variables`` assertion fails --
-        // observed against cross-repo run 27582656096: execution
-        // ran to completion (1277 register snapshots) and the
-        // source model loaded correctly, but the trace contained no
-        // ``sum_val`` variable name because the synthesiser's
-        // ``let``-binding path only fires for *structured* RHS
-        // (struct/array/tuple/enum) and simple ``let sum_val: u64
-        // = a + b;`` slipped through.
-        //
-        // The value is the register's current snapshot, looked up
-        // via the env's ``name -> register`` map.  ``VarEnv``
-        // records this mapping on each ``let NAME = ...`` line by
-        // assigning the binding to the lowest register r{1..=10}
-        // whose value changed at that step -- the canonical sBPF
-        // convention the workspace's hand-written fixtures rely on.
-        if let Some(env) = env_stack.last() {
-            for var_name in &env.emit_as_int {
-                let Some(&reg) = env.names.get(var_name) else {
-                    continue;
-                };
-                let value = ValueRecord::Int {
-                    i: snap.reg(reg) as i64,
-                    type_id: type_ids.int,
-                };
-                TraceWriter::register_variable_with_full_value(writer, var_name, value);
-            }
-        }
-
         prev_pc = Some(pc);
-        prev_regs = snap.registers;
     }
 
     // Emit return for the main function.  When the last visited line
@@ -2961,10 +2238,6 @@ pub fn record_with_cpi(
     // Emit initial call.
     TraceWriter::register_call(&mut *writer, main_fn_id, vec![]);
 
-    // Frame-aligned variable→register env stack so format-arg
-    // interpolation in `synthesise_step_events` honours the active
-    // frame.  Outer frame at index 0; CPI calls push, returns pop.
-    let mut env_stack: Vec<VarEnv> = vec![var_env_for_fn(&model, &outer_fn_name)];
     // Per-frame call-site `fn name` so within-program forward jumps
     // emit a named call frame instead of `fn_at_pc_<pc>`.
     let mut fn_stack: Vec<String> = vec![outer_fn_name.clone()];
@@ -2975,7 +2248,6 @@ pub fn record_with_cpi(
     // multi-statement lines surface distinct column-aware steps.
     let mut prev_column: Option<u32> = None;
     let mut prev_pc: Option<u64> = None;
-    let mut prev_regs: [u64; 12] = [0u64; 12];
 
     for snap in snapshots {
         let pc = snap.pc();
@@ -3030,7 +2302,6 @@ pub fn record_with_cpi(
                     },
                 );
                 TraceWriter::register_call(&mut *writer, cpi_fn_id, vec![]);
-                env_stack.push(var_env_for_fn(&model, &callee_name));
                 fn_stack.push(callee_name);
                 // Reset line tracking for the new program context.
                 prev_line = None;
@@ -3038,9 +2309,6 @@ pub fn record_with_cpi(
             }
             CpiEvent::CpiReturn { return_pc: _ } => {
                 TraceWriter::register_return(&mut *writer, NONE_VALUE);
-                if env_stack.len() > 1 {
-                    env_stack.pop();
-                }
                 if fn_stack.len() > 1 {
                     fn_stack.pop();
                 }
@@ -3080,7 +2348,6 @@ pub fn record_with_cpi(
                                     Line(line as i64),
                                 );
                                 TraceWriter::register_call(&mut *writer, callee_fn_id, vec![]);
-                                env_stack.push(var_env_for_fn(&model, &callee_name));
                                 fn_stack.push(callee_name);
                             } else {
                                 // Backward cross-boundary jump — unwind
@@ -3093,14 +2360,12 @@ pub fn record_with_cpi(
                                         {
                                             TraceWriter::register_return(&mut *writer, NONE_VALUE);
                                             fn_stack.pop();
-                                            env_stack.pop();
                                         }
                                     }
                                     None => {
                                         if fn_stack.len() > 1 {
                                             TraceWriter::register_return(&mut *writer, NONE_VALUE);
                                             fn_stack.pop();
-                                            env_stack.pop();
                                         } else {
                                             TraceWriter::register_return(&mut *writer, NONE_VALUE);
                                         }
@@ -3147,18 +2412,8 @@ pub fn record_with_cpi(
                 column.map(|c| Line(c as i64)),
             );
 
-            // Update the active frame's variable→register env from any
-            // `let NAME = ...` binding visible on this step before
-            // synthesising events.
-            if let Some(env) = env_stack.last_mut()
-                && let Some(name) = extract_let_lhs(strip_line_for_match(model.line(line)))
-            {
-                env.record_let(name, &prev_regs, snap);
-            }
-
             // Synthesise side-effecting / typed-value events.
-            let active_env = env_stack.last().cloned().unwrap_or_else(VarEnv::new);
-            synthesise_step_events(&model, &mut *writer, line, &mut type_ids, &active_env, snap);
+            synthesise_step_events(&model, &mut *writer, line);
 
             prev_line = Some(line);
             prev_column = column;
@@ -3175,7 +2430,6 @@ pub fn record_with_cpi(
         }
 
         prev_pc = Some(pc);
-        prev_regs = snap.registers;
     }
 
     // Emit returns for any remaining CPI contexts (handles traces that

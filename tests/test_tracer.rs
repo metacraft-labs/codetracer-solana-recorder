@@ -384,23 +384,16 @@ fn test_sbpf_step_events() {
     assert_eq!(step_lines, vec![1i64, 5, 6, 7, 8, 9, 10, 11]);
 }
 
-/// Test 7: With a real source file on disk, the recorder must surface
-/// named source-level locals (``let a = ...``, ``let sum = ..``, etc.)
-/// alongside the raw ``r0..r10`` registers.
-///
-/// Reproduces the cross-repo WDIO smoke failure at run 27582656096:
-/// after the executor's syscall + rodata fixes let the SBF VM run to
-/// completion (1277 register snapshots), the ``finds sum_val in local
-/// variables`` assertion still failed because the recorder's
-/// ``record_from_snapshots_into_writer`` only emitted the raw register
-/// names -- never the bindings tracked in its ``VarEnv``.  The fix
-/// emits each env-tracked binding as a named ``Value`` event at every
-/// snapshot.  This test pins the new behaviour by writing a real source
-/// file at the path the recorder will read and asserting the trace
-/// contains ``a``, ``b``, ``sum``, ``doubled``, ``final_val`` in its
-/// variable-name table.
+/// Test 7: Even with a real source file on disk, the record path must NOT
+/// surface source-text-inferred locals (``let a = ...``, ``let sum = ..``,
+/// etc.).  The record path no longer infers locals from source text
+/// (Recorder-Solana CXP-SOL-2, operator decision 2026-11-12): step
+/// variables are exactly the VM registers ``r0..r10``.  This test writes a
+/// real source file at the path the recorder will read and asserts the
+/// trace's variable-name table contains the register names but none of
+/// ``a``, ``b``, ``sum``, ``doubled``, ``final_val``.
 #[test]
-fn test_named_source_locals_emitted_when_source_file_exists() {
+fn test_no_source_text_locals_are_emitted_even_when_source_exists() {
     use codetracer_solana_recorder::register_trace::parse_regs_file;
 
     let tmp = tempfile::TempDir::new().unwrap();
@@ -444,10 +437,19 @@ fn test_named_source_locals_emitted_when_source_file_exists() {
         })
         .collect();
 
-    for expected in ["r0", "r1", "r10", "a", "b", "sum", "doubled", "final_val"] {
+    for i in 0..=10 {
+        let expected = format!("r{i}");
         assert!(
-            var_names.contains(expected),
+            var_names.contains(expected.as_str()),
             "trace variable-name table missing `{expected}`; got: {:?}",
+            var_names
+        );
+    }
+    // The record path no longer infers locals (Recorder-Solana CXP-SOL-2, operator decision 2026-11-12).
+    for guessed in ["a", "b", "sum", "doubled", "final_val"] {
+        assert!(
+            !var_names.contains(guessed),
+            "trace variable-name table must not contain source-inferred `{guessed}`; got: {:?}",
             var_names
         );
     }

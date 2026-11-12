@@ -162,11 +162,10 @@ fn record_and_dump_full(
 /// error that asks the test author to extend the test rather than
 /// weaken it.
 ///
-/// Compound-typed locals (`Struct` / `Tuple` / `Sequence`) the
-/// source-driven synthesiser surfaces (`xs`, `pair`, `p`, `account`,
-/// ...) are *not* register variables and are returned by
-/// [`observed_compound_vars`] for explicit per-test assertions, rather
-/// than being conflated into the integer round-trip stream.
+/// Non-register variables are *not* part of the integer round-trip
+/// stream; they are returned by [`observed_compound_vars`], which
+/// [`assert_no_inferred_variables`] requires to be empty on the record
+/// path (it no longer infers source-level locals).
 fn observed_int_vars(doc: &serde_json::Value) -> Vec<(String, i64)> {
     let events = doc["events"].as_array().expect("events array");
     let mut out = Vec::new();
@@ -203,11 +202,10 @@ fn observed_int_vars(doc: &serde_json::Value) -> Vec<(String, i64)> {
 }
 
 /// Decode every (varname, value-json) pair from step events for **non-
-/// register** variables (the source-driven synthesiser surfaces these
-/// as `Sequence` / `Tuple` / `Struct` etc.).  Returns the variables in
-/// the order they appear; per-test assertions then key off varname and
-/// inspect `value["kind"]`, `value["elements"]`, `value["field_values"]`,
-/// etc.
+/// register** variables, in the order they appear.  The record path no
+/// longer infers source-level locals (Recorder-Solana CXP-SOL-2,
+/// operator decision 2026-11-12), so [`assert_no_inferred_variables`]
+/// requires this to be empty.
 fn observed_compound_vars(doc: &serde_json::Value) -> Vec<(String, serde_json::Value)> {
     let events = doc["events"].as_array().expect("events array");
     let mut out = Vec::new();
@@ -227,6 +225,52 @@ fn observed_compound_vars(doc: &serde_json::Value) -> Vec<(String, serde_json::V
         }
     }
     out
+}
+
+/// Asserts the record path's no-inference contract (Recorder-Solana
+/// CXP-SOL-2, operator decision 2026-11-12): step variables are exactly
+/// the VM registers `r0..r10`, each an `Int`, and no source-text-inferred
+/// local (in particular none of `guessed`, the names the old synthesiser
+/// used to emit) appears.  Anti-vacuity: at least one step must carry all
+/// of `r0..r10`, so an empty trace cannot pass.
+fn assert_no_inferred_variables(doc: &serde_json::Value, guessed: &[&str]) {
+    let compounds = observed_compound_vars(doc);
+    assert!(
+        compounds.is_empty(),
+        "record path must not emit non-register variables; got {compounds:?}"
+    );
+    let mut saw_full_register_step = false;
+    for ev in doc["events"].as_array().expect("events array") {
+        if ev["kind"] != "step" {
+            continue;
+        }
+        let mut regs = std::collections::BTreeSet::new();
+        for v in ev["vars"].as_array().cloned().unwrap_or_default() {
+            let name = v["varname"].as_str().expect("varname str");
+            assert!(
+                is_register_name(name),
+                "step variable `{name}` is not a register r0..r10"
+            );
+            assert!(
+                !guessed.contains(&name),
+                "formerly-inferred variable `{name}` must not appear"
+            );
+            assert_eq!(
+                v["value"]["kind"].as_str(),
+                Some("Int"),
+                "register `{name}` must be Int; got {}",
+                v["value"]
+            );
+            regs.insert(name.to_string());
+        }
+        if (0..=10).all(|i| regs.contains(&format!("r{i}"))) {
+            saw_full_register_step = true;
+        }
+    }
+    assert!(
+        saw_full_register_step,
+        "at least one step must carry all of r0..r10"
+    );
 }
 
 /// Returns `true` when `name` is one of the synthetic register names
@@ -789,11 +833,10 @@ fn test_nested_calls_test_call_names_resolved_via_dwarf() {
 //   dist_sq      = 25  (point_distance_sq(Point{x:3, y:4}))
 //   combined     = 65  (10 + 30 + 25)
 //
-// The source-driven synthesiser surfaces `xs` as
-// ValueRecord::Sequence, `pair` as Tuple, and `p` as Struct alongside
-// the per-snapshot register stream — `test_collections_test_value_kinds_present`
-// asserts on the kinds and `test_collections_test_via_ct_print_full`
-// pins the exact element / field values.
+// The record path no longer infers `xs` / `pair` / `p` from the source
+// literals (Recorder-Solana CXP-SOL-2, operator decision 2026-11-12):
+// step variables are exactly the registers r0..r10, which
+// `test_collections_test_records_registers_not_inferred_values` pins.
 
 fn collections_snapshots() -> (Vec<RegisterSnapshot>, Vec<(u64, &'static str, u32)>) {
     // compute() body in collections_test.rs:
@@ -909,79 +952,35 @@ fn test_collections_test_via_ct_print_full() {
         r0
     );
 
-    // ----- Compound locals (Sequence / Tuple / Struct) --------------------
-    // The source-driven synthesiser pattern-matches the array literal,
-    // tuple literal, and struct literal in compute() and emits typed
-    // ValueRecord variants alongside the per-snapshot register stream.
-    let compounds = observed_compound_vars(&doc);
-    let xs = compounds
-        .iter()
-        .find(|(n, _)| n == "xs")
-        .expect("xs must surface as a compound variable");
-    assert_eq!(xs.1["kind"].as_str(), Some("Sequence"));
-    assert_eq!(xs.1["is_slice"].as_bool(), Some(false));
-    let xs_elements = xs.1["elements"].as_array().expect("xs.elements array");
-    let xs_ints: Vec<i64> = xs_elements
-        .iter()
-        .map(|e| e["i"].as_i64().expect("xs element must be Int.i"))
-        .collect();
-    assert_eq!(xs_ints, vec![1, 2, 3, 4]);
-
-    let pair = compounds
-        .iter()
-        .find(|(n, _)| n == "pair")
-        .expect("pair must surface as a compound variable");
-    assert_eq!(pair.1["kind"].as_str(), Some("Tuple"));
-    let pair_elements = pair.1["elements"].as_array().expect("pair.elements array");
-    let pair_ints: Vec<i64> = pair_elements
-        .iter()
-        .map(|e| e["i"].as_i64().expect("pair element must be Int.i"))
-        .collect();
-    assert_eq!(pair_ints, vec![10, 20]);
-
-    let p = compounds
-        .iter()
-        .find(|(n, _)| n == "p")
-        .expect("p must surface as a compound variable");
-    assert_eq!(p.1["kind"].as_str(), Some("Struct"));
-    let p_fields = p.1["field_values"]
-        .as_array()
-        .expect("p.field_values array");
-    let p_ints: Vec<i64> = p_fields
-        .iter()
-        .map(|e| e["i"].as_i64().expect("p field must be Int.i"))
-        .collect();
-    assert_eq!(p_ints, vec![3, 4]);
+    // ----- No inferred compound locals -----------------------------------
+    // The record path no longer infers locals (Recorder-Solana CXP-SOL-2, operator decision 2026-11-12).
+    assert_no_inferred_variables(
+        &doc,
+        &[
+            "xs",
+            "pair",
+            "p",
+            "xs_total",
+            "pair_total",
+            "dist_sq",
+            "combined",
+        ],
+    );
 }
 
 #[test]
-fn test_collections_test_value_kinds_present() {
+fn test_collections_test_records_registers_not_inferred_values() {
     let (snaps, locs) = collections_snapshots();
     let Some((doc, _)) = record_and_dump_full(
-        "test_collections_test_value_kinds_present",
+        "test_collections_test_records_registers_not_inferred_values",
         "collections_test.rs",
         &snaps,
         &locs,
     ) else {
         return;
     };
-    let mut kinds = std::collections::BTreeSet::new();
-    for ev in doc["events"].as_array().unwrap() {
-        if ev["kind"] != "step" {
-            continue;
-        }
-        for v in ev["vars"].as_array().cloned().unwrap_or_default() {
-            if let Some(k) = v["value"]["kind"].as_str() {
-                kinds.insert(k.to_string());
-            }
-        }
-    }
-    for want in ["Int", "Sequence", "Tuple", "Struct"] {
-        assert!(
-            kinds.contains(want),
-            "expected {want} ValueRecord variant in collections trace; got {kinds:?}"
-        );
-    }
+    // The record path no longer infers locals (Recorder-Solana CXP-SOL-2, operator decision 2026-11-12).
+    assert_no_inferred_variables(&doc, &["xs", "pair", "p"]);
 }
 
 // ===========================================================================
@@ -1273,11 +1272,9 @@ fn test_msg_log_test_emits_three_io_events() {
 
 fn account_processing_snapshots() -> (Vec<RegisterSnapshot>, Vec<(u64, &'static str, u32)>) {
     // process_transfer() lives at lines 44..54.  The AccountInfo struct
-    // literal spans lines 45..49 (the recorder's source-driven model
-    // stitches multi-line `Name { .. }` literals together when the
-    // visited line opens with `{` but doesn't close it on the same
-    // line).  Snapshots:
-    //   line 45: let mut account = AccountInfo { ... }   (Struct)
+    // literal spans lines 45..49; it is NOT inferred as a local (the
+    // record path no longer infers locals).  Snapshots:
+    //   line 45: let mut account = AccountInfo { ... }
     //   line 50: let before = read_balance(&account)     -> 1000
     //   line 51: let after  = debit(before, 250)         -> 750
     //   line 52: write_balance(&mut account, after)
@@ -1389,52 +1386,24 @@ fn test_account_processing_test_via_ct_print_full() {
         r0
     );
 
-    // ----- AccountInfo struct surface -------------------------------------
-    // The visited step at line 45 stitches the multi-line
-    // `AccountInfo { ... }` literal back into a single Struct value
-    // with three Int field values (balance=1000, owner=42, is_signer=1).
-    let compounds = observed_compound_vars(&doc);
-    let account = compounds
-        .iter()
-        .find(|(n, _)| n == "account")
-        .expect("account must surface as a compound variable");
-    assert_eq!(account.1["kind"].as_str(), Some("Struct"));
-    let fields = account.1["field_values"]
-        .as_array()
-        .expect("field_values array");
-    let field_ints: Vec<i64> = fields
-        .iter()
-        .map(|e| e["i"].as_i64().expect("AccountInfo field must be Int.i"))
-        .collect();
-    assert_eq!(field_ints, vec![1000, 42, 1]);
+    // ----- No inferred AccountInfo struct --------------------------------
+    // The record path no longer infers locals (Recorder-Solana CXP-SOL-2, operator decision 2026-11-12).
+    assert_no_inferred_variables(&doc, &["account", "before", "after"]);
 }
 
 #[test]
-fn test_account_processing_test_account_struct_present() {
+fn test_account_processing_test_records_registers_not_account_struct() {
     let (snaps, locs) = account_processing_snapshots();
     let Some((doc, _)) = record_and_dump_full(
-        "test_account_processing_test_account_struct_present",
+        "test_account_processing_test_records_registers_not_account_struct",
         "account_processing_test.rs",
         &snaps,
         &locs,
     ) else {
         return;
     };
-    let mut kinds = std::collections::BTreeSet::new();
-    for ev in doc["events"].as_array().unwrap() {
-        if ev["kind"] != "step" {
-            continue;
-        }
-        for v in ev["vars"].as_array().cloned().unwrap_or_default() {
-            if let Some(k) = v["value"]["kind"].as_str() {
-                kinds.insert(k.to_string());
-            }
-        }
-    }
-    assert!(
-        kinds.contains("Struct"),
-        "expected Struct ValueRecord variant for AccountInfo; got {kinds:?}"
-    );
+    // The record path no longer infers locals (Recorder-Solana CXP-SOL-2, operator decision 2026-11-12).
+    assert_no_inferred_variables(&doc, &["account"]);
 }
 
 // ===========================================================================
@@ -1471,10 +1440,10 @@ fn test_step_count_helper_matches_counts_field() {
 //
 // Canonical native-program shape: a `MyInstruction` enum with typed
 // variants, decoded from `instruction_data[0]`.  The strict pin
-// asserts that `let init = MyInstruction::Init { lamports: 500 };`
-// surfaces as a `ValueRecord::Variant { discriminator, contents }`
-// where `contents` is a `Struct` carrying the field values — the
-// recorder's first emission of a `Variant`-typed local.
+// asserts the register stream and that
+// `let init = MyInstruction::Init { lamports: 500 };` is NOT inferred
+// as a `Variant` local: the record path no longer infers locals
+// (Recorder-Solana CXP-SOL-2, operator decision 2026-11-12).
 
 fn instruction_enum_dispatch_snapshots() -> (Vec<RegisterSnapshot>, Vec<(u64, &'static str, u32)>) {
     // process_instruction() body in instruction_enum_dispatch_test.rs:
@@ -1562,56 +1531,24 @@ fn test_instruction_enum_dispatch_test_via_ct_print_full() {
     let r0 = observed_register_sequence(&doc, "r0");
     assert_eq!(r0, vec![0, 0, 0, 501], "r0 (return) must end at 501",);
 
-    // ----- Variant decode --------------------------------------------------
-    // The `let init = MyInstruction::Init { lamports: 500 };` step
-    // surfaces as `ValueRecord::Variant` with `discriminator="Init"`
-    // and a `Struct` contents carrying the `lamports=500` field.
-    let compounds = observed_compound_vars(&doc);
-    let init = compounds
-        .iter()
-        .find(|(n, _)| n == "init")
-        .expect("init must surface as a compound variable");
-    assert_eq!(init.1["kind"].as_str(), Some("Variant"));
-    assert_eq!(init.1["discriminator"].as_str(), Some("Init"));
-    let contents = &init.1["contents"];
-    assert_eq!(contents["kind"].as_str(), Some("Struct"));
-    let field_values = contents["field_values"]
-        .as_array()
-        .expect("contents.field_values array");
-    let ints: Vec<i64> = field_values
-        .iter()
-        .map(|e| e["i"].as_i64().expect("variant field must be Int.i"))
-        .collect();
-    assert_eq!(ints, vec![500]);
+    // ----- No inferred Variant local -------------------------------------
+    // The record path no longer infers locals (Recorder-Solana CXP-SOL-2, operator decision 2026-11-12).
+    assert_no_inferred_variables(&doc, &["init", "discriminator", "result"]);
 }
 
 #[test]
-fn test_instruction_enum_dispatch_variant_kinds_present() {
+fn test_instruction_enum_dispatch_records_registers_not_inferred_variant() {
     let (snaps, locs) = instruction_enum_dispatch_snapshots();
     let Some((doc, _)) = record_and_dump_full(
-        "test_instruction_enum_dispatch_variant_kinds_present",
+        "test_instruction_enum_dispatch_records_registers_not_inferred_variant",
         "instruction_enum_dispatch_test.rs",
         &snaps,
         &locs,
     ) else {
         return;
     };
-    let mut kinds = std::collections::BTreeSet::new();
-    for ev in doc["events"].as_array().unwrap() {
-        if ev["kind"] != "step" {
-            continue;
-        }
-        for v in ev["vars"].as_array().cloned().unwrap_or_default() {
-            if let Some(k) = v["value"]["kind"].as_str() {
-                kinds.insert(k.to_string());
-            }
-        }
-    }
-    assert!(
-        kinds.contains("Variant"),
-        "expected Variant ValueRecord variant in instruction-enum dispatch trace; \
-         got {kinds:?}"
-    );
+    // The record path no longer infers locals (Recorder-Solana CXP-SOL-2, operator decision 2026-11-12).
+    assert_no_inferred_variables(&doc, &["init"]);
 }
 
 // ===========================================================================
@@ -1966,23 +1903,9 @@ fn test_anchor_program_test_via_ct_print_full() {
         ],
     );
 
-    // ----- Context struct decode ------------------------------------------
-    // The visited step at line 100 stitches the multi-line `Context { .. }`
-    // literal back into a single Struct value with three Int field values.
-    let compounds = observed_compound_vars(&doc);
-    let ctx = compounds
-        .iter()
-        .find(|(n, _)| n == "ctx")
-        .expect("ctx must surface as a compound variable");
-    assert_eq!(ctx.1["kind"].as_str(), Some("Struct"));
-    let fields = ctx.1["field_values"]
-        .as_array()
-        .expect("ctx.field_values array");
-    let field_ints: Vec<i64> = fields
-        .iter()
-        .map(|e| e["i"].as_i64().expect("Context field must be Int.i"))
-        .collect();
-    assert_eq!(field_ints, vec![1, 254, 7]);
+    // ----- No inferred Context struct ------------------------------------
+    // The record path no longer infers locals (Recorder-Solana CXP-SOL-2, operator decision 2026-11-12).
+    assert_no_inferred_variables(&doc, &["ctx", "result"]);
 
     // ----- r0 returns the handler's final value ---------------------------
     let r0 = observed_register_sequence(&doc, "r0");
@@ -2022,9 +1945,10 @@ fn test_anchor_program_handler_name_resolved() {
 // Program-Derived Addresses are the canonical state-ownership idiom in
 // Solana: `Pubkey::find_program_address(&[seed1, seed2], program_id)`
 // returns `(Pubkey, u8)` — derived address and bump byte.  The strict
-// pin asserts that the seed list (when expressed as an int-array literal)
-// surfaces as `ValueRecord::Sequence` and that the bump byte surfaces
-// as the final `r0` Int.
+// pin asserts that the bump byte surfaces as the final `r0` Int and that
+// the seed list is NOT inferred from its int-array literal: the record
+// path no longer infers locals (Recorder-Solana CXP-SOL-2, operator
+// decision 2026-11-12).
 
 fn pda_derivation_snapshots() -> (Vec<RegisterSnapshot>, Vec<(u64, &'static str, u32)>) {
     // derive_vault_pda body (lines 57..67):
@@ -2051,10 +1975,10 @@ fn pda_derivation_snapshots() -> (Vec<RegisterSnapshot>, Vec<(u64, &'static str,
 }
 
 #[test]
-fn test_pda_derivation_test_seeds_and_bump_recorded() {
+fn test_pda_derivation_test_bump_recorded_seeds_not_inferred() {
     let (snaps, locs) = pda_derivation_snapshots();
     let Some((doc, source_path)) = record_and_dump_full(
-        "test_pda_derivation_test_seeds_and_bump_recorded",
+        "test_pda_derivation_test_bump_recorded_seeds_not_inferred",
         "pda_derivation_test.rs",
         &snaps,
         &locs,
@@ -2106,23 +2030,9 @@ fn test_pda_derivation_test_seeds_and_bump_recorded() {
         vec!["<toplevel>".to_string(), "derive_vault_pda".to_string()]
     );
 
-    // ----- Seed list as Sequence ------------------------------------------
-    // The `let seeds: [i64; 3] = [1, 2, 3];` step surfaces the array
-    // literal as a `ValueRecord::Sequence` with three Int elements.
-    let compounds = observed_compound_vars(&doc);
-    let seeds = compounds
-        .iter()
-        .find(|(n, _)| n == "seeds")
-        .expect("seeds must surface as a compound variable");
-    assert_eq!(seeds.1["kind"].as_str(), Some("Sequence"));
-    let seed_elements = seeds.1["elements"]
-        .as_array()
-        .expect("seeds.elements array");
-    let seed_ints: Vec<i64> = seed_elements
-        .iter()
-        .map(|e| e["i"].as_i64().expect("seed element must be Int.i"))
-        .collect();
-    assert_eq!(seed_ints, vec![1, 2, 3]);
+    // ----- No inferred seed list -----------------------------------------
+    // The record path no longer infers locals (Recorder-Solana CXP-SOL-2, operator decision 2026-11-12).
+    assert_no_inferred_variables(&doc, &["seeds", "pda", "bump", "derived"]);
 
     // ----- bump byte as Int ------------------------------------------------
     // r0 surfaces the final return value (the bump byte).
@@ -2146,12 +2056,11 @@ fn test_pda_derivation_test_seeds_and_bump_recorded() {
 // ===========================================================================
 //
 // `msg!("balance: {}", balance)` is the canonical Solana debug-logging
-// idiom.  Today the recorder's `extract_macro_string_arg` captures the
-// literal format string only (`balance: {}`) — runtime-value
-// interpolation is M10's documented known limitation.  The strict pin
-// below asserts that present-day shape (literal text in the io_event
-// content); the `#[ignore]`d sibling pins the spec-correct
-// substituted-text expectation.
+// idiom.  The recorder's `extract_macro_string_arg` captures the
+// literal format string only (`balance: {}`): the record path no longer
+// infers locals (Recorder-Solana CXP-SOL-2, operator decision
+// 2026-11-12), so it never interpolates runtime values.  Both pins below
+// assert that literal text in the io_event content.
 
 fn msg_format_args_snapshots() -> (Vec<RegisterSnapshot>, Vec<(u64, &'static str, u32)>) {
     // compute(100, 50) body in msg_format_args_test.rs (lines 25..32):
@@ -2257,24 +2166,21 @@ fn test_msg_format_args_test_via_ct_print_full() {
         vec!["<toplevel>".to_string(), "compute".to_string()]
     );
 
-    // ----- Spec-correct format-arg interpolation --------------------------
-    // The recorder's source-driven model resolves each positional `{}`
-    // placeholder against the call-site's runtime register values:
-    // function parameters are mapped to r1.. by signature order, and
-    // each `let NAME = ...` binding is mapped to the lowest register
-    // that became live at its line.  At each `msg!` call site the
-    // extracted args (`balance`, `new_balance`, `doubled`) resolve to
-    // their register values and substitute into the format string.
+    // ----- msg! payloads are the literal format strings -------------------
+    // The record path no longer infers locals (Recorder-Solana CXP-SOL-2,
+    // operator decision 2026-11-12), so it cannot resolve the `{}` args
+    // against runtime values: each io_event payload is the macro's
+    // literal format string, verbatim.
     let contents = observed_io_event_contents(&doc);
     assert_eq!(
         contents,
         vec![
-            "balance: 100".to_string(),
-            "from 100 to 150".to_string(),
-            "doubled = 300".to_string(),
+            "balance: {}".to_string(),
+            "from {} to {}".to_string(),
+            "doubled = {}".to_string(),
         ],
-        "io_event payloads must contain the substituted runtime values \
-         the source-driven synthesiser resolves at each msg! call site",
+        "io_event payloads must be the literal msg! format strings, \
+         not interpolated with inferred values",
     );
 
     // ----- Register stream surfaces the runtime values --------------------
@@ -2309,10 +2215,10 @@ fn test_msg_format_args_test_via_ct_print_full() {
 }
 
 #[test]
-fn test_msg_format_args_interpolated() {
+fn test_msg_format_args_are_not_interpolated() {
     let (snaps, locs) = msg_format_args_snapshots();
     let Some((doc, _)) = record_and_dump_full(
-        "test_msg_format_args_interpolated",
+        "test_msg_format_args_are_not_interpolated",
         "msg_format_args_test.rs",
         &snaps,
         &locs,
@@ -2320,17 +2226,18 @@ fn test_msg_format_args_interpolated() {
         return;
     };
     let contents = observed_io_event_contents(&doc);
-    // Spec-correct expectation: format placeholders substituted with
-    // the runtime values seen at each msg! call site.
+    // Interpolation would require mapping `{}` args to source-level
+    // locals, which the record path no longer infers (Recorder-Solana
+    // CXP-SOL-2, operator decision 2026-11-12).  The payloads are
+    // therefore the literal format strings, in call-site order.
     assert_eq!(
         contents,
         vec![
-            "balance: 100".to_string(),
-            "from 100 to 150".to_string(),
-            "doubled = 300".to_string(),
+            "balance: {}".to_string(),
+            "from {} to {}".to_string(),
+            "doubled = {}".to_string(),
         ],
-        "io_event payloads must contain the substituted runtime values \
-         when the format-arg interpolation path lands"
+        "io_event payloads must be the literal msg! format strings"
     );
 }
 
@@ -2338,14 +2245,12 @@ fn test_msg_format_args_interpolated() {
 // M11: nested_struct_test.rs
 // ===========================================================================
 //
-// Exercises the recorder's parse_struct_literal extension: nested
-// struct literals, string-literal fields, `Vec<T>` element lists, and
-// `Pubkey::default()` placeholders all decode through the recursive
-// `decode_value_literal` path instead of being silently dropped (the
-// pre-M11 int/bool-only behaviour).  The strict pin asserts that
-// `let outer = Outer { ... };` surfaces a `Struct` whose three fields
-// decode as `Struct` (nested Inner), `Sequence` (vec items), and
-// `String` (Pubkey::default placeholder) respectively.
+// A nested struct literal (`let outer = Outer { inner, items, owner }`)
+// with string-literal fields, a `Vec<T>` element list, and a
+// `Pubkey::default()` placeholder.  The record path no longer infers
+// locals from such literals (Recorder-Solana CXP-SOL-2, operator
+// decision 2026-11-12): the strict pin asserts steps / calls / the msg!
+// io_event, and that only the r0..r10 registers are recorded.
 
 fn nested_struct_snapshots() -> (Vec<RegisterSnapshot>, Vec<(u64, &'static str, u32)>) {
     // process_instruction body in nested_struct_test.rs:
@@ -2422,60 +2327,9 @@ fn test_nested_struct_test_via_ct_print_full() {
         vec!["<toplevel>".to_string(), "process_instruction".to_string()],
     );
 
-    // ----- Outer struct decode --------------------------------------------
-    // The visited step at line 62 stitches the multi-line `Outer { .. }`
-    // literal back into one expression, then `parse_struct_literal_rich`
-    // recursively decodes each field via `decode_value_literal`.
-    let compounds = observed_compound_vars(&doc);
-    let outer = compounds
-        .iter()
-        .find(|(n, _)| n == "outer")
-        .expect("outer must surface as a compound variable");
-    assert_eq!(outer.1["kind"].as_str(), Some("Struct"));
-    let fields = outer.1["field_values"]
-        .as_array()
-        .expect("outer.field_values array");
-    assert_eq!(
-        fields.len(),
-        3,
-        "Outer has three fields (inner, items, owner); got {fields:?}"
-    );
-
-    // field 0 — `inner: Inner { count: 7, label: "hi" }` — recursive Struct.
-    let inner = &fields[0];
-    assert_eq!(inner["kind"].as_str(), Some("Struct"));
-    let inner_fields = inner["field_values"]
-        .as_array()
-        .expect("inner.field_values array");
-    assert_eq!(
-        inner_fields.len(),
-        2,
-        "Inner has two fields (count, label); got {inner_fields:?}"
-    );
-    assert_eq!(inner_fields[0]["kind"].as_str(), Some("Int"));
-    assert_eq!(inner_fields[0]["i"].as_i64(), Some(7));
-    assert_eq!(inner_fields[1]["kind"].as_str(), Some("String"));
-    assert_eq!(inner_fields[1]["text"].as_str(), Some("hi"));
-
-    // field 1 — `items: vec![1, 2, 3]` — Sequence of Int.
-    let items = &fields[1];
-    assert_eq!(items["kind"].as_str(), Some("Sequence"));
-    assert_eq!(items["is_slice"].as_bool(), Some(false));
-    let item_elements = items["elements"].as_array().expect("items.elements array");
-    let item_ints: Vec<i64> = item_elements
-        .iter()
-        .map(|e| e["i"].as_i64().expect("items element must be Int.i"))
-        .collect();
-    assert_eq!(item_ints, vec![1, 2, 3]);
-
-    // field 2 — `owner: Pubkey::default()` — String placeholder.
-    let owner = &fields[2];
-    assert_eq!(owner["kind"].as_str(), Some("String"));
-    assert_eq!(
-        owner["text"].as_str(),
-        Some("11111111111111111111111111111111"),
-        "Pubkey::default() decodes as the canonical base58 all-zeros key",
-    );
+    // ----- No inferred Outer struct --------------------------------------
+    // The record path no longer infers locals (Recorder-Solana CXP-SOL-2, operator decision 2026-11-12).
+    assert_no_inferred_variables(&doc, &["outer", "inner", "items", "owner"]);
 }
 
 // ===========================================================================
@@ -2885,10 +2739,10 @@ fn test_result_error_propagation_test_via_ct_print_full() {
 // uses.  The fixture lifts each iterator chain into its own helper
 // (`count_signers` / `sum_lamports`) and the per-iteration logger
 // into `log_account` so the recorder's existing call-frame
-// resolution surfaces each as a balanced Call/Return pair, and so
-// the source-driven `msg!` substituter can resolve `i` /
-// `account_lamports` against the helper's `r1` / `r2` calling
-// convention.
+// resolution surfaces each as a balanced Call/Return pair.  The
+// `msg!` payloads are the literal format strings: the record path no
+// longer infers locals such as `i` / `account_lamports`
+// (Recorder-Solana CXP-SOL-2, operator decision 2026-11-12).
 
 fn iterator_closures_snapshots() -> (Vec<RegisterSnapshot>, Vec<(u64, &'static str, u32)>) {
     // process_instruction body lives at lines 64..71:
@@ -3050,21 +2904,21 @@ fn test_iterator_closures_test_via_ct_print_full() {
          and the driver exits last",
     );
 
-    // ----- io_event payloads pin the substituted runtime values ------------
-    // log_account's `msg!("account {}: {} lamports", i, account_lamports)`
-    // resolves both args against the helper's parameter env (i → r1,
-    // account_lamports → r2) and substitutes the snapshot register
-    // values at each call site.
+    // ----- io_event payloads are the literal msg! format strings -----------
+    // The record path no longer infers locals (Recorder-Solana CXP-SOL-2,
+    // operator decision 2026-11-12), so log_account's
+    // `msg!("account {}: {} lamports", i, account_lamports)` is recorded
+    // verbatim once per for-loop iteration, never interpolated.
     let contents = observed_io_event_contents(&doc);
     assert_eq!(
         contents,
         vec![
-            "account 0: 100 lamports".to_string(),
-            "account 1: 200 lamports".to_string(),
-            "account 2: 300 lamports".to_string(),
+            "account {}: {} lamports".to_string(),
+            "account {}: {} lamports".to_string(),
+            "account {}: {} lamports".to_string(),
         ],
-        "io_event payloads must contain the substituted (i, lamports) \
-         pair from each for-loop iteration's log_account call",
+        "io_event payloads must be the literal format string from each \
+         for-loop iteration's log_account call",
     );
 }
 
@@ -3075,11 +2929,11 @@ fn test_iterator_closures_test_via_ct_print_full() {
 // Canonical Solana sysvar-fetch idioms (`Clock::get()` /
 // `Rent::get()`).  Each fetch surfaces as a balanced Call/Return
 // pair through dedicated `fetch_clock_sysvar` / `fetch_rent_sysvar`
-// helpers, and each subsequent let-binding stitches a typed
-// struct-literal local (`Clock { unix_timestamp, slot, epoch }` /
-// `Rent { lamports_per_byte_year, exemption_threshold }`) the
-// strict pin asserts on by `type_name` plus per-field positional
-// value.
+// helpers.  The subsequent struct-literal let-bindings
+// (`Clock { .. }` / `Rent { .. }`) are NOT inferred as locals and the
+// `msg!` payloads are the literal format strings: the record path no
+// longer infers locals (Recorder-Solana CXP-SOL-2, operator decision
+// 2026-11-12).
 
 fn sysvar_clock_rent_snapshots() -> (Vec<RegisterSnapshot>, Vec<(u64, &'static str, u32)>) {
     // process_instruction body lives at lines 63..72:
@@ -3212,109 +3066,21 @@ fn test_sysvar_clock_rent_test_via_ct_print_full() {
         ],
     );
 
-    // ----- io_event payloads pin the substituted runtime values ------------
+    // ----- io_event payloads are the literal msg! format strings -----------
     let contents = observed_io_event_contents(&doc);
     assert_eq!(
         contents,
         vec![
-            "clock unix_timestamp=1700000000".to_string(),
-            "rent lamports_per_byte_year=3480".to_string(),
+            "clock unix_timestamp={}".to_string(),
+            "rent lamports_per_byte_year={}".to_string(),
         ],
     );
 
-    // ----- `clock` surfaces as a typed Clock Struct ------------------------
-    // The struct-literal RHS at line 65 decodes through
-    // `parse_struct_literal_rich` so the local surfaces with a
-    // `type_name` of `Clock` and the three Int field values from the
-    // literal (unix_timestamp, slot, epoch in source order).
-    let step_events: Vec<&serde_json::Value> =
-        events.iter().filter(|e| e["kind"] == "step").collect();
-    // Type-name lookup: the JSON document's `types` array is indexed by
-    // type_id (the `lang_type` field of each `TypeRecord`).  Struct
-    // variables are routed through the writer's CBOR path which
-    // assigns the variable record itself a typeId of 0 (the actual
-    // type lives in the encoded value), so the strict pin reads the
-    // Struct's type via `value.type_id` → `types[type_id]` rather
-    // than the variable record's outer `type_name`.
-    let types_table: Vec<&str> = doc["types"]
-        .as_array()
-        .expect("types array")
-        .iter()
-        .map(|v| v.as_str().expect("types entry must be a string"))
-        .collect();
-    let clock_step = step_events
-        .iter()
-        .find(|s| {
-            s["vars"]
-                .as_array()
-                .map(|vars| vars.iter().any(|v| v["varname"].as_str() == Some("clock")))
-                .unwrap_or(false)
-        })
-        .expect("a step event must surface `clock` as a typed local");
-    let clock_var = clock_step["vars"]
-        .as_array()
-        .expect("clock step vars")
-        .iter()
-        .find(|v| v["varname"].as_str() == Some("clock"))
-        .expect("clock var");
-    let clock_value = &clock_var["value"];
-    assert_eq!(clock_value["kind"].as_str(), Some("Struct"));
-    let clock_type_id = clock_value["type_id"]
-        .as_u64()
-        .expect("Clock value.type_id") as usize;
-    assert_eq!(
-        types_table.get(clock_type_id).copied(),
-        Some("Clock"),
-        "the struct literal at line 65 must register a `Clock` type",
-    );
-    let clock_fields = clock_value["field_values"]
-        .as_array()
-        .expect("Clock.field_values array");
-    let clock_ints: Vec<i64> = clock_fields
-        .iter()
-        .map(|e| e["i"].as_i64().expect("Clock field must be Int.i"))
-        .collect();
-    assert_eq!(
-        clock_ints,
-        vec![1700000000, 200000000, 500],
-        "Clock fields in source order: unix_timestamp, slot, epoch",
-    );
-
-    // ----- `rent` surfaces as a typed Rent Struct --------------------------
-    let rent_step = step_events
-        .iter()
-        .find(|s| {
-            s["vars"]
-                .as_array()
-                .map(|vars| vars.iter().any(|v| v["varname"].as_str() == Some("rent")))
-                .unwrap_or(false)
-        })
-        .expect("a step event must surface `rent` as a typed local");
-    let rent_var = rent_step["vars"]
-        .as_array()
-        .expect("rent step vars")
-        .iter()
-        .find(|v| v["varname"].as_str() == Some("rent"))
-        .expect("rent var");
-    let rent_value = &rent_var["value"];
-    assert_eq!(rent_value["kind"].as_str(), Some("Struct"));
-    let rent_type_id = rent_value["type_id"].as_u64().expect("Rent value.type_id") as usize;
-    assert_eq!(
-        types_table.get(rent_type_id).copied(),
-        Some("Rent"),
-        "the struct literal at line 67 must register a `Rent` type",
-    );
-    let rent_fields = rent_value["field_values"]
-        .as_array()
-        .expect("Rent.field_values array");
-    let rent_ints: Vec<i64> = rent_fields
-        .iter()
-        .map(|e| e["i"].as_i64().expect("Rent field must be Int.i"))
-        .collect();
-    assert_eq!(
-        rent_ints,
-        vec![3480, 2],
-        "Rent fields in source order: lamports_per_byte_year, exemption_threshold",
+    // ----- No inferred Clock / Rent struct locals --------------------------
+    // The record path no longer infers locals (Recorder-Solana CXP-SOL-2, operator decision 2026-11-12).
+    assert_no_inferred_variables(
+        &doc,
+        &["clock", "rent", "unix_timestamp", "lamports_per_byte_year"],
     );
 }
 
@@ -3439,7 +3205,9 @@ fn test_declare_id_entrypoint_test_via_ct_print_full() {
     let contents = observed_io_event_contents(&doc);
     assert_eq!(
         contents,
-        vec!["processing instruction with value=7".to_string()],
+        // Literal format string: the record path no longer infers locals
+        // (Recorder-Solana CXP-SOL-2, operator decision 2026-11-12).
+        vec!["processing instruction with value={}".to_string()],
         "the only io_event must be the `msg!` from line 66 — neither \
          `declare_id!` nor `entrypoint!` may surface a spurious one",
     );
@@ -3584,16 +3352,13 @@ fn test_sol_log_data_compute_test_via_ct_print_full() {
 // ===========================================================================
 //
 // Exercises the canonical account-data borrow + instruction-data
-// slice-indexing idioms.  After the recorder's
-// `is_borrowed_slice_rhs` extension:
+// slice-indexing idioms:
 //
-//   * `let data = account.try_borrow_data().unwrap();` recognises the
-//     `try_borrow_data(` substring and surfaces `data` as
-//     `Sequence { is_slice: true }`.
-//   * `let prefix = &instruction_data[..32];` and
-//     `let rest = &instruction_data[32..];` recognise the
-//     `&IDENT[range]` slice-indexing shape and surface each as
-//     `Sequence { is_slice: true }`.
+//   * `let data = account.try_borrow_data().unwrap();`,
+//     `let prefix = &instruction_data[..32];` and
+//     `let rest = &instruction_data[32..];` are NOT inferred as
+//     locals: the record path no longer infers locals
+//     (Recorder-Solana CXP-SOL-2, operator decision 2026-11-12).
 //   * `let count = from_le_bytes_u64(&data);` produces a balanced
 //     Call/Return pair through the existing source-driven call-frame
 //     resolver — the helper's `u64::from_le_bytes(...)` body line is
@@ -3733,49 +3498,9 @@ fn test_memory_borrow_test_via_ct_print_full() {
          hasn't been written yet",
     );
 
-    // ----- Borrowed slices surface as Sequence (NOT opaque pointers) ------
-    // Each let-binding in the driver hits the recorder's
-    // `is_borrowed_slice_rhs` recogniser and emits a typed Sequence
-    // (NOT a `Raw` placeholder / `String` pointer).  The Rust→Nim FFI
-    // now threads the `is_slice` flag through
-    // `ct_value_begin_sequence_with_slice`, so each borrowed-slice
-    // binding surfaces with `is_slice = true` end-to-end.
-    let compounds = observed_compound_vars(&doc);
-    let want_slice_vars = ["data", "prefix", "rest"];
-    for want in want_slice_vars.iter() {
-        let var = compounds
-            .iter()
-            .find(|(n, _)| n == want)
-            .unwrap_or_else(|| {
-                panic!(
-                    "expected `{want}` to surface as a compound variable; \
-                     got {compounds:?}"
-                )
-            });
-        assert_eq!(
-            var.1["kind"].as_str(),
-            Some("Sequence"),
-            "`{want}` must surface as a Sequence (NOT an opaque \
-             pointer); got {}",
-            var.1
-        );
-        // Pin the sequence has a present (possibly empty) elements
-        // array — this distinguishes Sequence from `Raw` (which has
-        // no `elements` field).
-        assert!(
-            var.1["elements"].is_array(),
-            "`{want}` Sequence must carry an `elements` array; got {}",
-            var.1,
-        );
-        assert_eq!(
-            var.1["is_slice"].as_bool(),
-            Some(true),
-            "`{want}` borrowed-slice Sequence must surface as \
-             is_slice = true (recorder pins borrowed slices to \
-             slice/view semantics); got {}",
-            var.1,
-        );
-    }
+    // ----- No inferred borrowed-slice locals -----------------------------
+    // The record path no longer infers locals (Recorder-Solana CXP-SOL-2, operator decision 2026-11-12).
+    assert_no_inferred_variables(&doc, &["data", "prefix", "rest", "count"]);
 }
 
 // ===========================================================================
