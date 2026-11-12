@@ -201,7 +201,10 @@ fn test_divergence_causes_are_classified_not_merely_counted() {
 
     let verdicts = [
         ("stale prestate", stale_verdict),
-        ("broken VM on the chain's prestate", run(&break_entrypoint(&good)).1),
+        (
+            "broken VM on the chain's prestate",
+            run(&break_entrypoint(&good)).1,
+        ),
         ("both defects", run(&break_entrypoint(&bundle)).1),
         ("neither (control)", run(&good).1),
     ];
@@ -217,7 +220,10 @@ fn test_divergence_causes_are_classified_not_merely_counted() {
             None,
         ],
         "{:?}",
-        verdicts.iter().map(|(n, v)| (n, &v.status, &v.cause)).collect::<Vec<_>>()
+        verdicts
+            .iter()
+            .map(|(n, v)| (n, &v.status, &v.cause))
+            .collect::<Vec<_>>()
     );
     // Counted per cause, not as one "divergent" figure.
     let per_cause = |c: Cause| causes.iter().filter(|x| x.as_ref() == Some(&c)).count();
