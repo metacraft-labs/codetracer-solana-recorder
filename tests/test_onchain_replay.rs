@@ -186,12 +186,14 @@ fn test_the_vm_path_test_fails_when_the_vm_path_breaks() {
 ///   already on the stack.
 /// * `v0-custom-error` is a v0 message that FAILED on chain with the program's
 ///   own error (`Custom(5)` in instruction 3), kept by a later capture.
+/// * `cpi-depth3` is a v0 message whose invocations nest three deep.
 #[test]
 fn test_the_pinned_corpus_replays_to_match() {
     for name in [
         "failed-compute-exhausted",
         "cpi-reentrant",
         "v0-custom-error",
+        "cpi-depth3",
     ] {
         let bundle = fixture(name);
         let (_, verdict) = run(&bundle);
