@@ -174,6 +174,48 @@ fn test_the_vm_path_test_fails_when_the_vm_path_breaks() {
     assert_eq!(verdict.cause, Some(Cause::Execution));
 }
 
+/// Recorder-Solana CXP-SOL-4's divergence corpus, two cells the published
+/// window does not reach, each a bundle a live forward capture kept on
+/// 2026-11-12 with the exact prestate it held, so neither is patched:
+///
+/// * `failed-compute-exhausted` FAILED on chain (`ComputationalBudgetExceeded`).
+///   A failed transaction still pays its fee. LiteSVM 0.18 withdraws it, and
+///   the engine used to withdraw it again, so the payer came back short by
+///   exactly the fee, and every failed mainnet transaction was `divergent`.
+/// * `cpi-reentrant` invokes another program at depth 2 while a program is
+///   already on the stack.
+#[test]
+fn test_the_pinned_corpus_replays_to_match() {
+    for name in ["failed-compute-exhausted", "cpi-reentrant"] {
+        let bundle = fixture(name);
+        let (_, verdict) = run(&bundle);
+        assert_eq!(verdict.status, Status::Match, "{name}: {:?}", verdict.facts);
+        assert!(verdict.cause.is_none(), "{name}");
+    }
+    // The fee, paid once, read off the chain's own record rather than restated.
+    let bundle = fixture("failed-compute-exhausted");
+    let (exec, _) = run(&bundle);
+    let meta = bundle.transactions[0].meta.as_ref().unwrap();
+    assert!(
+        exec.error.is_some(),
+        "the transaction failed on chain and must fail here"
+    );
+    let chain_post = meta["postBalances"][0].as_u64().unwrap();
+    let chain_pre = meta["preBalances"][0].as_u64().unwrap();
+    let fee = meta["fee"].as_u64().unwrap();
+    assert_eq!(
+        chain_pre - chain_post,
+        fee,
+        "on chain the payer paid the fee and nothing else"
+    );
+    let ours = exec.post_accounts[0].as_ref().map(|a| a.lamports);
+    assert_eq!(
+        ours,
+        Some(chain_post),
+        "the replay's payer after the failure"
+    );
+}
+
 /// Recorder-Solana CXP-SOL-4: a prestate-caused and an execution-caused
 /// divergence are told apart in ONE run, and counted per cause. The two
 /// injections are the two defects the arms above inject separately: the head

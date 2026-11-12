@@ -354,6 +354,12 @@ impl Replay {
     /// a program cannot be loaded for tracing at all; it is recorded as
     /// unloadable and every transaction naming it is refused with that reason,
     /// rather than the whole replay aborting. Returns whether it was set.
+    ///
+    /// A loader ERROR is treated the same way. On 2026-11-12 an executable the
+    /// loader rejected with `InvalidAccountData` ended a whole mainnet capture
+    /// through `?`. That is the shape of an upgradeable program set before its
+    /// programdata is held, and the reload in `add_accounts` sets it again once the
+    /// programdata arrives, which clears the mark.
     fn set_guarded(&mut self, key: Address, account: Account) -> Result<bool> {
         if !account.executable {
             self.svm
@@ -365,12 +371,11 @@ impl Replay {
         match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
             svm.set_account(key, account)
         })) {
-            Ok(r) => {
-                r.map_err(|e| eyre!("program {key}: {e:?}"))?;
+            Ok(Ok(())) => {
                 self.unloadable.remove(&key);
                 Ok(true)
             }
-            Err(_) => {
+            Ok(Err(_)) | Err(_) => {
                 self.unloadable.insert(key);
                 Ok(false)
             }
@@ -708,16 +713,24 @@ impl Replay {
             Err(failed) => (Some(failed.err), failed.meta),
         };
 
-        // A failed transaction is not committed by LiteSVM, but on chain it
-        // still pays its fee: the fee payer (key 0) is debited, nothing else
-        // changes. Apply exactly that, so the next transaction sees the chain's
-        // state rather than the simulator's.
+        // A failed transaction still pays its fee on chain: the fee payer
+        // (key 0) is debited and nothing else changes. LiteSVM 0.18 already
+        // withdraws that fee itself on failure, and an earlier LiteSVM did
+        // not; debiting it unconditionally here charged it twice, which the
+        // divergence check caught as the payer's postBalance short by exactly
+        // the fee (four failed mainnet transactions, 2026-11-12). So measure
+        // what the simulator took from the payer's balance before the
+        // transaction, and debit only what is still owed.
         if error.is_some() && meta.fee > 0 {
-            if let Some(mut payer) = self.svm.get_account(&keys[0]) {
-                payer.lamports = payer.lamports.saturating_sub(meta.fee);
-                self.svm
-                    .set_account(keys[0], payer)
-                    .map_err(|e| eyre!("fee payer: {e:?}"))?;
+            let before = pre_accounts[0].as_ref().map(|a| a.lamports);
+            if let (Some(before), Some(mut payer)) = (before, self.svm.get_account(&keys[0])) {
+                let taken = before.saturating_sub(payer.lamports);
+                if taken < meta.fee {
+                    payer.lamports = payer.lamports.saturating_sub(meta.fee - taken);
+                    self.svm
+                        .set_account(keys[0], payer)
+                        .map_err(|e| eyre!("fee payer: {e:?}"))?;
+                }
             }
         }
 
