@@ -357,6 +357,60 @@ fn step_paths_are_the_real_source_files() {
     }
 }
 
+/// The copy `cargo build-sbf` deploys -- `target/deploy/<name>.so`, which its
+/// output names and which has been through `llvm-objcopy --strip-all` -- is
+/// recorded at the source level too: the recorder reads the debug info from
+/// the unstripped build of the same code next to it, so the recording has the
+/// same source steps as one made from the unstripped ELF.
+#[test]
+fn the_stripped_deploy_copy_records_the_same_source_steps() {
+    let rec = recording();
+    let deployed = rec
+        .crate_dir
+        .join("target")
+        .join("deploy")
+        .join(format!("{CRATE_NAME}.so"));
+    assert!(deployed.is_file(), "cargo-build-sbf wrote no deploy copy at {}", deployed.display());
+    assert!(
+        std::fs::metadata(&deployed).unwrap().len() < std::fs::metadata(&rec.elf).unwrap().len(),
+        "the deploy copy is expected to be the stripped one"
+    );
+
+    let out_dir = rec.crate_dir.join("deploy-trace");
+    let record = Command::new(env!("CARGO_BIN_EXE_codetracer-solana-recorder"))
+        .arg("record")
+        .arg(&deployed)
+        .arg("--out-dir")
+        .arg(&out_dir)
+        .output()
+        .expect("run the recorder");
+    assert!(
+        record.status.success(),
+        "recorder failed:\nstdout: {}\nstderr: {}",
+        String::from_utf8_lossy(&record.stdout),
+        String::from_utf8_lossy(&record.stderr)
+    );
+    let trace = DecodedTrace::read(&out_dir);
+
+    let source_steps = |steps: &[Step]| -> Vec<(PathBuf, i64, Option<String>)> {
+        steps
+            .iter()
+            .map(|s| (s.path.clone(), s.line, s.function.clone()))
+            .collect()
+    };
+    let main_rs = fixture_source();
+    assert!(
+        trace.steps.iter().any(|s| s.path == main_rs),
+        "the deploy copy's recording never reaches {}",
+        main_rs.display()
+    );
+    assert_eq!(
+        source_steps(&trace.steps),
+        source_steps(&rec.trace.steps),
+        "the deploy copy and the unstripped build record the same source steps"
+    );
+}
+
 /// The lines recorded in `main.rs` are the program's own lines, in execution
 /// order, each inside the function that contains it.
 #[test]

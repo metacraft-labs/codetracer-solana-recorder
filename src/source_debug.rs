@@ -1125,6 +1125,38 @@ fn parse_dep_info(path: &Path) -> Vec<PathBuf> {
     out
 }
 
+/// Whether an ELF carries a DWARF line table: the `.debug_line` section the
+/// source-level recorder maps every executed address through.
+pub fn has_line_table(elf_data: &[u8]) -> bool {
+    use object::{Object, ObjectSection};
+    object::File::parse(elf_data)
+        .ok()
+        .and_then(|obj| obj.section_by_name(".debug_line").map(|s| s.size() > 0))
+        .unwrap_or(false)
+}
+
+/// The unstripped build of a program `cargo build-sbf` deployed.
+///
+/// `cargo build-sbf` links `target/sbpf-solana-solana/release/<name>.so`
+/// and then writes `target/deploy/<name>.so` through `llvm-objcopy
+/// --strip-all`: the same code at the same addresses, with every debug
+/// section removed. The deploy copy is the one its output names, so it is
+/// the one a user records -- and on its own it maps nothing to source.
+/// This returns the unstripped sibling of a `deploy/` program when one is
+/// there (`sbf-solana-solana` is the triple older toolchains used).
+pub fn unstripped_build_of(elf_path: &Path) -> Option<PathBuf> {
+    let deploy = elf_path.parent()?;
+    if deploy.file_name()? != "deploy" {
+        return None;
+    }
+    let name = elf_path.file_name()?;
+    let target = deploy.parent()?;
+    ["sbpf-solana-solana", "sbf-solana-solana"]
+        .iter()
+        .map(|triple| target.join(triple).join("release").join(name))
+        .find(|candidate| candidate.is_file())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1160,5 +1192,27 @@ mod tests {
             resolver.resolve(Path::new("/x/y.rs"), None),
             PathBuf::from("/x/y.rs")
         );
+    }
+    #[test]
+    fn a_deploy_program_names_its_unstripped_build() {
+        let scratch = tempfile::tempdir().unwrap();
+        let target = scratch.path().join("target");
+        std::fs::create_dir_all(target.join("deploy")).unwrap();
+        std::fs::create_dir_all(target.join("sbpf-solana-solana").join("release")).unwrap();
+        let deployed = target.join("deploy").join("prog.so");
+        let unstripped = target.join("sbpf-solana-solana").join("release").join("prog.so");
+        std::fs::write(&deployed, b"").unwrap();
+        assert_eq!(unstripped_build_of(&deployed), None, "no unstripped build yet");
+        std::fs::write(&unstripped, b"").unwrap();
+        assert_eq!(unstripped_build_of(&deployed), Some(unstripped.clone()));
+        // Only a `deploy/` program has one: the unstripped build itself, or
+        // a program anywhere else, is recorded as given.
+        assert_eq!(unstripped_build_of(&unstripped), None);
+        assert_eq!(unstripped_build_of(&scratch.path().join("prog.so")), None);
+    }
+
+    #[test]
+    fn a_program_without_dwarf_has_no_line_table() {
+        assert!(!has_line_table(b"not an elf"));
     }
 }

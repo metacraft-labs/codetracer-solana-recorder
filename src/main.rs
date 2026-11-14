@@ -342,10 +342,30 @@ fn record(args: RecordArgs) -> Result<()> {
         exec.regs.len() / 96
     );
 
+    // The debug info comes from the program itself, or -- for the stripped
+    // copy `cargo build-sbf` deploys -- from the unstripped build of the
+    // same code next to it.
+    let (debug_data, debug_path) = match codetracer_solana_recorder::source_debug::unstripped_build_of(&elf_path) {
+        Some(unstripped)
+            if !codetracer_solana_recorder::source_debug::has_line_table(&elf_data) =>
+        {
+            eprintln!(
+                "{} carries no debug info (cargo build-sbf strips its deploy copy); \
+                 reading it from the unstripped build {}",
+                elf_path.display(),
+                unstripped.display()
+            );
+            let data = std::fs::read(&unstripped)
+                .with_context(|| format!("failed to read ELF file: {}", unstripped.display()))?;
+            (data, unstripped)
+        }
+        _ => (elf_data.clone(), elf_path.clone()),
+    };
+
     // With DWARF describing the executed code, record at the source level:
     // real files and lines, named locals read through their DWARF
     // locations, and function frames.
-    match codetracer_solana_recorder::source_debug::SourceDebugInfo::load(&elf_data, &elf_path) {
+    match codetracer_solana_recorder::source_debug::SourceDebugInfo::load(&debug_data, &debug_path) {
         Ok(debug)
             if codetracer_solana_recorder::source_recorder::describes_execution(&debug, &exec) =>
         {
@@ -363,7 +383,7 @@ fn record(args: RecordArgs) -> Result<()> {
                 );
             }
             codetracer_solana_recorder::recorder::record_from_traces(
-                &exec.regs, &elf_data, &elf_path, &out_dir,
+                &exec.regs, &debug_data, &elf_path, &out_dir,
             )?;
         }
     }
