@@ -128,6 +128,9 @@ pub struct ExecutionTrace {
     pub initial_memory: Vec<(u64, Vec<u8>)>,
     /// Memory written by each syscall invocation, in invocation order.
     pub syscall_writes: Vec<Vec<(u64, Vec<u8>)>>,
+    /// Each syscall invocation (name and what it logged), in the same order
+    /// as `syscall_writes`: what `msg!` printed is here.
+    pub syscall_log: Vec<crate::syscalls::SyscallLogEntry>,
     /// Whether the program's SBPF version uses the relocated memory
     /// instruction classes (SBPF v2+).
     pub moved_memory_instructions: bool,
@@ -258,11 +261,13 @@ pub fn execute_with_memory_trace(elf_data: &[u8], compute_budget: u64) -> Result
     drop(vm);
 
     let syscall_writes = context.syscall_state.mem_writes.take();
+    let syscall_log = context.syscall_state.log.take();
     Ok(ExecutionTrace {
         regs: regs_data,
         text: executable.get_text_bytes().1.to_vec(),
         initial_memory,
         syscall_writes,
+        syscall_log,
         moved_memory_instructions: sbpf_version.move_memory_instruction_classes(),
         manual_stack_frames: sbpf_version.manual_stack_frame_bump(),
     })

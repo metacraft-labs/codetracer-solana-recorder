@@ -220,6 +220,10 @@ impl SourceDebugInfo {
             type_ids: HashMap::new(),
             functions: Vec::new(),
             rows: Vec::new(),
+            unit_crate: None,
+            text_start: text_vaddr,
+            unit_index: 0,
+            pending_files: Vec::new(),
         };
 
         let mut units = dwarf.units();
@@ -522,6 +526,21 @@ struct Builder<'a> {
     type_ids: HashMap<usize, TypeRef>,
     functions: Vec<Function>,
     rows: Vec<LineRow>,
+    /// The crate the unit being read was compiled from (see
+    /// [`unit_crate_name`]).
+    unit_crate: Option<String>,
+    /// Where `.text` starts. The linker's `--gc-sections` leaves the DWARF of
+    /// every function it discarded in place, at address 0 (a "tombstone");
+    /// in a program with dependencies thousands of such line sequences and
+    /// scopes start below `.text` and run over the real code, so an address
+    /// was matched to a discarded function of another crate.
+    text_start: u64,
+    /// Units read so far: a path left relative is kept apart per unit.
+    unit_index: usize,
+    /// Files of the current unit whose relative path matched no single file
+    /// (file id, the path the line table names), settled once the unit's
+    /// functions are known (see `settle_ambiguous_files`).
+    pending_files: Vec<(usize, PathBuf)>,
 }
 
 impl Builder<'_> {
@@ -529,14 +548,23 @@ impl Builder<'_> {
         let comp_dir = unit
             .comp_dir
             .map(|d| PathBuf::from(d.to_string_lossy().into_owned()));
+        self.unit_crate = unit
+            .name
+            .and_then(|n| unit_crate_name(&n.to_string_lossy()).map(str::to_string));
+        self.unit_index += 1;
+        let first_function = self.functions.len();
         // Line-table file index -> resolved path id.
         let mut file_map: HashMap<u64, usize> = HashMap::new();
         if let Some(program) = unit.line_program.clone() {
             let header = program.header().clone();
             let mut rows = program.rows();
             let mut current: Option<(u64, Option<SourcePosition>)> = None;
+            // The rows of the sequence being read, and where it started: a
+            // sequence that starts below `.text` describes discarded code.
+            let mut sequence: Option<(usize, u64)> = None;
             while let Some((_, row)) = rows.next_row()? {
                 let addr = row.address();
+                let (first_row, sequence_start) = *sequence.get_or_insert((self.rows.len(), addr));
                 if let Some((start, position)) = current.take()
                     && addr > start
                 {
@@ -547,6 +575,10 @@ impl Builder<'_> {
                     });
                 }
                 if row.end_sequence() {
+                    if sequence_start < self.text_start {
+                        self.rows.truncate(first_row);
+                    }
+                    sequence = None;
                     continue;
                 }
                 let file = self.file_id(
@@ -580,7 +612,63 @@ impl Builder<'_> {
             comp_dir: comp_dir.as_deref(),
         };
         self.walk(&ctx, root, &mut file_map)?;
+        self.settle_ambiguous_files(first_function);
         Ok(())
+    }
+
+    /// A unit's relative paths that name no single file. Code a macro
+    /// expanded is described in the file the macro was written in: the
+    /// `entrypoint` function `entrypoint!` generates in the program's own
+    /// unit is declared in `solana-program-entrypoint`'s `src/lib.rs`, named
+    /// there only `src/lib.rs`, a path every crate has. Of the files the
+    /// build compiled (its dep-info), the one meant is the one in which the
+    /// unit's functions declared in that file are written at their
+    /// declared lines.
+    fn settle_ambiguous_files(&mut self, first_function: usize) {
+        for (id, path) in std::mem::take(&mut self.pending_files) {
+            let candidates = self.resolver.compiled_sources_ending_with(&path);
+            let declared: Vec<(u32, String)> = self.functions[first_function..]
+                .iter()
+                .flat_map(|f| {
+                    let mut out = vec![(f.decl_file, f.decl_line, f.name.clone())];
+                    collect_inlined(&f.body, &mut out);
+                    out
+                })
+                .filter(|(file, line, _)| *file == Some(id) && *line > 0)
+                .map(|(_, line, name)| (line, name))
+                .collect();
+            // How many of the unit's functions declared in this file are
+            // written, at their declared lines, in `candidate`.
+            let score = |candidate: &PathBuf| -> usize {
+                let Ok(text) = std::fs::read_to_string(candidate) else {
+                    return 0;
+                };
+                let lines: Vec<&str> = text.lines().collect();
+                declared
+                    .iter()
+                    .filter(|(line, name)| {
+                        lines
+                            .get(*line as usize - 1)
+                            .is_some_and(|l| l.contains(&format!("fn {}", short_function_name(name))))
+                    })
+                    .count()
+            };
+            let chosen: Vec<&PathBuf> = if candidates.len() == 1 {
+                candidates.iter().collect()
+            } else {
+                let scored: Vec<(usize, &PathBuf)> =
+                    candidates.iter().map(|c| (score(c), c)).collect();
+                let best = scored.iter().map(|(n, _)| *n).max().unwrap_or(0);
+                if best == 0 {
+                    Vec::new()
+                } else {
+                    scored.iter().filter(|(n, _)| *n == best).map(|(_, c)| *c).collect()
+                }
+            };
+            if let [only] = chosen.as_slice() {
+                self.files[id] = (*only).clone();
+            }
+        }
     }
 
     fn file_id(
@@ -607,7 +695,20 @@ impl Builder<'_> {
             .map(|d| d.to_string_lossy().into_owned())
             .unwrap_or_default();
         let joined = Path::new(&dir).join(&name);
-        let resolved = self.resolver.resolve(&joined, comp_dir);
+        let resolved = self
+            .resolver
+            .resolve_in_crate(&joined, comp_dir, self.unit_crate.as_deref());
+        if resolved.is_relative() {
+            // Not settled yet: an id of this unit's own, so the same relative
+            // path in another unit (another crate's `src/lib.rs`) stays apart.
+            self.files.push(resolved.clone());
+            let id = self.files.len() - 1;
+            self.file_ids
+                .insert(PathBuf::from(format!("{}\u{0}{}", resolved.display(), self.unit_index)), id);
+            self.pending_files.push((id, joined));
+            file_map.insert(index, id);
+            return Some(id);
+        }
         let id = match self.file_ids.get(&resolved) {
             Some(id) => *id,
             None => {
@@ -774,7 +875,9 @@ impl Builder<'_> {
         let mut out = Vec::new();
         let mut iter = self.dwarf.die_ranges(unit, entry)?;
         while let Some(r) = iter.next()? {
-            if r.end > r.begin {
+            // Below `.text`: a function the linker discarded (see
+            // `text_start`).
+            if r.end > r.begin && r.begin >= self.text_start {
                 out.push(r.begin..r.end);
             }
         }
@@ -1042,6 +1145,11 @@ impl Scope {
 pub struct PathResolver {
     dep_info_sources: Vec<PathBuf>,
     crate_dirs: Vec<PathBuf>,
+    /// Cargo's `deps/` directory beside the ELF: one dep-info file per
+    /// compiled crate (`<crate>-<hash>.d`), each listing that crate's
+    /// sources by absolute path.
+    deps_dir: Option<PathBuf>,
+    compiled_sources: Vec<PathBuf>,
 }
 
 impl PathResolver {
@@ -1058,14 +1166,84 @@ impl PathResolver {
             .filter(|a| a.join("Cargo.toml").is_file())
             .map(Path::to_path_buf)
             .collect();
+        let deps_dir = elf_path
+            .parent()
+            .map(|d| d.join("deps"))
+            .filter(|d| d.is_dir());
+        let compiled_sources = deps_dir
+            .iter()
+            .flat_map(|d| std::fs::read_dir(d).into_iter().flatten().flatten())
+            .map(|e| e.path())
+            .filter(|p| p.extension().is_some_and(|x| x == "d"))
+            .flat_map(|d| parse_dep_info(&d))
+            .filter(|p| p.is_absolute())
+            .collect::<std::collections::BTreeSet<_>>()
+            .into_iter()
+            .collect();
         Self {
             dep_info_sources,
             crate_dirs,
+            deps_dir,
+            compiled_sources,
         }
+    }
+
+    /// Every file of every crate the build compiled (its `deps/` dep-info)
+    /// whose path ends with `path`.
+    pub fn compiled_sources_ending_with(&self, path: &Path) -> Vec<PathBuf> {
+        self.compiled_sources
+            .iter()
+            .filter(|p| p.ends_with(path))
+            .cloned()
+            .collect()
+    }
+
+    /// [`resolve`](Self::resolve) for a path the line table of a unit of
+    /// `crate_name` names.  A dependency's files (the `entrypoint!` code of
+    /// `solana-program-entrypoint`, say) are relative to that crate's own
+    /// root, which no recorded compilation directory names; the crate's
+    /// dep-info file in `deps/` lists them by absolute path.
+    pub fn resolve_in_crate(
+        &self,
+        path: &Path,
+        comp_dir: Option<&Path>,
+        crate_name: Option<&str>,
+    ) -> PathBuf {
+        if path.is_absolute() || comp_dir.is_some_and(|d| !d.as_os_str().is_empty()) {
+            return self.resolve(path, comp_dir);
+        }
+        if let (Some(name), Some(deps)) = (crate_name, &self.deps_dir) {
+            let prefix = format!("{name}-");
+            let mut found: Vec<PathBuf> = std::fs::read_dir(deps)
+                .into_iter()
+                .flatten()
+                .flatten()
+                .map(|e| e.path())
+                .filter(|p| {
+                    p.extension().is_some_and(|x| x == "d")
+                        && p.file_name()
+                            .and_then(|n| n.to_str())
+                            .is_some_and(|n| n.starts_with(&prefix))
+                })
+                .flat_map(|d| parse_dep_info(&d))
+                .filter(|src| src.is_absolute() && src.ends_with(path))
+                .collect();
+            found.sort();
+            found.dedup();
+            if found.len() == 1 {
+                return found.remove(0);
+            }
+        }
+        self.resolve(path, comp_dir)
     }
 
     pub fn resolve(&self, path: &Path, comp_dir: Option<&Path>) -> PathBuf {
         if path.is_absolute() {
+            if !path.exists()
+                && let Some(local) = platform_tools_library_source(path)
+            {
+                return local;
+            }
             return path.to_path_buf();
         }
         if let Some(dir) = comp_dir.filter(|d| !d.as_os_str().is_empty()) {
@@ -1086,6 +1264,65 @@ impl PathResolver {
         }
         path.to_path_buf()
     }
+}
+
+/// Where Solana's platform tools build their Rust standard library: the
+/// path its DWARF names for `core`, `alloc` and `std` sources.
+const PLATFORM_TOOLS_LIBRARY: &str = "/home/runner/work/platform-tools/platform-tools/out/rust/library";
+
+/// The local copy of a standard-library file the platform tools' DWARF names
+/// by its build machine's path: the `rust-src` the platform tools ship
+/// (`<platform-tools>/rust/lib/rustlib/src/rust/library`), in
+/// `$CODETRACER_SOLANA_PLATFORM_TOOLS` or where `cargo-build-sbf` installs
+/// them (`~/.cache/solana/v*/platform-tools`, newest first).
+fn platform_tools_library_source(path: &Path) -> Option<PathBuf> {
+    let rest = path.strip_prefix(PLATFORM_TOOLS_LIBRARY).ok()?;
+    let mut roots: Vec<PathBuf> = Vec::new();
+    if let Some(dir) = std::env::var_os("CODETRACER_SOLANA_PLATFORM_TOOLS") {
+        roots.push(PathBuf::from(dir));
+    }
+    if let Some(home) = std::env::var_os("HOME") {
+        let cache = PathBuf::from(home).join(".cache").join("solana");
+        let mut versions: Vec<PathBuf> = std::fs::read_dir(&cache)
+            .into_iter()
+            .flatten()
+            .flatten()
+            .map(|e| e.path().join("platform-tools"))
+            .filter(|p| p.is_dir())
+            .collect();
+        versions.sort();
+        roots.extend(versions.into_iter().rev());
+    }
+    roots
+        .into_iter()
+        .map(|root| root.join("rust/lib/rustlib/src/rust/library").join(rest))
+        .find(|candidate| candidate.is_file())
+}
+
+/// The inlined calls under `scope`, as (declared file, line, name).
+fn collect_inlined(scope: &Scope, out: &mut Vec<(Option<usize>, u32, String)>) {
+    for child in &scope.children {
+        if let Some(call) = &child.inlined {
+            out.push((call.decl_file, call.decl_line, call.name.clone()));
+        }
+        collect_inlined(child, out);
+    }
+}
+
+/// A function's name as written after `fn`: the last path segment, without
+/// generic arguments (`solana_program_entrypoint::deserialize<'a>` ->
+/// `deserialize`).
+fn short_function_name(name: &str) -> &str {
+    let base = name.split('<').next().unwrap_or(name);
+    base.rsplit("::").next().unwrap_or(base)
+}
+
+/// The crate a Rust compilation unit belongs to, from its `DW_AT_name`
+/// (`src/lib.rs/@/solana_program_entrypoint.8fe03ffc92028cc4-cgu.0`).
+fn unit_crate_name(unit_name: &str) -> Option<&str> {
+    let (_, cgu) = unit_name.rsplit_once("/@/")?;
+    let (name, _) = cgu.split_once('.')?;
+    (!name.is_empty()).then_some(name)
 }
 
 /// Absolute source paths listed in a Makefile-style dep-info file.
@@ -1214,5 +1451,51 @@ mod tests {
     #[test]
     fn a_program_without_dwarf_has_no_line_table() {
         assert!(!has_line_table(b"not an elf"));
+    }
+
+    #[test]
+    fn a_dependency_s_relative_file_resolves_through_its_crate_s_dep_info() {
+        let dir = tempfile::tempdir().unwrap();
+        // Two crates with a `src/lib.rs`: the program's dependency and an
+        // unrelated one. The unit names which crate a path belongs to.
+        let entry = dir.path().join("registry").join("solana-program-entrypoint-2.3.0");
+        let other = dir.path().join("registry").join("log-0.4.27");
+        for c in [&entry, &other] {
+            std::fs::create_dir_all(c.join("src")).unwrap();
+            std::fs::write(c.join("src").join("lib.rs"), "").unwrap();
+        }
+        let release = dir.path().join("target").join("release");
+        std::fs::create_dir_all(release.join("deps")).unwrap();
+        for (crate_name, root) in [("solana_program_entrypoint", &entry), ("log", &other)] {
+            let d = release.join("deps").join(format!("{crate_name}-0123456789abcdef.d"));
+            std::fs::write(&d, format!("{}: {}\n", d.display(), root.join("src/lib.rs").display()))
+                .unwrap();
+        }
+        let elf = release.join("prog.so");
+        std::fs::write(&elf, b"").unwrap();
+        let resolver = PathResolver::new(&elf);
+        let unit = "src/lib.rs/@/solana_program_entrypoint.8fe03ffc92028cc4-cgu.0";
+        assert_eq!(unit_crate_name(unit), Some("solana_program_entrypoint"));
+        assert_eq!(
+            resolver.resolve_in_crate(Path::new("src/lib.rs"), None, unit_crate_name(unit)),
+            entry.join("src").join("lib.rs")
+        );
+        assert_eq!(
+            resolver.resolve_in_crate(Path::new("src/lib.rs"), None, Some("log")),
+            other.join("src").join("lib.rs")
+        );
+    }
+
+    #[test]
+    fn a_standard_library_file_resolves_to_the_platform_tools_rust_src() {
+        let tools = tempfile::tempdir().unwrap();
+        let fmt = tools.path().join("rust/lib/rustlib/src/rust/library/core/src/fmt");
+        std::fs::create_dir_all(&fmt).unwrap();
+        std::fs::write(fmt.join("mod.rs"), "").unwrap();
+        // SAFETY: tests in this module do not read this variable concurrently.
+        unsafe { std::env::set_var("CODETRACER_SOLANA_PLATFORM_TOOLS", tools.path()) };
+        let built = Path::new(PLATFORM_TOOLS_LIBRARY).join("core/src/fmt/mod.rs");
+        assert_eq!(platform_tools_library_source(&built), Some(fmt.join("mod.rs")));
+        assert_eq!(platform_tools_library_source(Path::new("/elsewhere/core/src/fmt/mod.rs")), None);
     }
 }

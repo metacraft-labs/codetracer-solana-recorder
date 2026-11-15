@@ -20,7 +20,8 @@ use std::collections::HashMap;
 use std::path::Path;
 
 use codetracer_trace_types::{
-    FieldTypeRecord, Line, NONE_VALUE, TypeId, TypeKind, TypeRecord, TypeSpecificInfo, ValueRecord,
+    EventLogKind, FieldTypeRecord, Line, NONE_VALUE, TypeId, TypeKind, TypeRecord, TypeSpecificInfo,
+    ValueRecord,
 };
 use codetracer_trace_writer_nim::trace_writer::TraceWriter;
 use codetracer_trace_writer_nim::{TraceEventsFileFormat, create_trace_writer};
@@ -141,6 +142,7 @@ impl SourceRecorder<'_> {
         let mut memory =
             ShadowMemory::new(exec.initial_memory.clone(), exec.moved_memory_instructions);
         let mut syscall_writes = exec.syscall_writes.iter();
+        let mut syscall_log = exec.syscall_log.iter();
         let mut stack: Vec<ActiveFrame> = Vec::new();
         let mut last_position: Option<(usize, u32, Option<u32>)> = None;
 
@@ -252,6 +254,19 @@ impl SourceRecorder<'_> {
                 if next_continues && let Some(writes) = syscall_writes.next() {
                     for (at, bytes) in writes {
                         memory.write(*at, bytes);
+                    }
+                    // What the program logged (`msg!`, `sol_log_64` ...) is
+                    // its output: an event at the step that made the call,
+                    // as the register-trace recorder writes it.
+                    if let Some(entry) = syscall_log.next()
+                        && entry.name.starts_with("sol_log")
+                    {
+                        TraceWriter::register_special_event(
+                            self.writer,
+                            EventLogKind::Write,
+                            "SolanaMsg",
+                            &entry.payload,
+                        );
                     }
                 }
             }
