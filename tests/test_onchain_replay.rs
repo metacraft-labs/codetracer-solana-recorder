@@ -187,6 +187,10 @@ fn test_the_vm_path_test_fails_when_the_vm_path_breaks() {
 /// * `v0-custom-error` is a v0 message that FAILED on chain with the program's
 ///   own error (`Custom(5)` in instruction 3), kept by a later capture.
 /// * `cpi-depth3` is a v0 message whose invocations nest three deep.
+/// * `precompile-ed25519` is a v1 message that alternates the Ed25519
+///   signature-verify precompile with the program it vouches for, three times.
+///   A precompile writes no `invoke` log, so the replay's own instruction list
+///   is what shows it ran.
 #[test]
 fn test_the_pinned_corpus_replays_to_match() {
     for name in [
@@ -194,12 +198,20 @@ fn test_the_pinned_corpus_replays_to_match() {
         "cpi-reentrant",
         "v0-custom-error",
         "cpi-depth3",
+        "precompile-ed25519",
     ] {
         let bundle = fixture(name);
         let (_, verdict) = run(&bundle);
         assert_eq!(verdict.status, Status::Match, "{name}: {:?}", verdict.facts);
         assert!(verdict.cause.is_none(), "{name}");
     }
+    let (exec, _) = run(&fixture("precompile-ed25519"));
+    let ran = exec
+        .instructions
+        .iter()
+        .filter(|i| i.program_id == "Ed25519SigVerify111111111111111111111111111")
+        .count();
+    assert_eq!(ran, 3, "the precompile runs once per signed instruction");
     // The fee, paid once, read off the chain's own record rather than restated.
     let bundle = fixture("failed-compute-exhausted");
     let (exec, _) = run(&bundle);
