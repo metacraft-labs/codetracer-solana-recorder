@@ -860,6 +860,7 @@ dependencies = [
  "codetracer_trace_types",
  "codetracer_trace_writer_nim",
  "eyre",
+ "flate2",
  "gimli",
  "litesvm",
  "object",

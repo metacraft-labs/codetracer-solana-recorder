@@ -31,10 +31,21 @@ use codetracer_solana_recorder::onchain::engine::{Replay, TxExecution, TxOutcome
 use codetracer_solana_recorder::onchain::oracle::{self, Cause, Status, Verdict};
 
 fn fixture(name: &str) -> ReplayBundle {
-    let path = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-        .join("tests/fixtures/onchain")
-        .join(format!("{name}.bundle.json"));
-    read_bundle(&path).expect("fixture bundle reads")
+    let dir = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/onchain");
+    // A bundle over the 1024 KB commit ceiling (a large program's code) is
+    // committed gzipped, and read here exactly as `read_bundle` reads JSON.
+    let gz = dir.join(format!("{name}.bundle.json.gz"));
+    if gz.exists() {
+        use std::io::Read;
+        let mut text = String::new();
+        flate2::read::GzDecoder::new(std::fs::File::open(&gz).expect("fixture opens"))
+            .read_to_string(&mut text)
+            .expect("fixture gunzips");
+        let dest = tempfile::NamedTempFile::new().expect("temp file");
+        std::fs::write(dest.path(), text).expect("temp file writes");
+        return read_bundle(dest.path()).expect("fixture bundle reads");
+    }
+    read_bundle(&dir.join(format!("{name}.bundle.json"))).expect("fixture bundle reads")
 }
 
 fn run(bundle: &ReplayBundle) -> (TxExecution, Verdict) {
@@ -191,6 +202,9 @@ fn test_the_vm_path_test_fails_when_the_vm_path_breaks() {
 ///   signature-verify precompile with the program it vouches for, three times.
 ///   A precompile writes no `invoke` log, so the replay's own instruction list
 ///   is what shows it ran.
+/// * `v0-lookup-table` is a v0 message that loads two of its addresses
+///   through an address lookup table, kept by a capture that carries the
+///   table as prestate.
 #[test]
 fn test_the_pinned_corpus_replays_to_match() {
     for name in [
@@ -199,6 +213,7 @@ fn test_the_pinned_corpus_replays_to_match() {
         "v0-custom-error",
         "cpi-depth3",
         "precompile-ed25519",
+        "v0-lookup-table",
     ] {
         let bundle = fixture(name);
         let (_, verdict) = run(&bundle);
@@ -446,6 +461,35 @@ fn test_an_account_the_replay_does_not_hold_refuses_execution() {
             assert!(n.reason.contains(&victim));
         }
         TxOutcome::Executed(_) => panic!("executed with an account it does not hold"),
+    }
+}
+
+/// A lookup table is prestate like any account the message names. Without
+/// it the runtime fails the transaction with `AddressLookupTableNotFound`
+/// before any instruction runs, which the chain did not do. Every live
+/// lookup-table transaction diverged that way, cause `execution`, until the
+/// replay refused it instead.
+#[test]
+fn test_a_lookup_table_the_replay_does_not_hold_refuses_execution() {
+    let mut bundle = fixture("v0-lookup-table");
+    let table = bundle
+        .accounts
+        .iter()
+        .find(|a| a.owner == "AddressLookupTab1e1111111111111111111111111")
+        .expect("the fixture carries its lookup table")
+        .pubkey
+        .clone();
+    // Control: with the table, the same bundle replays to `match`.
+    let (_, verdict) = run(&bundle);
+    assert_eq!(verdict.status, Status::Match, "{:?}", verdict.facts);
+    bundle.accounts.retain(|a| a.pubkey != table);
+    let mut replay = Replay::new(&bundle).unwrap();
+    match replay.execute(&bundle.transactions[0]).unwrap() {
+        TxOutcome::NotExecuted(n) => {
+            assert!(n.reason.starts_with("prestate-unavailable"), "{}", n.reason);
+            assert!(n.reason.contains(&table), "{}", n.reason);
+        }
+        TxOutcome::Executed(_) => panic!("executed without the lookup table it reads"),
     }
 }
 

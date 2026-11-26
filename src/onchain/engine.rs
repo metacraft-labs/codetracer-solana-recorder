@@ -626,6 +626,17 @@ impl Replay {
                 missing.push(programdata.to_string());
             }
         }
+        // A v0 message's lookup tables are prestate too: the runtime resolves
+        // the loaded addresses by reading them, and without one it fails the
+        // transaction with `AddressLookupTableNotFound` before any instruction
+        // runs, which the chain did not do.
+        for lookup in vtx.message.address_table_lookups().unwrap_or_default() {
+            if !self.held.contains(&lookup.account_key)
+                && !missing.contains(&lookup.account_key.to_string())
+            {
+                missing.push(lookup.account_key.to_string());
+            }
+        }
         if !missing.is_empty() {
             return Ok(TxOutcome::NotExecuted(NotExecuted {
                 signature: tx.signature.clone(),
